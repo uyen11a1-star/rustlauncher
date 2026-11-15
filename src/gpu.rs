@@ -1,17 +1,25 @@
 //! Vẽ bằng wgpu (Vulkan trên Android, có GL dự phòng).
 
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use wgpu::util::DeviceExt;
 use winit::window::Window;
 
 use crate::game::Mat4;
-use crate::world::{MeshData, Vertex};
+use crate::ui::{UiVertex, UI_MAX_VERTICES};
+use crate::world::{MeshData, Vertex, OUTLINE_MAX_INDICES, OUTLINE_MAX_VERTICES};
 
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 
+/// Màu trời, cũng là màu sương mù để chunk xa hoà vào nền.
+pub const SKY: [f32; 3] = [0.30, 0.55, 0.92];
+
 const SHADER: &str = r#"
-struct Camera { view_proj: mat4x4<f32> };
+struct Camera {
+    view_proj: mat4x4<f32>,
+    eye: vec4<f32>,   // xyz = vị trí mắt, w = khoảng cách bắt đầu có sương mù
+    fog: vec4<f32>,   // rgb = màu sương mù, w = khoảng cách sương mù dày đặc
+};
 @group(0) @binding(0) var<uniform> camera: Camera;
 
 struct VsIn {
@@ -22,6 +30,7 @@ struct VsIn {
 struct VsOut {
     @builtin(position) clip: vec4<f32>,
     @location(0) color: vec3<f32>,
+    @location(1) world: vec3<f32>,
 };
 
 @vertex
@@ -29,21 +38,68 @@ fn vs_main(v: VsIn) -> VsOut {
     var o: VsOut;
     o.clip = camera.view_proj * vec4<f32>(v.pos, 1.0);
     o.color = v.color;
+    o.world = v.pos;
     return o;
 }
 
 @fragment
 fn fs_main(i: VsOut) -> @location(0) vec4<f32> {
-    return vec4<f32>(i.color, 1.0);
+    let d = distance(i.world, camera.eye.xyz);
+    let t = clamp((d - camera.eye.w) / (camera.fog.w - camera.eye.w), 0.0, 1.0);
+    return vec4<f32>(mix(i.color, camera.fog.xyz, t), 1.0);
+}
+
+struct UiIn {
+    @location(0) pos: vec2<f32>,
+    @location(1) color: vec4<f32>,
+};
+
+struct UiOut {
+    @builtin(position) clip: vec4<f32>,
+    @location(0) color: vec4<f32>,
+};
+
+@vertex
+fn ui_vs(v: UiIn) -> UiOut {
+    var o: UiOut;
+    o.clip = vec4<f32>(v.pos, 0.0, 1.0);
+    o.color = v.color;
+    return o;
+}
+
+@fragment
+fn ui_fs(i: UiOut) -> @location(0) vec4<f32> {
+    return i.color;
 }
 "#;
 
 const VERTEX_ATTRS: [wgpu::VertexAttribute; 2] =
     wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3];
+const UI_ATTRS: [wgpu::VertexAttribute; 2] =
+    wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x4];
 
 fn as_bytes<T>(s: &[T]) -> &[u8] {
     // Chỉ dùng cho kiểu #[repr(C)] gồm toàn f32/u32 (không có padding).
     unsafe { std::slice::from_raw_parts(s.as_ptr() as *const u8, std::mem::size_of_val(s)) }
+}
+
+/// Dữ liệu chung của cảnh, khớp với `struct Camera` trong shader (96 byte).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct SceneUniform {
+    view_proj: [[f32; 4]; 4],
+    eye: [f32; 4],
+    fog: [f32; 4],
+}
+
+impl SceneUniform {
+    pub fn new(view_proj: Mat4, eye: [f32; 3], fog_start: f32, fog_end: f32) -> Self {
+        Self {
+            view_proj,
+            eye: [eye[0], eye[1], eye[2], fog_start],
+            fog: [SKY[0], SKY[1], SKY[2], fog_end],
+        }
+    }
 }
 
 struct GpuMesh {
@@ -57,11 +113,15 @@ pub struct Gpu {
     device: wgpu::Device,
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
-    pipeline: wgpu::RenderPipeline,
+    scene_pipeline: wgpu::RenderPipeline,
+    ui_pipeline: wgpu::RenderPipeline,
     uniform: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
     depth_view: wgpu::TextureView,
-    meshes: Vec<GpuMesh>,
+    chunks: HashMap<(i32, i32), GpuMesh>,
+    sel_vb: wgpu::Buffer,
+    sel_ib: wgpu::Buffer,
+    ui_vb: wgpu::Buffer,
 }
 
 fn make_depth_view(device: &wgpu::Device, w: u32, h: u32) -> wgpu::TextureView {
@@ -80,7 +140,7 @@ fn make_depth_view(device: &wgpu::Device, w: u32, h: u32) -> wgpu::TextureView {
 }
 
 impl Gpu {
-    pub fn new(window: Arc<Window>, meshes: &[MeshData]) -> Result<Self, String> {
+    pub fn new(window: Arc<Window>) -> Result<Self, String> {
         let size = window.inner_size();
         let (w, h) = (size.width.max(1), size.height.max(1));
 
@@ -131,7 +191,7 @@ impl Gpu {
 
         let uniform = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("camera"),
-            size: 64,
+            size: std::mem::size_of::<SceneUniform>() as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -139,7 +199,7 @@ impl Gpu {
             label: Some("camera_layout"),
             entries: &[wgpu::BindGroupLayoutEntry {
                 binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX,
+                visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
                 ty: wgpu::BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Uniform,
                     has_dynamic_offset: false,
@@ -163,8 +223,9 @@ impl Gpu {
             bind_group_layouts: &[&bgl],
             push_constant_ranges: &[],
         });
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("pipeline"),
+
+        let scene_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("scene_pipeline"),
             layout: Some(&layout),
             vertex: wgpu::VertexState {
                 module: &shader,
@@ -204,36 +265,82 @@ impl Gpu {
             cache: None,
         });
 
+        // Giao diện: vẽ sau cùng, đè lên mọi thứ, có trong suốt.
+        let ui_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("ui_pipeline"),
+            layout: Some(&layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: "ui_vs",
+                compilation_options: Default::default(),
+                buffers: &[wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<UiVertex>() as u64,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &UI_ATTRS,
+                }],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: "ui_fs",
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: false,
+                depth_compare: wgpu::CompareFunction::Always,
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+
         let depth_view = make_depth_view(&device, w, h);
 
-        let gpu_meshes = meshes
-            .iter()
-            .filter(|m| !m.indices.is_empty())
-            .map(|m| GpuMesh {
-                vb: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("vb"),
-                    contents: as_bytes(&m.vertices),
-                    usage: wgpu::BufferUsages::VERTEX,
-                }),
-                ib: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("ib"),
-                    contents: as_bytes(&m.indices),
-                    usage: wgpu::BufferUsages::INDEX,
-                }),
-                count: m.indices.len() as u32,
-            })
-            .collect();
+        let sel_vb = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("selection_vb"),
+            size: (OUTLINE_MAX_VERTICES * std::mem::size_of::<Vertex>()) as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let sel_ib = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("selection_ib"),
+            size: (OUTLINE_MAX_INDICES * std::mem::size_of::<u32>()) as u64,
+            usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let ui_vb = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("ui_vb"),
+            size: (UI_MAX_VERTICES * std::mem::size_of::<UiVertex>()) as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
 
         Ok(Self {
             surface,
             device,
             queue,
             config,
-            pipeline,
+            scene_pipeline,
+            ui_pipeline,
             uniform,
             bind_group,
             depth_view,
-            meshes: gpu_meshes,
+            chunks: HashMap::new(),
+            sel_vb,
+            sel_ib,
+            ui_vb,
         })
     }
 
@@ -251,7 +358,30 @@ impl Gpu {
         self.config.width as f32 / self.config.height as f32
     }
 
-    pub fn render(&mut self, view_proj: &Mat4) {
+    /// Thay (hoặc bỏ, nếu `mesh` là None hoặc rỗng) mesh của một chunk.
+    pub fn set_chunk(&mut self, key: (i32, i32), mesh: Option<&MeshData>) {
+        match mesh {
+            Some(m) if !m.indices.is_empty() => {
+                let vb = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("chunk_vb"),
+                    contents: as_bytes(&m.vertices),
+                    usage: wgpu::BufferUsages::VERTEX,
+                });
+                let ib = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("chunk_ib"),
+                    contents: as_bytes(&m.indices),
+                    usage: wgpu::BufferUsages::INDEX,
+                });
+                self.chunks
+                    .insert(key, GpuMesh { vb, ib, count: m.indices.len() as u32 });
+            }
+            _ => {
+                self.chunks.remove(&key);
+            }
+        }
+    }
+
+    pub fn render(&mut self, scene: &SceneUniform, selection: Option<&MeshData>, ui: &[UiVertex]) {
         let frame = match self.surface.get_current_texture() {
             Ok(f) => f,
             Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
@@ -266,7 +396,24 @@ impl Gpu {
         let view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
 
         self.queue
-            .write_buffer(&self.uniform, 0, as_bytes(std::slice::from_ref(view_proj)));
+            .write_buffer(&self.uniform, 0, as_bytes(std::slice::from_ref(scene)));
+
+        let mut sel_count = 0u32;
+        if let Some(m) = selection {
+            if !m.indices.is_empty()
+                && m.vertices.len() <= OUTLINE_MAX_VERTICES
+                && m.indices.len() <= OUTLINE_MAX_INDICES
+            {
+                self.queue.write_buffer(&self.sel_vb, 0, as_bytes(&m.vertices));
+                self.queue.write_buffer(&self.sel_ib, 0, as_bytes(&m.indices));
+                sel_count = m.indices.len() as u32;
+            }
+        }
+
+        let ui_count = ui.len().min(UI_MAX_VERTICES);
+        if ui_count > 0 {
+            self.queue.write_buffer(&self.ui_vb, 0, as_bytes(&ui[..ui_count]));
+        }
 
         let mut encoder = self
             .device
@@ -278,7 +425,12 @@ impl Gpu {
                     view: &view,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.30, g: 0.55, b: 0.92, a: 1.0 }),
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: SKY[0] as f64,
+                            g: SKY[1] as f64,
+                            b: SKY[2] as f64,
+                            a: 1.0,
+                        }),
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -293,12 +445,24 @@ impl Gpu {
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });
-            pass.set_pipeline(&self.pipeline);
+
+            pass.set_pipeline(&self.scene_pipeline);
             pass.set_bind_group(0, &self.bind_group, &[]);
-            for m in &self.meshes {
+            for m in self.chunks.values() {
                 pass.set_vertex_buffer(0, m.vb.slice(..));
                 pass.set_index_buffer(m.ib.slice(..), wgpu::IndexFormat::Uint32);
                 pass.draw_indexed(0..m.count, 0, 0..1);
+            }
+            if sel_count > 0 {
+                pass.set_vertex_buffer(0, self.sel_vb.slice(..));
+                pass.set_index_buffer(self.sel_ib.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..sel_count, 0, 0..1);
+            }
+
+            if ui_count > 0 {
+                pass.set_pipeline(&self.ui_pipeline);
+                pass.set_vertex_buffer(0, self.ui_vb.slice(..));
+                pass.draw(0..ui_count as u32, 0..1);
             }
         }
         self.queue.submit(Some(encoder.finish()));
