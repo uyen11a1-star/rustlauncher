@@ -7,7 +7,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::Relaxed},
-        Mutex,
+        Arc, Mutex,
     },
     time::Duration,
 };
@@ -263,7 +263,12 @@ pub async fn load_versions(client: &Client, shared: &Shared) -> Res<()> {
     Ok(())
 }
 
-pub async fn install(client: &Client, root: &Path, entry: &VersionEntry, shared: &Shared) -> Res<()> {
+pub async fn install(
+    client: &Client,
+    root: &Path,
+    entry: &VersionEntry,
+    shared: &Arc<Shared>,
+) -> Res<()> {
     shared.set_phase("Đang đọc thông tin phiên bản...");
     let vjson = root
         .join("versions")
@@ -347,9 +352,14 @@ pub async fn install(client: &Client, root: &Path, entry: &VersionEntry, shared:
         .store(tasks.iter().map(|t| t.size).sum(), Relaxed);
 
     shared.set_phase("Đang tải thư viện và tài nguyên...");
-    let mut results = stream::iter(tasks.iter())
-        .map(|t| download_one(client, t, shared))
-        .buffer_unordered(CONCURRENCY);
+    // Mỗi future sở hữu client/shared/task của nó (clone rẻ) để tránh lỗi lifetime
+    // khi chạy trong tokio::spawn.
+    let mut results = stream::iter(tasks.into_iter().map(|t| {
+        let client = client.clone();
+        let shared = Arc::clone(shared);
+        async move { download_one(&client, &t, &shared).await }
+    }))
+    .buffer_unordered(CONCURRENCY);
     while let Some(r) = results.next().await {
         r?;
     }
