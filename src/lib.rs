@@ -63,8 +63,13 @@ fn android_main(app: winit::platform::android::activity::AndroidApp) {
         android_logger::Config::default().with_max_level(log::LevelFilter::Info),
     );
 
+    // eframe 0.29 chưa có NativeOptions::android_app, nên truyền AndroidApp
+    // vào winit qua hook event_loop_builder.
     let options = eframe::NativeOptions {
-        android_app: Some(app),
+        event_loop_builder: Some(Box::new(move |builder| {
+            use winit::platform::android::EventLoopBuilderExtAndroid;
+            builder.with_android_app(app);
+        })),
         ..Default::default()
     };
 
