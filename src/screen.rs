@@ -208,6 +208,7 @@ impl Screen {
         y += list.h + 12.0 * s;
 
         // nút xem khối thật (G1)
+        let busy = l.busy.load(Relaxed);
         let can2 = !busy && self.selected.is_some();
         let btn2 = Rect { x: m, y, w: w - 2.0 * m, h: 46.0 * s };
         g.rect(btn2.x, btn2.y, btn2.w, btn2.h, if can2 { 0x2e8b57ff } else { BTN_OFF });
