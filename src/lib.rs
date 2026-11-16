@@ -48,11 +48,24 @@ fn setup_fonts(ctx: &egui::Context) {
 impl App {
     fn new(cc: &eframe::CreationContext<'_>, root: PathBuf) -> Self {
         setup_fonts(&cc.egui_ctx);
+        // Nhật ký bền: đọc phần còn lại của lần chạy trước (nếu app từng bị văng) rồi bắt đầu file mới.
+        let crash = root.join("last_run.log");
+        let prev = std::fs::read_to_string(&crash).unwrap_or_default();
+        let _ = std::fs::write(&crash, "");
+        jvm::set_crash_log(crash);
         cc.egui_ctx.set_pixels_per_point(2.0);
         Self {
             root,
             shared: Arc::new(mc::Shared::default()),
-            log: Arc::new(Mutex::new(vec!["Sẵn sàng.".to_string()])),
+            log: Arc::new(Mutex::new({
+                let mut v = vec!["Sẵn sàng.".to_string()];
+                if !prev.trim().is_empty() {
+                    v.push("--- Nhật ký lần chạy trước (app bị thoát giữa chừng) ---".into());
+                    v.extend(prev.lines().map(|x| x.to_string()));
+                    v.push("--- hết nhật ký cũ ---".into());
+                }
+                v
+            })),
             busy: Arc::new(AtomicBool::new(false)),
             jvm_used: Arc::new(AtomicBool::new(false)),
         }
@@ -72,7 +85,10 @@ impl App {
         std::thread::spawn(move || {
             let push = {
                 let log = log.clone();
-                move |s: String| log.lock().unwrap().push(s)
+                move |s: String| {
+                    jvm::breadcrumb(&s);
+                    log.lock().unwrap().push(s)
+                }
             };
             let rt = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
                 Ok(r) => r,
@@ -97,12 +113,17 @@ impl App {
                         work_dir: root.join("work"),
                         tmp_dir: root.join("tmp"),
                         extra_lib_dirs: vec![],
-                        args: vec!["-version".into()],
+                        args: vec!["-XX:+UseSerialGC".into(), "-version".into()],
                     };
                     push("$ java -version".into());
+                    let lib_dbg = cfg.lib_dir.display().to_string();
+                    jvm::breadcrumb(&format!("lib_dir={lib_dbg}"));
                     let cb = {
                         let log = log.clone();
-                        Arc::new(move |s: String| log.lock().unwrap().push(s))
+                        Arc::new(move |s: String| {
+                            jvm::breadcrumb(&format!("[jvm] {s}"));
+                            log.lock().unwrap().push(s)
+                        })
                             as Arc<dyn Fn(String) + Send + Sync>
                     };
                     match jvm::run(&cfg, cb) {

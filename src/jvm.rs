@@ -18,8 +18,7 @@ extern "C" {
     fn dup2(a: c_int, b: c_int) -> c_int;
     fn close(fd: c_int) -> c_int;
     fn read(fd: c_int, buf: *mut c_void, n: usize) -> isize;
-    #[cfg(target_os = "android")]
-    fn signal(sig: c_int, handler: usize) -> usize;
+    fn atexit(cb: extern "C" fn()) -> c_int;
 }
 
 const RTLD_LAZY: c_int = 1;
@@ -41,6 +40,28 @@ type JliLaunch = unsafe extern "C" fn(
     javaw: u8,
     ergo: i32,
 ) -> c_int;
+
+
+static LOG_PATH: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Đặt file nhật ký bền (ghi và sync ngay) để đọc lại sau khi app bị văng.
+pub fn set_crash_log(p: PathBuf) {
+    let _ = LOG_PATH.set(p);
+}
+
+pub fn breadcrumb(msg: &str) {
+    if let Some(p) = LOG_PATH.get() {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(p) {
+            let _ = writeln!(f, "{msg}");
+            let _ = f.sync_all();
+        }
+    }
+}
+
+extern "C" fn on_exit() {
+    breadcrumb("!! exit() được gọi trong tiến trình (JVM hoặc JLI thoát cả app)");
+}
 
 pub struct JvmConfig {
     /// Thư mục gốc JRE (chứa `release`, `lib`, `bin`).
@@ -120,6 +141,8 @@ pub fn run(cfg: &JvmConfig, on_line: Arc<dyn Fn(String) + Send + Sync>) -> Resul
     std::fs::create_dir_all(&cfg.work_dir).map_err(|e| e.to_string())?;
     std::fs::create_dir_all(&cfg.tmp_dir).map_err(|e| e.to_string())?;
 
+    unsafe { atexit(on_exit) };
+    breadcrumb(&format!("run: libjli={}", libjli.display()));
     let ld = ld_library_path(cfg);
     // Nếu đã có đủ đường dẫn của mình (vd. JLI desktop tự exec lại chính nó) thì giữ nguyên.
     let have = std::env::var("LD_LIBRARY_PATH").unwrap_or_default();
@@ -165,6 +188,7 @@ pub fn run(cfg: &JvmConfig, on_line: Arc<dyn Fn(String) + Send + Sync>) -> Resul
         on_line(format!("[cảnh báo] {n}"));
     }
 
+    breadcrumb("đã nạp libjli và các lib lõi");
     let sym = cs("JLI_Launch")?;
     let f = unsafe { dlsym(h_jli, sym.as_ptr()) };
     if f.is_null() {
@@ -216,16 +240,9 @@ pub fn run(cfg: &JvmConfig, on_line: Arc<dyn Fn(String) + Send + Sync>) -> Resul
         unsafe { close(rfd) };
     });
 
-    // Android: trả signal về mặc định để JVM tự cài handler của nó.
-    #[cfg(target_os = "android")]
-    unsafe {
-        for s in 1..32 {
-            if s != 9 && s != 19 {
-                signal(s, 0);
-            }
-        }
-        signal(11, 1);
-    }
+    // KHÔNG reset signal: HotSpot tự lưu handler cũ của ART rồi chuyển tiếp các lỗi không phải của nó.
+    // Reset về SIG_DFL làm mất handler SIGSEGV/SIGPIPE của ART và app bị văng ngay sau khi JVM xong.
+    breadcrumb("sắp gọi JLI_Launch");
 
     let full = cs("1.8.0-internal")?;
     let dot = cs("1.8")?;
@@ -249,6 +266,7 @@ pub fn run(cfg: &JvmConfig, on_line: Arc<dyn Fn(String) + Send + Sync>) -> Resul
         )
     };
 
+    breadcrumb(&format!("JLI_Launch trả về {code}"));
     // Trả stdout/stderr, đóng đầu ghi để luồng đọc gặp EOF.
     unsafe {
         dup2(saved_out, 1);
