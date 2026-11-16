@@ -325,6 +325,10 @@ pub async fn install(
         if !lib_allowed(&lib.rules) {
             continue;
         }
+        // Bản native kiểu cũ (có classifier: nhóm:tên:phiên bản:classifier) không dùng được trên Android.
+        if lib.name.matches(':').count() >= 3 {
+            continue;
+        }
         if let Some(a) = lib.downloads.as_ref().and_then(|d| d.artifact.as_ref()) {
             push(Task {
                 url: a.url.clone(),

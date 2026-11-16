@@ -12,8 +12,9 @@ Mọi thứ còn lại tự viết: tải và kiểm tra file, giải xz/tar, qu
 
 ## Mốc
 - 1-2: giao diện, tải Minecraft song song (`src/mc.rs`) - xong
-- **3 (đây)**: tải JRE 21 arm64, giải nén, chạy `java -version` ngay trong tiến trình app (`src/jre.rs`, `src/tarx.rs`, `src/jvm.rs`)
-- 4: cầu native + tải vanilla và mở cửa sổ game đầu tiên
+- 3: tải JRE, giải nén, tạo JVM ngay trong tiến trình app bằng JNI (`src/jre.rs`, `src/tarx.rs`, `src/jvm.rs`) - xong
+- **4a (đây)**: chọn phiên bản, tải, dựng lệnh chạy từ version JSON (`src/json.rs`, `src/launch.rs`), gọi `main` thật của Minecraft
+- 4b: cầu GLFW/OpenGL (lấy binary từ APK Amethyst) để mở cửa sổ game đầu tiên
 - 5: cảm ứng, đăng nhập Microsoft, chọn phiên bản
 
 Game voxel tự viết cũ nằm ở nhánh `voxel-game`.
@@ -22,8 +23,8 @@ Game voxel tự viết cũ nằm ở nhánh `voxel-game`.
 `git push` rồi lấy APK ở tab Actions, artifact `rustlauncher-apk` (hoặc `gh run download -n rustlauncher-apk`).
 
 ## Test (không cần Android)
-`tarx.rs` và `jvm.rs` chỉ dùng std: `rustc --edition 2021 --test src/tarx.rs && ./tarx`.
-Test `jvm.rs` đã được chạy với JDK 21 thật trên máy dev (JLI_Launch, bắt stdout/stderr).
+`tarx.rs`, `json.rs`, `launch.rs`, `jvm.rs` chỉ dùng std: tạo `t.rs` chứa `mod json; mod launch; mod tarx; mod jvm; fn main(){}` cạnh chúng rồi `rustc --edition 2021 --test t.rs && ./t`.
+`jvm.rs` đã chạy với JDK 21 thật trên máy dev (JNI_CreateJavaVM, gọi `main`, bắt stdout/stderr).
 
 ## Giới hạn
 - Mỗi tiến trình chỉ chạy được một JVM; muốn chạy lại phải mở lại app.
