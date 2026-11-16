@@ -14,7 +14,9 @@ Mọi thứ còn lại tự viết: tải và kiểm tra file, giải xz/tar, qu
 - 1-2: giao diện, tải Minecraft song song (`src/mc.rs`) - xong
 - 3: tải JRE, giải nén, tạo JVM ngay trong tiến trình app bằng JNI (`src/jre.rs`, `src/tarx.rs`, `src/jvm.rs`) - xong
 - **4a (đây)**: chọn phiên bản, tải, dựng lệnh chạy từ version JSON (`src/json.rs`, `src/launch.rs`), gọi `main` thật của Minecraft
-- 4b: cầu GLFW/OpenGL (lấy binary từ APK Amethyst) để mở cửa sổ game đầu tiên
+- **4b-1 (đây)**: bỏ eframe, shell tự viết: android-activity + EGL + GLES, giao diện vẽ tay (`src/gles.rs`, `src/gfx.rs`, `src/screen.rs`, `src/launcher.rs`)
+- 4b-2: lớp GLFW tự viết (xuất hàm C `glfw*`) + natives LWJGL của Amethyst, game chạy tới lúc tạo cửa sổ
+- 4b-3: lớp dịch OpenGL sang GLES tự viết để lên hình
 - 5: cảm ứng, đăng nhập Microsoft, chọn phiên bản
 
 Game voxel tự viết cũ nằm ở nhánh `voxel-game`.
