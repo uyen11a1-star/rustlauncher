@@ -11,6 +11,11 @@ const BTN: u32 = 0x2f6fb3ff;
 const BTN_OFF: u32 = 0x3a3a3cff;
 const SEL: u32 = 0x2d5a8aff;
 
+pub enum Action {
+    Run(String),
+    View(String),
+}
+
 #[derive(Clone, Copy, PartialEq)]
 enum Region {
     None,
@@ -138,18 +143,18 @@ impl Screen {
     }
 
     /// Vẽ một khung hình. Trả về phiên bản vừa được bấm "chạy" (nếu có).
-    pub fn draw(&mut self, g: &mut Gfx, l: &Launcher) -> Option<String> {
+    pub fn draw(&mut self, g: &mut Gfx, l: &Launcher) -> Option<Action> {
         let s = g.scale;
         let (w, h) = (g.w as f32, g.h as f32);
         let m = 16.0 * s;
         let tap = self.tap.take();
-        let mut run: Option<String> = None;
+        let mut run: Option<Action> = None;
         g.begin();
 
         let mut y = 40.0 * s;
         g.text(m, y, 26.0 * s, TEXT, "Rust Launcher");
         y += 34.0 * s;
-        g.text(m, y, 12.0 * s, DIM, "Mốc 4b-1: giao diện tự vẽ (EGL + GLES)");
+        g.text(m, y, 12.0 * s, DIM, "Game Rust: G1 - texture và model thật từ client.jar");
         y += 22.0 * s;
 
         // checkbox snapshot
@@ -219,11 +224,30 @@ impl Screen {
         if can {
             if let Some(t) = tap {
                 if btn.has(t) {
-                    run = self.selected.clone();
+                    run = self.selected.clone().map(Action::Run);
                 }
             }
         }
-        y += btn.h + 12.0 * s;
+        y += btn.h + 8.0 * s;
+
+        // nút xem khối thật (G1)
+        let can2 = !busy && self.selected.is_some();
+        let btn2 = Rect { x: m, y, w: w - 2.0 * m, h: 46.0 * s };
+        g.rect(btn2.x, btn2.y, btn2.w, btn2.h, if can2 { 0x2e8b57ff } else { BTN_OFF });
+        let l2 = match &self.selected {
+            Some(v) => format!("Xem khối thật {v} (game Rust)"),
+            None => "Chọn một phiên bản".to_string(),
+        };
+        let tw2 = g.text_width(&l2, 16.0 * s);
+        g.text(btn2.x + (btn2.w - tw2) / 2.0, btn2.y + 12.0 * s, 16.0 * s, if can2 { 0xffffffff } else { DIM }, &l2);
+        if can2 {
+            if let Some(t) = tap {
+                if btn2.has(t) {
+                    run = self.selected.clone().map(Action::View);
+                }
+            }
+        }
+        y += btn2.h + 12.0 * s;
 
         // trạng thái + tiến trình
         let phase = l.shared.phase.lock().unwrap().clone();
@@ -275,7 +299,7 @@ impl Screen {
         if !g.has_font() {
             g.rect(0.0, 0.0, w, 6.0, 0xff0000ff);
         }
-        g.end(BG);
+        g.end(Some(BG));
         run
     }
 }

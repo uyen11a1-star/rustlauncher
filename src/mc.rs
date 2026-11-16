@@ -371,3 +371,38 @@ pub async fn install(
     shared.set_phase("Hoàn tất");
     Ok(())
 }
+
+/// Chỉ tải version JSON + client.jar (đủ để đọc texture/model), không tải thư viện hay assets âm thanh.
+pub async fn install_client(client: &Client, root: &Path, entry: &VersionEntry, shared: &Arc<Shared>) -> Res<PathBuf> {
+    shared.set_phase("Đang đọc thông tin phiên bản...");
+    let vjson = root.join("versions").join(&entry.id).join(format!("{}.json", entry.id));
+    download_one(
+        client,
+        &Task {
+            url: entry.url.clone(),
+            path: vjson.clone(),
+            sha1: if entry.sha1.is_empty() { None } else { Some(entry.sha1.clone()) },
+            size: 0,
+        },
+        shared,
+    )
+    .await?;
+    let meta: VersionMeta = serde_json::from_slice(&fs::read(&vjson).await?)?;
+    let jar = root.join("versions").join(&entry.id).join(format!("{}.jar", entry.id));
+    shared.reset_progress();
+    shared.bytes_total.store(meta.downloads.client.size, Relaxed);
+    shared.files_total.store(1, Relaxed);
+    shared.set_phase("Đang tải client.jar...");
+    download_one(
+        client,
+        &Task {
+            url: meta.downloads.client.url.clone(),
+            path: jar.clone(),
+            sha1: Some(meta.downloads.client.sha1.clone()),
+            size: meta.downloads.client.size,
+        },
+        shared,
+    )
+    .await?;
+    Ok(jar)
+}

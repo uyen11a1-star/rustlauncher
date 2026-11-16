@@ -6,6 +6,7 @@ use android_activity::{
     AndroidApp, InputStatus, MainEvent, PollEvent,
 };
 
+mod assets;
 mod components;
 mod gfx;
 mod gles;
@@ -15,10 +16,19 @@ mod json;
 mod jvm;
 mod launch;
 mod launcher;
+mod math;
 mod mc;
+mod png;
+mod scene;
 mod screen;
 mod tarx;
+mod view;
 mod zipr;
+
+enum Mode {
+    Menu,
+    View(Box<view::View>),
+}
 
 #[no_mangle]
 fn android_main(app: AndroidApp) {
@@ -30,10 +40,12 @@ fn android_main(app: AndroidApp) {
     let mut egl: Option<gles::Egl> = None;
     let mut gfx: Option<gfx::Gfx> = None;
     let mut quit = false;
+    let mut mode = Mode::Menu;
 
     while !quit {
         let (mut init, mut term) = (false, false);
-        app.poll_events(Some(Duration::from_millis(33)), |event| {
+        let timeout = if matches!(mode, Mode::View(_)) { 1 } else { 33 };
+        app.poll_events(Some(Duration::from_millis(timeout)), |event| {
             if let PollEvent::Main(me) = event {
                 match me {
                     MainEvent::InitWindow { .. } => init = true,
@@ -74,19 +86,31 @@ fn android_main(app: AndroidApp) {
             }
         }
 
-        let scale = gfx.as_ref().map_or(1.0, |g| g.scale);
+        // thu mọi sự kiện cảm ứng, xử lý sau theo chế độ hiện tại
+        let mut events: Vec<(i32, view::Phase, f32, f32)> = Vec::new();
         if let Ok(mut it) = app.input_events_iter() {
             while it.next(|ev| {
                 if let InputEvent::MotionEvent(m) = ev {
-                    if m.pointer_count() > 0 {
-                        let p = m.pointer_at_index(0);
-                        let (x, y) = (p.x(), p.y());
-                        match m.action() {
-                            MotionAction::Down => screen.touch_down(x, y, scale),
-                            MotionAction::Move => screen.touch_move(x, y, scale),
-                            MotionAction::Up | MotionAction::Cancel => screen.touch_up(x, y),
-                            _ => {}
+                    let n = m.pointer_count();
+                    match m.action() {
+                        MotionAction::Down | MotionAction::PointerDown | MotionAction::Up | MotionAction::PointerUp => {
+                            let p = m.pointer_at_index(m.pointer_index());
+                            let ph = if matches!(m.action(), MotionAction::Down | MotionAction::PointerDown) { view::Phase::Down } else { view::Phase::Up };
+                            events.push((p.pointer_id(), ph, p.x(), p.y()));
                         }
+                        MotionAction::Move => {
+                            for i in 0..n {
+                                let p = m.pointer_at_index(i);
+                                events.push((p.pointer_id(), view::Phase::Move, p.x(), p.y()));
+                            }
+                        }
+                        MotionAction::Cancel => {
+                            for i in 0..n {
+                                let p = m.pointer_at_index(i);
+                                events.push((p.pointer_id(), view::Phase::Up, p.x(), p.y()));
+                            }
+                        }
+                        _ => {}
                     }
                     return InputStatus::Handled;
                 }
@@ -94,12 +118,45 @@ fn android_main(app: AndroidApp) {
             }) {}
         }
 
+        // cảnh 3D vừa dựng xong ở luồng nền -> đưa lên GPU, chuyển chế độ
+        if matches!(mode, Mode::Menu) && egl.as_ref().map_or(false, |e| !e.surface.is_null()) {
+            let ready = launcher.scene.lock().unwrap().take();
+            if let Some(d) = ready {
+                match view::View::new(d) {
+                    Ok(v) => mode = Mode::View(Box::new(v)),
+                    Err(e) => launcher.log.lock().unwrap().push(format!("LỖI tạo view: {e}")),
+                }
+            }
+        }
+
         if let (Some(e), Some(g)) = (egl.as_ref(), gfx.as_mut()) {
             if !e.surface.is_null() {
                 let (w, h) = e.size();
                 g.set_size(w, h);
-                if let Some(id) = screen.draw(g, &launcher) {
-                    launcher.start(id);
+                match &mut mode {
+                    Mode::Menu => {
+                        let scale = g.scale;
+                        for (_, ph, x, y) in &events {
+                            match ph {
+                                view::Phase::Down => screen.touch_down(*x, *y, scale),
+                                view::Phase::Move => screen.touch_move(*x, *y, scale),
+                                view::Phase::Up => screen.touch_up(*x, *y),
+                            }
+                        }
+                        match screen.draw(g, &launcher) {
+                            Some(screen::Action::Run(id)) => launcher.start(id),
+                            Some(screen::Action::View(id)) => launcher.prepare_view(id),
+                            None => {}
+                        }
+                    }
+                    Mode::View(v) => {
+                        for (id, ph, x, y) in &events {
+                            v.touch(*id, *ph, *x, *y, g);
+                        }
+                        if v.frame(g) {
+                            mode = Mode::Menu;
+                        }
+                    }
                 }
                 e.swap();
             }

@@ -7,7 +7,7 @@ use std::{
     },
 };
 
-use crate::{components, jre, jvm, launch, mc};
+use crate::{components, jre, jvm, launch, mc, scene};
 
 pub struct Launcher {
     pub root: PathBuf,
@@ -16,6 +16,8 @@ pub struct Launcher {
     pub busy: Arc<AtomicBool>,
     /// JVM chỉ chạy được một lần mỗi tiến trình.
     pub jvm_used: Arc<AtomicBool>,
+    /// Cảnh 3D đã dựng xong (CPU), chờ luồng chính đưa lên GPU.
+    pub scene: Arc<Mutex<Option<scene::SceneData>>>,
 }
 
 pub fn pusher(log: &Arc<Mutex<Vec<String>>>) -> impl Fn(String) + Send + Sync + Clone + 'static {
@@ -46,6 +48,7 @@ impl Launcher {
             log: Arc::new(Mutex::new(first)),
             busy: Arc::new(AtomicBool::new(false)),
             jvm_used: Arc::new(AtomicBool::new(false)),
+            scene: Arc::new(Mutex::new(None)),
         };
         l.load_versions();
         l
@@ -66,6 +69,51 @@ impl Launcher {
                 Ok(()) => push(format!("Đã tải danh sách {} phiên bản.", shared.versions.lock().unwrap().len())),
                 Err(e) => push(format!("Không tải được danh sách phiên bản: {e}")),
             }
+        });
+    }
+
+    /// Tải client.jar rồi dựng cảnh 3D từ texture/model thật. Kết quả để vào `self.scene`.
+    pub fn prepare_view(&self, id: String) {
+        if self.busy.swap(true, Relaxed) {
+            return;
+        }
+        let (root, shared, log, busy, out) = (self.root.clone(), self.shared.clone(), self.log.clone(), self.busy.clone(), self.scene.clone());
+        std::thread::spawn(move || {
+            let push = pusher(&log);
+            let rt = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
+                Ok(r) => r,
+                Err(e) => {
+                    push(format!("tokio: {e}"));
+                    busy.store(false, Relaxed);
+                    return;
+                }
+            };
+            let res: mc::Res<std::path::PathBuf> = rt.block_on(async {
+                let client = mc::make_client()?;
+                let entry = shared.versions.lock().unwrap().iter().find(|v| v.id == id).cloned().ok_or("không thấy phiên bản trong danh sách")?;
+                let jar = mc::install_client(&client, &root, &entry, &shared).await?;
+                Ok::<_, Box<dyn std::error::Error + Send + Sync>>(jar)
+            });
+            match res {
+                Err(e) => {
+                    push(format!("LỖI: {e}"));
+                    shared.set_phase("Lỗi");
+                }
+                Ok(jar) => {
+                    shared.set_phase("Đang dựng texture và model...");
+                    match scene::build(&jar, &push) {
+                        Ok(d) => {
+                            *out.lock().unwrap() = Some(d);
+                            shared.set_phase("Sẵn sàng");
+                        }
+                        Err(e) => {
+                            push(format!("LỖI dựng cảnh: {e}"));
+                            shared.set_phase("Lỗi");
+                        }
+                    }
+                }
+            }
+            busy.store(false, Relaxed);
         });
     }
 

@@ -79,6 +79,31 @@ fn compile(kind: u32, src: &str) -> Result<u32, String> {
     }
 }
 
+/// Biên dịch + liên kết một chương trình shader; `attribs` được gán vị trí 0,1,2...
+pub fn build_program(vs: &str, fs: &str, attribs: &[&str]) -> Result<u32, String> {
+    unsafe {
+        let v = compile(GL_VERTEX_SHADER, vs)?;
+        let f = compile(GL_FRAGMENT_SHADER, fs)?;
+        let prog = glCreateProgram();
+        glAttachShader(prog, v);
+        glAttachShader(prog, f);
+        for (i, n) in attribs.iter().enumerate() {
+            let c = CString::new(*n).unwrap();
+            glBindAttribLocation(prog, i as u32, c.as_ptr());
+        }
+        glLinkProgram(prog);
+        let mut ok = 0;
+        glGetProgramiv(prog, GL_LINK_STATUS, &mut ok);
+        if ok == 0 {
+            let mut buf = vec![0u8; 1024];
+            let mut n = 0;
+            glGetProgramInfoLog(prog, 1024, &mut n, buf.as_mut_ptr() as *mut _);
+            return Err(format!("link lỗi: {}", String::from_utf8_lossy(&buf[..n.max(0) as usize])));
+        }
+        Ok(prog)
+    }
+}
+
 const VS: &str = "#version 300 es
 in vec2 a_pos; in vec2 a_uv; in vec4 a_col;
 uniform vec2 u_size;
@@ -328,13 +353,15 @@ impl Gfx {
     }
 
     /// Xả mọi thứ đã gom ra màn hình (chưa swap).
-    pub fn end(&mut self, bg: u32) {
+    pub fn end(&mut self, bg: Option<u32>) {
         unsafe {
             glViewport(0, 0, self.w, self.h);
             glDisable(GL_SCISSOR_TEST);
-            let c = rgba(bg);
-            glClearColor(c[0] as f32 / 255.0, c[1] as f32 / 255.0, c[2] as f32 / 255.0, 1.0);
-            glClear(GL_COLOR_BUFFER_BIT);
+            if let Some(bg) = bg {
+                let c = rgba(bg);
+                glClearColor(c[0] as f32 / 255.0, c[1] as f32 / 255.0, c[2] as f32 / 255.0, 1.0);
+                glClear(GL_COLOR_BUFFER_BIT);
+            }
             if self.verts.is_empty() {
                 return;
             }

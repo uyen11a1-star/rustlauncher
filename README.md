@@ -15,7 +15,7 @@ Mọi thứ còn lại tự viết: tải và kiểm tra file, giải xz/tar, qu
 - 3: tải JRE, giải nén, tạo JVM ngay trong tiến trình app bằng JNI (`src/jre.rs`, `src/tarx.rs`, `src/jvm.rs`) - xong
 - **4a (đây)**: chọn phiên bản, tải, dựng lệnh chạy từ version JSON (`src/json.rs`, `src/launch.rs`), gọi `main` thật của Minecraft
 - 4b-1: bỏ eframe, shell tự viết: android-activity + EGL + GLES, giao diện vẽ tay (`src/gles.rs`, `src/gfx.rs`, `src/screen.rs`, `src/launcher.rs`)
-- **4b-2a (đây)**: tải natives LWJGL từ APK Amethyst bằng HTTP Range (`src/zipr.rs`, `src/inflate.rs` tự viết, `src/components.rs`), nạp vào JVM
+- 4b-2a: tải natives LWJGL từ APK Amethyst bằng HTTP Range (`src/zipr.rs`, `src/inflate.rs` tự viết, `src/components.rs`), nạp vào JVM
 - 4b-2b: lớp GLFW tự viết (xuất hàm C `glfw*`), game chạy tới lúc tạo cửa sổ
 - 4b-3: lớp dịch OpenGL sang GLES tự viết để lên hình
 - 5: cảm ứng, đăng nhập Microsoft, chọn phiên bản
@@ -32,3 +32,14 @@ Game voxel tự viết cũ nằm ở nhánh `voxel-game`.
 ## Giới hạn
 - Mỗi tiến trình chỉ chạy được một JVM; muốn chạy lại phải mở lại app.
 - Lỗi nặng trong JLI có thể làm thoát cả app.
+
+## Đổi hướng (16/11/2026)
+Mục tiêu thật: game Rust kiểu Horizon (không JVM), đọc tài nguyên và thế giới từ bản Minecraft Java của chính người dùng.
+Phần launcher JVM giữ lại ở nhánh `launcher-jvm`.
+
+- **G1 (đây)**: đọc client.jar, tự giải PNG (`src/png.rs`), dựng atlas, đọc model khối thật (`src/assets.rs`), vẽ 3D bằng GLES (`src/view.rs`)
+- G2: đọc thế giới Java (.mca, NBT) và vẽ
+- G3: ánh sáng, nước, lá, sương, trời; dựng mesh nhiều luồng
+- G4: vật lý và điều khiển giống bản Java
+- G5: đập/đặt khối, túi đồ, chế tạo theo dữ liệu thật
+- G6: sinh địa hình giống Mojang, sinh vật, âm thanh

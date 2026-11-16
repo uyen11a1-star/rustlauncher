@@ -69,6 +69,8 @@ extern "C" {
     pub fn glBlendFunc(s: u32, d: u32);
     pub fn glDrawArrays(mode: u32, first: i32, count: i32);
     pub fn glGetError() -> u32;
+    pub fn glUniformMatrix4fv(loc: i32, count: i32, transpose: u8, v: *const f32);
+    pub fn glDepthFunc(f: u32);
 }
 
 pub const GL_TEXTURE_2D: u32 = 0x0DE1;
@@ -96,8 +98,17 @@ pub const GL_R8: i32 = 0x8229;
 pub const GL_RED: u32 = 0x1903;
 pub const GL_UNPACK_ALIGNMENT: u32 = 0x0CF5;
 pub const GL_TEXTURE0: u32 = 0x84C0;
+pub const GL_DEPTH_TEST: u32 = 0x0B71;
+pub const GL_CULL_FACE: u32 = 0x0B44;
+pub const GL_LEQUAL: u32 = 0x0203;
+pub const GL_DEPTH_BUFFER_BIT: u32 = 0x0100;
+pub const GL_RGBA: u32 = 0x1908;
+pub const GL_RGBA8: i32 = 0x8058;
+pub const GL_NEAREST: i32 = 0x2600;
+pub const GL_STATIC_DRAW: u32 = 0x88E4;
 
 const EGL_NONE: i32 = 0x3038;
+const EGL_DEPTH_SIZE: i32 = 0x3025;
 const EGL_SURFACE_TYPE: i32 = 0x3033;
 const EGL_WINDOW_BIT: i32 = 4;
 const EGL_RENDERABLE_TYPE: i32 = 0x3040;
@@ -133,12 +144,13 @@ impl Egl {
             eglBindAPI(EGL_OPENGL_ES_API);
             let mut config: EGLConfig = null_mut();
             let mut n = 0;
-            for renderable in [0x40, 4] {
+            for (renderable, depth) in [(0x40, 24), (0x40, 16), (4, 16)] {
                 // 0x40 = ES3, 4 = ES2
                 let attribs = [
                     EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
                     EGL_RENDERABLE_TYPE, renderable,
                     EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8, EGL_ALPHA_SIZE, 8,
+                    EGL_DEPTH_SIZE, depth,
                     EGL_NONE,
                 ];
                 if eglChooseConfig(display, attribs.as_ptr(), &mut config, 1, &mut n) != 0 && n > 0 {
