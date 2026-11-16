@@ -72,23 +72,24 @@ fn android_main(app: AndroidApp) {
         }
 
         let scale = gfx.as_ref().map_or(1.0, |g| g.scale);
-        #[allow(deprecated)]
-        app.input_events(|ev| {
-            if let InputEvent::MotionEvent(m) = ev {
-                if m.pointer_count() > 0 {
-                    let p = m.pointer_at_index(0);
-                    let (x, y) = (p.x(), p.y());
-                    match m.action() {
-                        MotionAction::Down => screen.touch_down(x, y, scale),
-                        MotionAction::Move => screen.touch_move(x, y, scale),
-                        MotionAction::Up | MotionAction::Cancel => screen.touch_up(x, y),
-                        _ => {}
+        if let Ok(mut it) = app.input_events_iter() {
+            while it.next(|ev| {
+                if let InputEvent::MotionEvent(m) = ev {
+                    if m.pointer_count() > 0 {
+                        let p = m.pointer_at_index(0);
+                        let (x, y) = (p.x(), p.y());
+                        match m.action() {
+                            MotionAction::Down => screen.touch_down(x, y, scale),
+                            MotionAction::Move => screen.touch_move(x, y, scale),
+                            MotionAction::Up | MotionAction::Cancel => screen.touch_up(x, y),
+                            _ => {}
+                        }
                     }
+                    return InputStatus::Handled;
                 }
-                return InputStatus::Handled;
-            }
-            InputStatus::Unhandled
-        });
+                InputStatus::Unhandled
+            }) {}
+        }
 
         if let (Some(e), Some(g)) = (egl.as_ref(), gfx.as_mut()) {
             if !e.surface.is_null() {
