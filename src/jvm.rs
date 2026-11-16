@@ -114,9 +114,11 @@ fn set_env(k: &str, v: &str) -> Result<(), String> {
 /// Danh sách thư mục cho LD_LIBRARY_PATH của JVM.
 pub fn ld_library_path(cfg: &JvmConfig) -> String {
     let l = &cfg.lib_dir;
+    // libjvm (server/) PHẢI đứng đầu: JLI chỉ coi LD_LIBRARY_PATH là đủ khi mục đầu là thư mục libjvm,
+    // nếu không nó tự execve lại chính mình (trên Android: "trying to exec .../bin/java: Permission denied").
     let mut v: Vec<String> = vec![
-        l.join("jli").display().to_string(),
         l.join("server").display().to_string(),
+        l.join("jli").display().to_string(),
         l.join("client").display().to_string(),
         l.display().to_string(),
     ];
@@ -340,7 +342,7 @@ mod tests {
             args: vec![],
         };
         let p = ld_library_path(&c);
-        assert!(p.starts_with("/j/lib/aarch64/jli:/j/lib/aarch64/server"));
+        assert!(p.starts_with("/j/lib/aarch64/server:/j/lib/aarch64/jli"));
         assert!(p.ends_with(":/n"));
     }
 
