@@ -82,7 +82,8 @@ impl App {
             self.busy.clone(),
             self.jvm_used.clone(),
         );
-        std::thread::spawn(move || {
+        // JVM cần stack lớn cho luồng gọi nó.
+        let _ = std::thread::Builder::new().stack_size(32 << 20).spawn(move || {
             let push = {
                 let log = log.clone();
                 move |s: String| {
@@ -113,9 +114,11 @@ impl App {
                         work_dir: root.join("work"),
                         tmp_dir: root.join("tmp"),
                         extra_lib_dirs: vec![],
-                        args: vec!["-XX:+UseSerialGC".into(), "-version".into()],
+                        args: vec!["-XX:+UseSerialGC".into(), "-Xmx256m".into()],
+                        main_class: None,
+                        app_args: vec![],
                     };
-                    push("$ java -version".into());
+                    push("$ tạo JVM và đọc thông tin phiên bản".into());
                     let lib_dbg = cfg.lib_dir.display().to_string();
                     jvm::breadcrumb(&format!("lib_dir={lib_dbg}"));
                     let cb = {
@@ -149,12 +152,12 @@ impl eframe::App for App {
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.add_space(36.0);
             ui.heading("Rust Launcher");
-            ui.label(format!("Mốc 3: JRE {JRE_MAJOR} + JVM trong app"));
+            ui.label(format!("Mốc 3: JRE {JRE_MAJOR} + JVM trong app (JNI trực tiếp)"));
             ui.add_space(8.0);
 
             let busy = self.busy.load(Relaxed);
             let used = self.jvm_used.load(Relaxed);
-            let label = if used { "JVM đã chạy (mở lại app để chạy lần nữa)" } else { "Tải JRE và chạy java -version" };
+            let label = if used { "JVM đã chạy (mở lại app để chạy lần nữa)" } else { "Tải JRE và khởi động JVM" };
             if ui.add_enabled(!busy && !used, egui::Button::new(label)).clicked() {
                 self.start();
             }
