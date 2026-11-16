@@ -24,6 +24,8 @@ pub struct Plan {
     pub game_args: Vec<String>,
     pub classpath: Vec<PathBuf>,
     pub asset_index: String,
+    /// Phiên bản LWJGL mà game yêu cầu (vd "3.3.3").
+    pub lwjgl_version: Option<String>,
 }
 
 const OS_NAME: &str = "linux";
@@ -150,6 +152,16 @@ pub fn build_plan(root: &Path, id: &str, o: &Opts) -> Result<Plan, String> {
         .unwrap_or(id)
         .to_string();
 
+    let lwjgl_version = v.get("libraries").and_then(|l| l.as_arr()).and_then(|libs| {
+        libs.iter().filter_map(|l| l.get("name").and_then(|n| n.as_str())).find_map(|n| {
+            let mut it = n.split(':');
+            match (it.next(), it.next(), it.next()) {
+                (Some("org.lwjgl"), Some("lwjgl"), Some(ver)) => Some(ver.to_string()),
+                _ => None,
+            }
+        })
+    });
+
     // classpath: lwjgl vá -> thư viện (bỏ org.lwjgl của Mojang) -> client jar
     let mut classpath: Vec<PathBuf> = o.lwjgl_jars.clone();
     if let Some(libs) = v.get("libraries").and_then(|l| l.as_arr()) {
@@ -227,7 +239,7 @@ pub fn build_plan(root: &Path, id: &str, o: &Opts) -> Result<Plan, String> {
     }
     let game_args: Vec<String> = game_raw.into_iter().map(|a| subst(&a, &vars)).collect();
 
-    Ok(Plan { java_major, main_class, jvm_args, game_args, classpath, asset_index })
+    Ok(Plan { java_major, main_class, jvm_args, game_args, classpath, asset_index, lwjgl_version })
 }
 
 #[cfg(test)]

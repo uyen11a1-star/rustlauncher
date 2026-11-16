@@ -7,7 +7,7 @@ use std::{
     },
 };
 
-use crate::{jre, jvm, launch, mc};
+use crate::{components, jre, jvm, launch, mc};
 
 pub struct Launcher {
     pub root: PathBuf,
@@ -105,7 +105,7 @@ impl Launcher {
                 natives_dir: root.join("natives"),
                 lwjgl_jars: vec![],
             };
-            let res: mc::Res<(launch::Plan, PathBuf)> = rt.block_on(async {
+            let res: mc::Res<(launch::Plan, PathBuf, PathBuf)> = rt.block_on(async {
                 let client = mc::make_client()?;
                 let entry = shared
                     .versions
@@ -120,9 +120,12 @@ impl Launcher {
                 let plan = launch::build_plan(&root, &id, &opts)?;
                 push(format!("{id} cần Java {}, main = {}", plan.java_major, plan.main_class));
                 let home = jre::install(&root, plan.java_major, &shared, &push).await?;
-                Ok::<_, Box<dyn std::error::Error + Send + Sync>>((plan, home))
+                let ver = plan.lwjgl_version.clone().unwrap_or_else(|| "3.3.3".to_string());
+                push(format!("LWJGL yêu cầu: {ver}"));
+                let nat = components::ensure(&root, &ver, &shared, &push).await?;
+                Ok::<_, Box<dyn std::error::Error + Send + Sync>>((plan, home, nat))
             });
-            let (plan, home) = match res {
+            let (plan, home, nat) = match res {
                 Ok(x) => x,
                 Err(e) => return fail(e.to_string()),
             };
@@ -132,14 +135,20 @@ impl Launcher {
             let _ = std::fs::create_dir_all(&game_dir);
             let _ = std::fs::create_dir_all(root.join("natives"));
             let cp = plan.classpath.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(":");
-            let mut args = vec!["-Xmx1024m".to_string(), "-XX:+UseSerialGC".to_string(), format!("-Djava.class.path={cp}")];
+            let mut args = vec![
+                "-Xmx1024m".to_string(),
+                "-XX:+UseSerialGC".to_string(),
+                "-Djava.awt.headless=true".to_string(),
+                format!("-Djava.class.path={cp}"),
+                format!("-Dorg.lwjgl.librarypath={}", nat.display()),
+            ];
             args.extend(plan.jvm_args.iter().cloned());
             let cfg = jvm::JvmConfig {
                 lib_dir: jvm::pick_lib_dir(&home, jre::OS_ARCH),
                 java_home: home,
                 work_dir: game_dir,
                 tmp_dir: root.join("tmp"),
-                extra_lib_dirs: vec![root.join("natives")],
+                extra_lib_dirs: vec![nat.clone(), root.join("natives")],
                 args,
                 main_class: Some(plan.main_class.clone()),
                 app_args: plan.game_args.clone(),

@@ -6,8 +6,10 @@ use android_activity::{
     AndroidApp, InputStatus, MainEvent, PollEvent,
 };
 
+mod components;
 mod gfx;
 mod gles;
+mod inflate;
 mod jre;
 mod json;
 mod jvm;
@@ -16,6 +18,7 @@ mod launcher;
 mod mc;
 mod screen;
 mod tarx;
+mod zipr;
 
 #[no_mangle]
 fn android_main(app: AndroidApp) {
