@@ -26,6 +26,22 @@ async fn get_range(client: &reqwest::Client, range: String) -> Res<Vec<u8>> {
     Ok(resp.bytes().await?.to_vec())
 }
 
+async fn total_size(client: &reqwest::Client) -> Res<u64> {
+    let resp = client.get(APK_URL).header(reqwest::header::RANGE, "bytes=0-0").send().await?;
+    let st = resp.status();
+    if st.as_u16() != 206 {
+        return Err(format!("máy chủ không trả 206 cho Range (HTTP {st})").into());
+    }
+    let total = resp
+        .headers()
+        .get(reqwest::header::CONTENT_RANGE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.rsplit('/').next())
+        .and_then(|t| t.parse::<u64>().ok())
+        .ok_or("không đọc được tổng dung lượng từ Content-Range")?;
+    Ok(total)
+}
+
 pub fn natives_dir(root: &Path, ver: &str) -> PathBuf {
     root.join("components").join(format!("lwjgl-{ver}"))
 }
@@ -47,7 +63,10 @@ pub async fn ensure(root: &Path, ver: &str, shared: &Arc<Shared>, log: &(dyn Fn(
     shared.reset_progress();
     shared.set_phase("Đang tải thư viện native (LWJGL)...");
     log("Đọc mục lục APK Amethyst (HTTP Range)...".into());
-    let tail = get_range(&client, "bytes=-262144".into()).await?;
+    // Azure Blob (đứng sau GitHub) không hỗ trợ Range dạng "N byte cuối" (trả 501): hỏi tổng dung lượng trước.
+    let total = total_size(&client).await?;
+    let tail_start = total.saturating_sub(262_144);
+    let tail = get_range(&client, format!("bytes={}-{}", tail_start, total - 1)).await?;
     let (cd_off, cd_size) = zipr::find_cd(&tail).ok_or("không thấy EOCD của APK")?;
     let cd = get_range(&client, format!("bytes={}-{}", cd_off, cd_off + cd_size - 1)).await?;
     let entries = zipr::parse_central(&cd)?;
