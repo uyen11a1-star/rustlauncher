@@ -1,4 +1,4 @@
-//! Logic launcher (không dính giao diện): danh sách phiên bản, cài đặt, chạy JVM. Chạy trên luồng riêng.
+//! Logic nền (không dính giao diện): danh sách phiên bản, tải client.jar, dựng cảnh. Chạy trên luồng riêng.
 use std::{
     path::PathBuf,
     sync::{
@@ -7,15 +7,25 @@ use std::{
     },
 };
 
-use crate::{components, jre, jvm, launch, mc, scene};
+use crate::{mc, scene};
+
+static CRASH_LOG: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Ghi từng dòng nhật ký xuống file ngay, để nếu app bị thoát đột ngột vẫn còn dấu vết.
+fn breadcrumb(s: &str) {
+    use std::io::Write;
+    if let Some(p) = CRASH_LOG.get() {
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(p) {
+            let _ = writeln!(f, "{s}");
+        }
+    }
+}
 
 pub struct Launcher {
     pub root: PathBuf,
     pub shared: Arc<mc::Shared>,
     pub log: Arc<Mutex<Vec<String>>>,
     pub busy: Arc<AtomicBool>,
-    /// JVM chỉ chạy được một lần mỗi tiến trình.
-    pub jvm_used: Arc<AtomicBool>,
     /// Cảnh 3D đã dựng xong (CPU), chờ luồng chính đưa lên GPU.
     pub scene: Arc<Mutex<Option<scene::SceneData>>>,
 }
@@ -23,7 +33,7 @@ pub struct Launcher {
 pub fn pusher(log: &Arc<Mutex<Vec<String>>>) -> impl Fn(String) + Send + Sync + Clone + 'static {
     let log = log.clone();
     move |s: String| {
-        jvm::breadcrumb(&s);
+        breadcrumb(&s);
         log.lock().unwrap().push(s)
     }
 }
@@ -34,7 +44,7 @@ impl Launcher {
         let crash = root.join("last_run.log");
         let prev = std::fs::read_to_string(&crash).unwrap_or_default();
         let _ = std::fs::write(&crash, "");
-        jvm::set_crash_log(crash);
+        let _ = CRASH_LOG.set(crash);
 
         let mut first = vec!["Sẵn sàng.".to_string()];
         if !prev.trim().is_empty() {
@@ -47,7 +57,6 @@ impl Launcher {
             shared: Arc::new(mc::Shared::default()),
             log: Arc::new(Mutex::new(first)),
             busy: Arc::new(AtomicBool::new(false)),
-            jvm_used: Arc::new(AtomicBool::new(false)),
             scene: Arc::new(Mutex::new(None)),
         };
         l.load_versions();
@@ -112,106 +121,6 @@ impl Launcher {
                         }
                     }
                 }
-            }
-            busy.store(false, Relaxed);
-        });
-    }
-
-    /// Cài + chạy một phiên bản. Trả về ngay, việc nặng chạy ở luồng khác.
-    pub fn start(&self, id: String) {
-        if self.busy.swap(true, Relaxed) {
-            return;
-        }
-        let (root, shared, log, busy, used) = (
-            self.root.clone(),
-            self.shared.clone(),
-            self.log.clone(),
-            self.busy.clone(),
-            self.jvm_used.clone(),
-        );
-        // JVM cần stack lớn cho luồng gọi nó.
-        let _ = std::thread::Builder::new().stack_size(32 << 20).spawn(move || {
-            let push = pusher(&log);
-            let fail = |e: String| {
-                push(format!("LỖI: {e}"));
-                shared.set_phase("Lỗi");
-                busy.store(false, Relaxed);
-            };
-            let rt = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
-                Ok(r) => r,
-                Err(e) => return fail(format!("tokio: {e}")),
-            };
-
-            let game_dir = root.join("game");
-            let opts = launch::Opts {
-                player_name: "Player".into(),
-                uuid: "00000000-0000-0000-0000-000000000000".into(),
-                access_token: "0".into(),
-                user_type: "legacy".into(),
-                game_dir: game_dir.clone(),
-                assets_root: root.join("assets"),
-                natives_dir: root.join("natives"),
-                lwjgl_jars: vec![],
-            };
-            let res: mc::Res<(launch::Plan, PathBuf, PathBuf)> = rt.block_on(async {
-                let client = mc::make_client()?;
-                let entry = shared
-                    .versions
-                    .lock()
-                    .unwrap()
-                    .iter()
-                    .find(|v| v.id == id)
-                    .cloned()
-                    .ok_or("không thấy phiên bản trong danh sách")?;
-                push(format!("Cài {id}..."));
-                mc::install(&client, &root, &entry, &shared).await?;
-                let plan = launch::build_plan(&root, &id, &opts)?;
-                push(format!("{id} cần Java {}, main = {}", plan.java_major, plan.main_class));
-                let home = jre::install(&root, plan.java_major, &shared, &push).await?;
-                let ver = plan.lwjgl_version.clone().unwrap_or_else(|| "3.3.3".to_string());
-                push(format!("LWJGL yêu cầu: {ver}"));
-                let nat = components::ensure(&root, &ver, &shared, &push).await?;
-                Ok::<_, Box<dyn std::error::Error + Send + Sync>>((plan, home, nat))
-            });
-            let (plan, home, nat) = match res {
-                Ok(x) => x,
-                Err(e) => return fail(e.to_string()),
-            };
-
-            shared.set_phase("Đang chạy Minecraft...");
-            used.store(true, Relaxed);
-            let _ = std::fs::create_dir_all(&game_dir);
-            let _ = std::fs::create_dir_all(root.join("natives"));
-            let cp = plan.classpath.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(":");
-            let mut args = vec![
-                "-Xmx1024m".to_string(),
-                "-XX:+UseSerialGC".to_string(),
-                "-Djava.awt.headless=true".to_string(),
-                format!("-Djava.class.path={cp}"),
-                format!("-Dorg.lwjgl.librarypath={}", nat.display()),
-            ];
-            args.extend(plan.jvm_args.iter().cloned());
-            let cfg = jvm::JvmConfig {
-                lib_dir: jvm::pick_lib_dir(&home, jre::OS_ARCH),
-                java_home: home,
-                work_dir: game_dir,
-                tmp_dir: root.join("tmp"),
-                extra_lib_dirs: vec![nat.clone(), root.join("natives")],
-                args,
-                main_class: Some(plan.main_class.clone()),
-                app_args: plan.game_args.clone(),
-            };
-            push(format!("$ java … {} {}", plan.main_class, plan.game_args.join(" ")));
-            let cb = {
-                let p = push.clone();
-                Arc::new(move |s: String| p(format!("[jvm] {s}"))) as Arc<dyn Fn(String) + Send + Sync>
-            };
-            match jvm::run(&cfg, cb) {
-                Ok(code) => {
-                    push(format!("main trả về, mã {code}"));
-                    shared.set_phase(if code == 0 { "Minecraft đã chạy xong main" } else { "Minecraft báo lỗi (xem nhật ký)" });
-                }
-                Err(e) => fail(e),
             }
             busy.store(false, Relaxed);
         });

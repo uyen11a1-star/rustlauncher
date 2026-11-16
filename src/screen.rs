@@ -12,7 +12,6 @@ const BTN_OFF: u32 = 0x3a3a3cff;
 const SEL: u32 = 0x2d5a8aff;
 
 pub enum Action {
-    Run(String),
     View(String),
 }
 
@@ -207,28 +206,6 @@ impl Screen {
         }
         g.clear_clip();
         y += list.h + 12.0 * s;
-
-        // nút chạy
-        let busy = l.busy.load(Relaxed);
-        let used = l.jvm_used.load(Relaxed);
-        let can = !busy && !used && self.selected.is_some();
-        let label = match (&self.selected, used) {
-            (_, true) => "JVM đã chạy (mở lại app để chạy lần nữa)".to_string(),
-            (Some(v), _) => format!("Cài và chạy {v}"),
-            (None, _) => "Chọn một phiên bản".to_string(),
-        };
-        let btn = Rect { x: m, y, w: w - 2.0 * m, h: 46.0 * s };
-        g.rect(btn.x, btn.y, btn.w, btn.h, if can { BTN } else { BTN_OFF });
-        let tw = g.text_width(&label, 16.0 * s);
-        g.text(btn.x + (btn.w - tw) / 2.0, btn.y + 12.0 * s, 16.0 * s, if can { 0xffffffff } else { DIM }, &label);
-        if can {
-            if let Some(t) = tap {
-                if btn.has(t) {
-                    run = self.selected.clone().map(Action::Run);
-                }
-            }
-        }
-        y += btn.h + 8.0 * s;
 
         // nút xem khối thật (G1)
         let can2 = !busy && self.selected.is_some();

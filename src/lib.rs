@@ -1,4 +1,4 @@
-//! Rust Launcher: launcher Minecraft Java cho Android, shell tự viết (android-activity + EGL + GLES, không eframe).
+//! Game voxel viết bằng Rust cho Android, đọc dữ liệu từ Minecraft Java (android-activity + EGL + GLES, không JVM).
 use std::{ffi::c_void, path::PathBuf, time::Duration};
 
 use android_activity::{
@@ -7,21 +7,16 @@ use android_activity::{
 };
 
 mod assets;
-mod components;
 mod gfx;
 mod gles;
 mod inflate;
-mod jre;
 mod json;
-mod jvm;
-mod launch;
 mod launcher;
 mod math;
 mod mc;
 mod png;
 mod scene;
 mod screen;
-mod tarx;
 mod view;
 mod zipr;
 
@@ -144,8 +139,7 @@ fn android_main(app: AndroidApp) {
                             }
                         }
                         match screen.draw(g, &launcher) {
-                            Some(screen::Action::Run(id)) => launcher.start(id),
-                            Some(screen::Action::View(id)) => launcher.prepare_view(id),
+                                            Some(screen::Action::View(id)) => launcher.prepare_view(id),
                             None => {}
                         }
                     }

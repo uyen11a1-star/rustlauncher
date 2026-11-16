@@ -132,12 +132,25 @@ pub fn decode(data: &[u8]) -> Result<Image, String> {
             let o = (y * w + x) * 4;
             match ctype {
                 0 => {
-                    let g = to8(sample(row, x));
+                    let raw_g = sample(row, x);
+                    let g = to8(raw_g);
                     rgba[o..o + 3].copy_from_slice(&[g, g, g]);
+                    // tRNS của ảnh xám: một giá trị xám duy nhất là trong suốt
+                    if trns.len() >= 2 && raw_g == (((trns[0] as u32) << 8) | trns[1] as u32) {
+                        rgba[o + 3] = 0;
+                    }
                 }
                 2 => {
+                    let mut hit = trns.len() >= 6;
                     for k in 0..3 {
-                        rgba[o + k] = to8(sample(row, x * 3 + k));
+                        let v = sample(row, x * 3 + k);
+                        rgba[o + k] = to8(v);
+                        if hit && v != (((trns[k * 2] as u32) << 8) | trns[k * 2 + 1] as u32) {
+                            hit = false;
+                        }
+                    }
+                    if hit {
+                        rgba[o + 3] = 0;
                     }
                 }
                 3 => {
