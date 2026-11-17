@@ -213,7 +213,7 @@ impl View {
             glEnable(GL_DEPTH_TEST);
             glDepthFunc(GL_LEQUAL);
             glDisable(GL_BLEND);
-            glDisable(GL_CULL_FACE);
+            glEnable(GL_CULL_FACE);
             glUseProgram(self.prog);
             glUniformMatrix4fv(self.u_mvp, 1, 0, mvp.as_ptr());
             glActiveTexture(GL_TEXTURE0);
@@ -230,6 +230,7 @@ impl View {
             glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, self.ebo);
             glDrawElements(GL_TRIANGLES, self.count, GL_UNSIGNED_INT, 0 as *const _);
             glDisable(GL_DEPTH_TEST);
+            glDisable(GL_CULL_FACE);
         }
 
         // HUD
