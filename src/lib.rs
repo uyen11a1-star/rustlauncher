@@ -24,6 +24,9 @@ mod screen;
 mod view;
 mod world;
 mod zipr;
+mod account;
+mod keyboard;
+mod ui;
 
 enum Mode {
     Menu,
@@ -152,7 +155,7 @@ fn android_main(app: AndroidApp) {
                                 } else {
                                     let say = launcher::pusher(&launcher.log);
                                     match perm::request_all_files(vm, app.activity_as_ptr(), "dev.rustlauncher.app") {
-                                        Ok(()) => say("Cần quyền quản lý mọi tệp: bật cho Rust Launcher ở trang vừa mở, rồi quay lại và bấm nút vàng lần nữa.".into()),
+                                        Ok(()) => say("Cần quyền quản lý mọi tệp: bật cho Rust Launcher ở trang vừa mở, rồi quay lại và bấm PLAY lần nữa.".into()),
                                         Err(e) => say(format!("Không mở được trang cấp quyền ({e}). Tự vào Cài đặt > Ứng dụng > Rust Launcher > Quyền để bật quản lý mọi tệp.")),
                                     }
                                 }

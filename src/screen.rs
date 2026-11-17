@@ -1,15 +1,13 @@
-//! Màn hình launcher vẽ tay bằng Gfx: danh sách phiên bản, nút chạy, tiến trình, nhật ký. Điều khiển bằng chạm/kéo.
+//! Màn hình launcher: thanh tài khoản, menu, thanh phiên bản + PLAY. Vẽ tay bằng Gfx, điều khiển bằng chạm/kéo.
 use std::sync::atomic::Ordering::Relaxed;
 
-use crate::{gfx::Gfx, launcher::Launcher};
-
-const BG: u32 = 0x1c1c1eff;
-const PANEL: u32 = 0x262628ff;
-const TEXT: u32 = 0xe8e8e8ff;
-const DIM: u32 = 0x9a9aa0ff;
-const BTN: u32 = 0x2f6fb3ff;
-const BTN_OFF: u32 = 0x3a3a3cff;
-const SEL: u32 = 0x2d5a8aff;
+use crate::{
+    account::{Accounts, Kind},
+    gfx::Gfx,
+    keyboard::{Kb, Keyboard},
+    launcher::Launcher,
+    ui::*,
+};
 
 pub enum Action {
     View(String),
@@ -17,42 +15,30 @@ pub enum Action {
 }
 
 #[derive(Clone, Copy, PartialEq)]
-enum Region {
-    None,
+enum Page {
+    Main,
     Versions,
+    Accounts,
+    AddName,
     Log,
 }
 
-#[derive(Clone, Copy)]
-struct Rect {
-    x: f32,
-    y: f32,
-    w: f32,
-    h: f32,
-}
-
-impl Rect {
-    fn has(&self, p: (f32, f32)) -> bool {
-        p.0 >= self.x && p.0 < self.x + self.w && p.1 >= self.y && p.1 < self.y + self.h
-    }
-}
-
 pub struct Screen {
+    page: Page,
     show_snapshots: bool,
     selected: Option<String>,
-    // cảm ứng
+    accounts: Option<Accounts>,
+    kb: Keyboard,
+    name_buf: String,
+    name_err: Option<&'static str>,
+    hint: Option<&'static str>,
     press: Option<(f32, f32)>,
     last: (f32, f32),
     dragging: bool,
-    drag_region: Region,
     tap: Option<(f32, f32)>,
-    // cuộn
-    ver_scroll: f32,
+    scroll: f32,
     log_scroll: f32,
     log_stick: bool,
-    ver_rect: Rect,
-    log_rect: Rect,
-    // nhật ký đã ngắt dòng (cache)
     wrapped: Vec<String>,
     wrapped_from: usize,
     wrapped_w: f32,
@@ -61,20 +47,22 @@ pub struct Screen {
 
 impl Screen {
     pub fn new() -> Self {
-        let z = Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 };
         Self {
+            page: Page::Main,
             show_snapshots: false,
             selected: None,
+            accounts: None,
+            kb: Keyboard::new(),
+            name_buf: String::new(),
+            name_err: None,
+            hint: None,
             press: None,
             last: (0.0, 0.0),
             dragging: false,
-            drag_region: Region::None,
             tap: None,
-            ver_scroll: 0.0,
+            scroll: 0.0,
             log_scroll: 0.0,
             log_stick: true,
-            ver_rect: z,
-            log_rect: z,
             wrapped: Vec::new(),
             wrapped_from: 0,
             wrapped_w: 0.0,
@@ -87,13 +75,6 @@ impl Screen {
         self.press = Some((x, y));
         self.last = (x, y);
         self.dragging = false;
-        self.drag_region = if self.ver_rect.has((x, y)) {
-            Region::Versions
-        } else if self.log_rect.has((x, y)) {
-            Region::Log
-        } else {
-            Region::None
-        };
     }
 
     pub fn touch_move(&mut self, x: f32, y: f32, scale: f32) {
@@ -103,13 +84,13 @@ impl Screen {
         }
         if self.dragging {
             let dy = y - self.last.1;
-            match self.drag_region {
-                Region::Versions => self.ver_scroll -= dy,
-                Region::Log => {
+            match self.page {
+                Page::Versions | Page::Accounts => self.scroll -= dy,
+                Page::Log => {
                     self.log_scroll -= dy;
                     self.log_stick = false;
                 }
-                Region::None => {}
+                _ => {}
             }
         }
         self.last = (x, y);
@@ -121,6 +102,14 @@ impl Screen {
         }
         self.press = None;
         self.dragging = false;
+    }
+
+    fn go(&mut self, p: Page) {
+        self.page = p;
+        self.scroll = 0.0;
+        if p == Page::Main {
+            self.hint = None;
+        }
     }
 
     fn update_wrap(&mut self, g: &mut Gfx, l: &Launcher, size: f32, max_w: f32) {
@@ -142,161 +131,425 @@ impl Screen {
         }
     }
 
-    /// Vẽ một khung hình. Trả về phiên bản vừa được bấm "chạy" (nếu có).
+    /// Thanh tiêu đề của trang con. Trả về (đã chạm nút quay lại, y đáy thanh).
+    fn header(&mut self, g: &mut Gfx, title: &str, tap: Option<(f32, f32)>) -> (bool, f32) {
+        let s = g.scale;
+        let w = g.w as f32;
+        let (inset, bh) = (30.0 * s, 56.0 * s);
+        g.rect(0.0, 0.0, w, inset + bh, BAR);
+        g.rect(0.0, inset + bh, w, 2.0 * s, ACCENT);
+        icon(g, &ICON_BACK, 20.0 * s, inset + (bh - 24.0 * s) / 2.0, 3.0 * s, TEXT);
+        text_v(g, 64.0 * s, Rect::new(0.0, inset, w, bh), 18.0 * s, TEXT, title);
+        (hit(Rect::new(0.0, inset, 64.0 * s, bh), tap), inset + bh + 2.0 * s)
+    }
+
+    /// Vẽ một khung hình. Trả về hành động khi người dùng bấm chạy.
     pub fn draw(&mut self, g: &mut Gfx, l: &Launcher) -> Option<Action> {
+        if self.accounts.is_none() {
+            self.accounts = Some(Accounts::load(&l.root));
+        }
+        let tap = self.tap.take();
+        g.begin();
+        let mut act = None;
+        match self.page {
+            Page::Main => act = self.page_main(g, l, tap),
+            Page::Versions => self.page_versions(g, l, tap),
+            Page::Accounts => self.page_accounts(g, tap),
+            Page::AddName => self.page_addname(g, tap),
+            Page::Log => self.page_log(g, l, tap),
+        }
+        if !g.has_font() {
+            g.rect(0.0, 0.0, g.w as f32, 6.0, 0xff0000ff);
+        }
+        g.end(Some(BG));
+        act
+    }
+
+    fn page_main(&mut self, g: &mut Gfx, l: &Launcher, tap: Option<(f32, f32)>) -> Option<Action> {
         let s = g.scale;
         let (w, h) = (g.w as f32, g.h as f32);
         let m = 16.0 * s;
-        let tap = self.tap.take();
+        let (inset, tb) = (30.0 * s, 64.0 * s);
+        let mut nav: Option<Page> = None;
         let mut run: Option<Action> = None;
-        g.begin();
 
-        let mut y = 40.0 * s;
-        g.text(m, y, 26.0 * s, TEXT, "Rust Launcher");
-        y += 34.0 * s;
-        g.text(m, y, 12.0 * s, DIM, "Game Rust: G2 - đọc world Java thật");
-        y += 22.0 * s;
+        // chọn sẵn một phiên bản (ưu tiên 1.21.10) để PLAY dùng được ngay
+        if self.selected.is_none() {
+            let pick: Option<String>;
+            {
+                let vs = l.shared.versions.lock().unwrap();
+                pick = vs.iter().find(|v| v.id == "1.21.10").or_else(|| vs.iter().find(|v| v.kind == "release")).map(|v| v.id.clone());
+            }
+            self.selected = pick;
+        }
+        let acc_name = self.accounts.as_ref().and_then(|a| a.current()).map(|a| a.name.clone());
+        let l17 = g.line_height(17.0 * s);
 
-        // checkbox snapshot
-        let cb = 20.0 * s;
-        let row = Rect { x: m, y, w: w - 2.0 * m, h: cb + 8.0 * s };
-        if let Some(t) = tap {
-            if row.has(t) {
-                self.show_snapshots = !self.show_snapshots;
+        // thanh trên: tài khoản + nhật ký
+        g.rect(0.0, 0.0, w, inset + tb, BAR);
+        g.rect(0.0, inset + tb, w, 2.0 * s, ACCENT);
+        let av = Rect::new(m, inset + (tb - 40.0 * s) / 2.0, 40.0 * s, 40.0 * s);
+        let bar = Rect::new(0.0, inset, w, tb);
+        match &acc_name {
+            Some(n) => {
+                avatar(g, av, n);
+                text_v(g, m + 52.0 * s, bar, 18.0 * s, TEXT, n);
+            }
+            None => {
+                g.rect(av.x, av.y, av.w, av.h, OFF);
+                icon(g, &ICON_USER, av.x + 8.0 * s, av.y + 8.0 * s, 3.0 * s, DIM);
+                text_v(g, m + 52.0 * s, bar, 16.0 * s, DIM, "Chưa có tài khoản");
             }
         }
-        g.rect(m, y + 4.0 * s, cb, cb, if self.show_snapshots { SEL } else { PANEL });
-        if self.show_snapshots {
-            g.rect(m + 5.0 * s, y + 9.0 * s, cb - 10.0 * s, cb - 10.0 * s, TEXT);
+        icon(g, &ICON_LOG, w - 48.0 * s, inset + (tb - 24.0 * s) / 2.0, 3.0 * s, DIM);
+        if hit(Rect::new(w - 76.0 * s, inset, 76.0 * s, tb), tap) {
+            nav = Some(Page::Log);
+        } else if hit(Rect::new(0.0, inset, w - 76.0 * s, tb), tap) {
+            nav = Some(Page::Accounts);
         }
-        g.text(m + cb + 10.0 * s, y + 6.0 * s, 14.0 * s, TEXT, "Hiện cả snapshot");
-        y += cb + 14.0 * s;
 
-        // danh sách phiên bản
-        let item_h = 36.0 * s;
-        let list = Rect { x: m, y, w: w - 2.0 * m, h: 150.0 * s };
-        self.ver_rect = list;
-        let ids: Vec<String> = l
+        // phần đầu trang
+        let hy = inset + tb + 2.0 * s;
+        let hh = 180.0 * s;
+        vgrad(g, Rect::new(0.0, hy, w, hh), 0x0f2b31ff, BG);
+        let l40 = g.line_height(40.0 * s);
+        g.text(m, hy + 30.0 * s, 40.0 * s, ACCENT, "RUST");
+        g.text(m, hy + 30.0 * s + l40, 40.0 * s, TEXT, "LAUNCHER");
+        g.text(m, hy + hh - 30.0 * s, 13.0 * s, DIM, "Minecraft voxel không JVM  ·  đọc thế giới Java thật");
+
+        // menu
+        let sub_acc = acc_name.clone().unwrap_or_else(|| "Chưa đăng nhập".to_string());
+        let items: [(&[u8; 8], &str, String); 3] = [
+            (&ICON_USER, "TÀI KHOẢN", sub_acc),
+            (&ICON_CUBE, "XEM KHỐI MẪU", "Cảnh thử khối thật".to_string()),
+            (&ICON_LOG, "NHẬT KÝ", "Tiến trình và lỗi".to_string()),
+        ];
+        let rh = 72.0 * s;
+        let mut y = hy + hh + 4.0 * s;
+        let busy = l.busy.load(Relaxed);
+        for (i, (ic, label, sub)) in items.iter().enumerate() {
+            let r = Rect::new(0.0, y, w, rh);
+            icon(g, ic, m + 4.0 * s, y + (rh - 32.0 * s) / 2.0, 4.0 * s, ACCENT);
+            g.text(m + 64.0 * s, y + 14.0 * s, 17.0 * s, TEXT, label);
+            g.text(m + 64.0 * s, y + 14.0 * s + l17 + 2.0 * s, 12.0 * s, DIM, sub);
+            g.rect(m, y + rh - 1.0, w - 2.0 * m, 1.0, LINE);
+            if hit(r, tap) {
+                match i {
+                    0 => nav = Some(Page::Accounts),
+                    1 => {
+                        if !busy {
+                            if let Some(v) = &self.selected {
+                                run = Some(Action::View(v.clone()));
+                            }
+                        }
+                    }
+                    _ => nav = Some(Page::Log),
+                }
+            }
+            y += rh;
+        }
+
+        // thanh dưới: tiến trình, phiên bản, PLAY
+        let bar_top = h - 36.0 * s - 150.0 * s;
+        g.rect(0.0, bar_top, w, h - bar_top, BAR);
+        g.rect(0.0, bar_top, w, 1.0, LINE);
+        let mut info = l.shared.phase.lock().unwrap().clone();
+        let (d, t) = (l.shared.bytes_done.load(Relaxed), l.shared.bytes_total.load(Relaxed));
+        let (fd, ft) = (l.shared.files_done.load(Relaxed), l.shared.files_total.load(Relaxed));
+        if ft > 0 {
+            info = format!("{info}  ·  {fd}/{ft} file");
+        }
+        g.text(m, bar_top - 44.0 * s, 12.0 * s, DIM, &info);
+        if t > 0 {
+            let by = bar_top - 16.0 * s;
+            g.rect(m, by, w - 2.0 * m, 5.0 * s, OFF);
+            g.rect(m, by, (w - 2.0 * m) * (d as f32 / t as f32).min(1.0), 5.0 * s, ACCENT);
+        }
+
+        let card = Rect::new(m, bar_top + 14.0 * s, w - 2.0 * m, 56.0 * s);
+        g.rect(card.x, card.y, card.w, card.h, CARD);
+        let tile = Rect::new(card.x + 8.0 * s, card.y + 8.0 * s, 40.0 * s, 40.0 * s);
+        vgrad(g, tile, ACCENT, ACCENT_DK);
+        text_c(g, tile, 16.0 * s, 0x022b25ff, "MC");
+        let vlabel = self.selected.clone().unwrap_or_else(|| "Chọn phiên bản".to_string());
+        g.text(card.x + 60.0 * s, card.y + 9.0 * s, 17.0 * s, TEXT, &vlabel);
+        g.text(card.x + 60.0 * s, card.y + 9.0 * s + l17 + 1.0 * s, 12.0 * s, DIM, "Phiên bản Minecraft");
+        icon(g, &ICON_UP, card.x + card.w - 40.0 * s, card.y + (card.h - 24.0 * s) / 2.0, 3.0 * s, DIM);
+        if hit(card, tap) {
+            nav = Some(Page::Versions);
+        }
+
+        let play = Rect::new(m, card.y + card.h + 10.0 * s, w - 2.0 * m, 52.0 * s);
+        let can = !busy && self.selected.is_some();
+        if can {
+            vgrad(g, play, ACCENT, ACCENT_DK);
+            g.rect(play.x, play.y, play.w, 2.0 * s, 0x9ff7ebff);
+            text_c(g, play, 20.0 * s, 0x022b25ff, "PLAY");
+        } else {
+            g.rect(play.x, play.y, play.w, play.h, OFF);
+            text_c(g, play, 16.0 * s, DIM, if busy { "ĐANG CHUẨN BỊ..." } else { "CHỌN PHIÊN BẢN" });
+        }
+        if can && hit(play, tap) {
+            if self.accounts.as_ref().map_or(true, |a| a.current().is_none()) {
+                nav = Some(Page::Accounts);
+                self.hint = Some("Thêm một tài khoản (ngoại tuyến) rồi quay lại bấm PLAY");
+            } else {
+                run = self.selected.clone().map(Action::World);
+            }
+        }
+
+        if let Some(p) = nav {
+            self.go(p);
+        }
+        run
+    }
+
+    fn page_versions(&mut self, g: &mut Gfx, l: &Launcher, tap: Option<(f32, f32)>) {
+        let (back, top) = self.header(g, "Phiên bản", tap);
+        if back {
+            self.go(Page::Main);
+            return;
+        }
+        let s = g.scale;
+        let (w, h) = (g.w as f32, g.h as f32);
+        let m = 16.0 * s;
+        let snaps = self.show_snapshots;
+        let row = Rect::new(0.0, top, w, 56.0 * s);
+        let bx = Rect::new(m, top + 16.0 * s, 24.0 * s, 24.0 * s);
+        g.rect(bx.x, bx.y, bx.w, bx.h, if snaps { ACCENT_DK } else { CARD_HI });
+        if snaps {
+            g.rect(bx.x + 6.0 * s, bx.y + 6.0 * s, 12.0 * s, 12.0 * s, TEXT);
+        }
+        text_v(g, m + 36.0 * s, row, 15.0 * s, TEXT, "Hiện cả snapshot");
+        g.rect(0.0, row.y + row.h - 1.0, w, 1.0, LINE);
+        if hit(row, tap) {
+            self.show_snapshots = !snaps;
+            self.scroll = 0.0;
+        }
+
+        let list = Rect::new(0.0, top + 56.0 * s, w, h - (top + 56.0 * s) - 36.0 * s);
+        let ids: Vec<(String, String)> = l
             .shared
             .versions
             .lock()
             .unwrap()
             .iter()
-            .filter(|v| self.show_snapshots || v.kind == "release")
-            .map(|v| v.id.clone())
+            .filter(|v| snaps || v.kind == "release")
+            .map(|v| (v.id.clone(), v.kind.clone()))
             .collect();
-        let content = ids.len() as f32 * item_h;
-        self.ver_scroll = self.ver_scroll.clamp(0.0, (content - list.h).max(0.0));
-        g.rect(list.x, list.y, list.w, list.h, PANEL);
+        let ih = 60.0 * s;
+        self.scroll = self.scroll.clamp(0.0, (ids.len() as f32 * ih - list.h).max(0.0));
+        let in_list = tap.map_or(false, |t| list.has(t));
+        let mut chosen: Option<String> = None;
         g.set_clip(list.x, list.y, list.w, list.h);
-        for (i, id) in ids.iter().enumerate() {
-            let iy = list.y + i as f32 * item_h - self.ver_scroll;
-            if iy + item_h < list.y || iy > list.y + list.h {
+        for (i, (id, kind)) in ids.iter().enumerate() {
+            let y = list.y + i as f32 * ih - self.scroll;
+            if y + ih < list.y || y > list.y + list.h {
                 continue;
             }
-            let r = Rect { x: list.x, y: iy, w: list.w, h: item_h };
+            let r = Rect::new(0.0, y, w, ih);
             if self.selected.as_deref() == Some(id.as_str()) {
-                g.rect(r.x, r.y, r.w, r.h, SEL);
+                g.rect(r.x, r.y, r.w, r.h, CARD_HI);
+                g.rect(r.x, r.y, 4.0 * s, r.h, ACCENT);
             }
-            if let Some(t) = tap {
-                if list.has(t) && r.has(t) {
-                    self.selected = Some(id.clone());
-                }
+            text_v(g, m + 8.0 * s, r, 17.0 * s, TEXT, id);
+            let kw = g.text_width(kind, 12.0 * s);
+            text_v(g, w - m - kw, r, 12.0 * s, DIM, kind);
+            g.rect(m, y + ih - 1.0, w - 2.0 * m, 1.0, LINE);
+            if in_list && hit(r, tap) {
+                chosen = Some(id.clone());
             }
-            g.text(r.x + 10.0 * s, r.y + 8.0 * s, 16.0 * s, TEXT, id);
         }
         g.clear_clip();
-        y += list.h + 12.0 * s;
+        if let Some(id) = chosen {
+            self.selected = Some(id);
+            self.go(Page::Main);
+        }
+    }
 
-        // nút xem khối thật (G1)
-        let busy = l.busy.load(Relaxed);
-        let can2 = !busy && self.selected.is_some();
-        let btn2 = Rect { x: m, y, w: w - 2.0 * m, h: 46.0 * s };
-        g.rect(btn2.x, btn2.y, btn2.w, btn2.h, if can2 { 0x2e8b57ff } else { BTN_OFF });
-        let l2 = match &self.selected {
-            Some(v) => format!("Xem khối thật {v} (game Rust)"),
-            None => "Chọn một phiên bản".to_string(),
+    fn page_accounts(&mut self, g: &mut Gfx, tap: Option<(f32, f32)>) {
+        let (back, top) = self.header(g, "Tài khoản", tap);
+        if back {
+            self.go(Page::Main);
+            return;
+        }
+        let s = g.scale;
+        let (w, h) = (g.w as f32, g.h as f32);
+        let m = 16.0 * s;
+        let (bh, gap) = (52.0 * s, 10.0 * s);
+        let block_top = h - 36.0 * s - (3.0 * bh + 4.0 * gap);
+        let mut ly = top + 8.0 * s;
+        if let Some(t) = self.hint {
+            g.text(m, ly + 4.0 * s, 13.0 * s, WARN, t);
+            ly += 30.0 * s;
+        }
+        let list = Rect::new(0.0, ly, w, block_top - ly);
+        let (rows, sel): (Vec<(String, &'static str)>, usize) = match &self.accounts {
+            Some(a) => (
+                a.list
+                    .iter()
+                    .map(|x| {
+                        let label = match x.kind {
+                            Kind::Offline => "Ngoại tuyến",
+                        };
+                        (x.name.clone(), label)
+                    })
+                    .collect(),
+                a.sel,
+            ),
+            None => (Vec::new(), 0),
         };
-        let tw2 = g.text_width(&l2, 16.0 * s);
-        g.text(btn2.x + (btn2.w - tw2) / 2.0, btn2.y + 12.0 * s, 16.0 * s, if can2 { 0xffffffff } else { DIM }, &l2);
-        if can2 {
-            if let Some(t) = tap {
-                if btn2.has(t) {
-                    run = self.selected.clone().map(Action::View);
+        let ih = 72.0 * s;
+        let l17 = g.line_height(17.0 * s);
+        self.scroll = self.scroll.clamp(0.0, (rows.len() as f32 * ih - list.h).max(0.0));
+        if rows.is_empty() {
+            text_c(g, list, 14.0 * s, DIM, "Chưa có tài khoản nào");
+        }
+        let in_list = tap.map_or(false, |t| list.has(t));
+        let (mut del, mut pick): (Option<usize>, Option<usize>) = (None, None);
+        g.set_clip(list.x, list.y, list.w, list.h);
+        for (i, (name, label)) in rows.iter().enumerate() {
+            let y = list.y + i as f32 * ih - self.scroll;
+            if y + ih < list.y || y > list.y + list.h {
+                continue;
+            }
+            let r = Rect::new(0.0, y, w, ih);
+            if i == sel {
+                g.rect(r.x, r.y, r.w, r.h, CARD_HI);
+                g.rect(r.x, r.y, 4.0 * s, r.h, ACCENT);
+                icon(g, &ICON_CHECK, w - 100.0 * s, y + (ih - 24.0 * s) / 2.0, 3.0 * s, ACCENT);
+            }
+            avatar(g, Rect::new(m + 4.0 * s, y + (ih - 44.0 * s) / 2.0, 44.0 * s, 44.0 * s), name);
+            g.text(m + 64.0 * s, y + 14.0 * s, 17.0 * s, TEXT, name);
+            g.text(m + 64.0 * s, y + 14.0 * s + l17 + 2.0 * s, 12.0 * s, DIM, label);
+            icon(g, &ICON_TRASH, w - 48.0 * s, y + (ih - 24.0 * s) / 2.0, 3.0 * s, DIM);
+            g.rect(m, y + ih - 1.0, w - 2.0 * m, 1.0, LINE);
+            if in_list {
+                if hit(Rect::new(w - 64.0 * s, y, 64.0 * s, ih), tap) {
+                    del = Some(i);
+                } else if hit(r, tap) {
+                    pick = Some(i);
                 }
             }
         }
-        y += btn2.h + 8.0 * s;
+        g.clear_clip();
 
-        // nút mở thế giới thật (G2)
-        let btn3 = Rect { x: m, y, w: w - 2.0 * m, h: 46.0 * s };
-        g.rect(btn3.x, btn3.y, btn3.w, btn3.h, if can2 { 0xb8860bff } else { BTN_OFF });
-        let l3 = match &self.selected {
-            Some(v) => format!("Mở world thật bằng {v}"),
-            None => "Chọn một phiên bản".to_string(),
-        };
-        let tw3 = g.text_width(&l3, 16.0 * s);
-        g.text(btn3.x + (btn3.w - tw3) / 2.0, btn3.y + 12.0 * s, 16.0 * s, if can2 { 0xffffffff } else { DIM }, &l3);
-        if can2 {
-            if let Some(t) = tap {
-                if btn3.has(t) {
-                    run = self.selected.clone().map(Action::World);
+        // nút thêm tài khoản
+        let bx = |i: usize| Rect::new(m, block_top + gap + i as f32 * (bh + gap), w - 2.0 * m, bh);
+        let r0 = bx(0);
+        vgrad(g, r0, ACCENT, ACCENT_DK);
+        text_c(g, r0, 16.0 * s, 0x022b25ff, "+  NGOẠI TUYẾN");
+        for (i, name) in ["MICROSOFT", "ELY.BY"].iter().enumerate() {
+            let r = bx(i + 1);
+            g.rect(r.x, r.y, r.w, r.h, OFF);
+            text_v(g, r.x + 16.0 * s, r, 15.0 * s, DIM, name);
+            let tw = g.text_width("sắp có", 12.0 * s);
+            text_v(g, r.x + r.w - 16.0 * s - tw, r, 12.0 * s, DIM, "sắp có");
+        }
+
+        if let Some(i) = del {
+            if let Some(a) = self.accounts.as_mut() {
+                a.remove(i);
+            }
+        } else if let Some(i) = pick {
+            if let Some(a) = self.accounts.as_mut() {
+                a.select(i);
+            }
+            self.go(Page::Main);
+        } else if hit(r0, tap) {
+            self.name_buf.clear();
+            self.name_err = None;
+            self.kb.reset();
+            self.go(Page::AddName);
+        }
+    }
+
+    fn page_addname(&mut self, g: &mut Gfx, tap: Option<(f32, f32)>) {
+        let (back, top) = self.header(g, "Tài khoản ngoại tuyến", tap);
+        if back {
+            self.go(Page::Accounts);
+            return;
+        }
+        let s = g.scale;
+        let (w, h) = (g.w as f32, g.h as f32);
+        let m = 16.0 * s;
+        let bx = Rect::new(m, top + 24.0 * s, w - 2.0 * m, 60.0 * s);
+        g.rect(bx.x, bx.y, bx.w, bx.h, CARD);
+        g.rect(bx.x, bx.y + bx.h - 2.0 * s, bx.w, 2.0 * s, ACCENT);
+        if self.name_buf.is_empty() {
+            text_v(g, bx.x + 16.0 * s, bx, 20.0 * s, DIM, "Nhập tên người chơi");
+        } else {
+            let t = self.name_buf.clone();
+            text_v(g, bx.x + 16.0 * s, bx, 20.0 * s, TEXT, &t);
+        }
+        let l12 = g.line_height(12.0 * s);
+        g.text(m, bx.y + bx.h + 12.0 * s, 12.0 * s, DIM, "1-16 ký tự: chữ, số hoặc dấu _");
+        if let Some(e) = self.name_err {
+            g.text(m, bx.y + bx.h + 12.0 * s + l12 + 6.0 * s, 13.0 * s, WARN, e);
+        }
+
+        let kh = 300.0 * s;
+        let area = Rect::new(0.0, h - 36.0 * s - kh, w, kh);
+        match self.kb.draw(g, area, tap) {
+            Some(Kb::Ch(c)) => {
+                if self.name_buf.len() < 16 {
+                    self.name_buf.push(c);
+                }
+                self.name_err = None;
+            }
+            Some(Kb::Back) => {
+                self.name_buf.pop();
+                self.name_err = None;
+            }
+            Some(Kb::Cancel) => self.go(Page::Accounts),
+            Some(Kb::Done) => {
+                let n = self.name_buf.clone();
+                let r = match self.accounts.as_mut() {
+                    Some(a) => a.add_offline(&n),
+                    None => Err("Chưa nạp được danh sách tài khoản"),
+                };
+                match r {
+                    Ok(()) => self.go(Page::Main),
+                    Err(e) => self.name_err = Some(e),
                 }
             }
+            _ => {}
         }
-        y += btn3.h + 12.0 * s;
+    }
 
-        // trạng thái + tiến trình
-        let phase = l.shared.phase.lock().unwrap().clone();
-        g.text(m, y, 14.0 * s, TEXT, &phase);
-        y += 22.0 * s;
-        let (d, t) = (l.shared.bytes_done.load(Relaxed), l.shared.bytes_total.load(Relaxed));
-        if t > 0 {
-            let bar = Rect { x: m, y, w: w - 2.0 * m, h: 16.0 * s };
-            g.rect(bar.x, bar.y, bar.w, bar.h, PANEL);
-            g.rect(bar.x, bar.y, bar.w * (d as f32 / t as f32).min(1.0), bar.h, BTN);
-            let txt = format!("{} / {} MB", d / 1_000_000, t / 1_000_000);
-            g.text(bar.x + 6.0 * s, bar.y + 1.0 * s, 11.0 * s, 0xffffffff, &txt);
-            y += bar.h + 6.0 * s;
+    fn page_log(&mut self, g: &mut Gfx, l: &Launcher, tap: Option<(f32, f32)>) {
+        let (back, top) = self.header(g, "Nhật ký", tap);
+        if back {
+            self.go(Page::Main);
+            return;
         }
-        let (fd, ft) = (l.shared.files_done.load(Relaxed), l.shared.files_total.load(Relaxed));
-        if ft > 0 {
-            g.text(m, y, 12.0 * s, DIM, &format!("{fd} / {ft} file"));
-            y += 18.0 * s;
-        } else if fd > 0 {
-            g.text(m, y, 12.0 * s, DIM, &format!("{fd} mục đã giải nén"));
-            y += 18.0 * s;
-        }
-        y += 6.0 * s;
-
-        // nhật ký
+        let s = g.scale;
+        let (w, h) = (g.w as f32, g.h as f32);
+        let m = 16.0 * s;
         let font = 11.0 * s;
         let lh = g.line_height(font);
-        let area = Rect { x: m, y, w: w - 2.0 * m, h: (h - y - m).max(40.0 * s) };
-        self.log_rect = area;
+        let area = Rect::new(m, top + 10.0 * s, w - 2.0 * m, h - top - 10.0 * s - 36.0 * s);
         self.update_wrap(g, l, font, area.w - 12.0 * s);
-        let content = self.wrapped.len() as f32 * lh + 8.0 * s;
-        let max_scroll = (content - area.h).max(0.0);
+        g.rect(area.x, area.y, area.w, area.h, 0x0a0e13ff);
+        let total = self.wrapped.len() as f32 * lh;
+        let max_scroll = (total - (area.h - 8.0 * s)).max(0.0);
         if self.log_stick {
             self.log_scroll = max_scroll;
-        } else if self.log_scroll >= max_scroll - 2.0 {
-            self.log_stick = true;
         }
         self.log_scroll = self.log_scroll.clamp(0.0, max_scroll);
-        g.rect(area.x, area.y, area.w, area.h, 0x141416ff);
+        if self.log_scroll >= max_scroll - 1.0 {
+            self.log_stick = true;
+        }
         g.set_clip(area.x, area.y, area.w, area.h);
-        let first = (self.log_scroll / lh).floor().max(0.0) as usize;
-        let last = (((self.log_scroll + area.h) / lh).ceil() as usize + 1).min(self.wrapped.len());
-        for i in first..last {
-            let ly = area.y + 4.0 * s + i as f32 * lh - self.log_scroll;
-            g.text(area.x + 6.0 * s, ly, font, 0xd0d0d0ff, &self.wrapped[i]);
+        let first = (self.log_scroll / lh).floor() as usize;
+        let mut ly = area.y + 4.0 * s - (self.log_scroll - first as f32 * lh);
+        for line in self.wrapped.iter().skip(first) {
+            if ly > area.y + area.h {
+                break;
+            }
+            g.text(area.x + 6.0 * s, ly, font, 0xc9d4e0ff, line);
+            ly += lh;
         }
         g.clear_clip();
-
-        if !g.has_font() {
-            g.rect(0.0, 0.0, w, 6.0, 0xff0000ff);
-        }
-        g.end(Some(BG));
-        run
     }
 }
