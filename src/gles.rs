@@ -73,6 +73,8 @@ extern "C" {
     pub fn glUniformMatrix4fv(loc: i32, count: i32, transpose: u8, v: *const f32);
     pub fn glDepthFunc(f: u32);
     pub fn glDeleteBuffers(n: i32, b: *const u32);
+    pub fn glDisableVertexAttribArray(i: u32);
+    pub fn glDepthMask(flag: u8);
 }
 
 pub const GL_TEXTURE_2D: u32 = 0x0DE1;

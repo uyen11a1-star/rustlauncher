@@ -416,6 +416,8 @@ pub fn occlusion_mask(faces: &[BFace], atlas: &Atlas) -> u8 {
 pub struct Mesh {
     pub v: Vec<V>,
     pub i: Vec<u32>,
+    /// chỉ số của các mặt nước (vẽ riêng, nửa trong suốt)
+    pub iw: Vec<u32>,
 }
 
 impl Mesh {
@@ -428,9 +430,20 @@ impl Mesh {
         self.i.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
     }
 
+    /// Như `push_face` nhưng cho mặt nước: alpha 200, chỉ số vào danh sách `iw`.
+    pub fn push_water(&mut self, f: &BFace, at: [f32; 3], col: [u8; 3]) {
+        let base = self.v.len() as u32;
+        let c = [(col[0] as f32 * f.shade) as u8, (col[1] as f32 * f.shade) as u8, (col[2] as f32 * f.shade) as u8, 200];
+        for k in 0..4 {
+            self.v.push(V { p: [f.q[k][0] + at[0], f.q[k][1] + at[1], f.q[k][2] + at[2]], uv: f.uv[k], c });
+        }
+        self.iw.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+    }
+
     pub fn append(&mut self, o: Mesh) {
         let off = self.v.len() as u32;
         self.v.extend(o.v);
         self.i.extend(o.i.into_iter().map(|x| x + off));
+        self.iw.extend(o.iw.into_iter().map(|x| x + off));
     }
 }

@@ -18,6 +18,7 @@ struct Gpu {
     vbo: u32,
     ebo: u32,
     count: i32,
+    cw: i32,
     nverts: usize,
     bb: [f32; 6],
 }
@@ -30,8 +31,10 @@ unsafe fn upload(c: &ChunkMesh) -> Gpu {
     glBufferData(GL_ARRAY_BUFFER, (c.v.len() * std::mem::size_of::<V>()) as isize, c.v.as_ptr() as *const _, GL_STATIC_DRAW);
     glGenBuffers(1, &mut ebo);
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ebo);
-    glBufferData(GL_ELEMENT_ARRAY_BUFFER, (c.i.len() * 4) as isize, c.i.as_ptr() as *const _, GL_STATIC_DRAW);
-    Gpu { vbo, ebo, count: c.i.len() as i32, nverts: c.v.len(), bb: c.bb }
+    let mut idx = c.i.clone();
+    idx.extend_from_slice(&c.iw);
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER, (idx.len() * 4) as isize, idx.as_ptr() as *const _, GL_STATIC_DRAW);
+    Gpu { vbo, ebo, count: c.i.len() as i32, cw: c.iw.len() as i32, nverts: c.v.len(), bb: c.bb }
 }
 
 unsafe fn free(g: &Gpu) {
@@ -42,15 +45,45 @@ unsafe fn free(g: &Gpu) {
 const VS: &str = "#version 300 es
 in vec3 a_pos; in vec2 a_uv; in vec4 a_col;
 uniform mat4 u_mvp;
-out vec2 v_uv; out vec4 v_col;
-void main(){ v_uv=a_uv; v_col=a_col; gl_Position=u_mvp*vec4(a_pos,1.0); }";
+out vec2 v_uv; out vec4 v_col; out float v_d;
+void main(){ v_uv=a_uv; v_col=a_col; vec4 p=u_mvp*vec4(a_pos,1.0); v_d=p.w; gl_Position=p; }";
 
 const FS: &str = "#version 300 es
 precision highp float;
-in vec2 v_uv; in vec4 v_col;
+in vec2 v_uv; in vec4 v_col; in float v_d;
 uniform sampler2D u_tex;
+uniform vec2 u_fog;
 out vec4 o;
-void main(){ vec4 t=texture(u_tex,v_uv); if(t.a<0.1) discard; o=vec4(t.rgb*v_col.rgb,1.0); }";
+void main(){
+  vec4 t=texture(u_tex,v_uv); if(t.a<0.1) discard;
+  float f=clamp((u_fog.y-v_d)/(u_fog.y-u_fog.x),0.0,1.0);
+  vec3 c=mix(vec3(0.53,0.81,0.92), t.rgb*v_col.rgb, f);
+  o=vec4(c, t.a*v_col.a);
+}";
+
+const VS_SKY: &str = "#version 300 es
+out vec2 v_ndc;
+void main(){ vec2 p=vec2(float((gl_VertexID<<1)&2), float(gl_VertexID&2)); v_ndc=p*2.0-1.0; gl_Position=vec4(v_ndc,1.0,1.0); }";
+
+const FS_SKY: &str = "#version 300 es
+precision highp float;
+in vec2 v_ndc;
+uniform mat4 u_view;
+uniform vec2 u_tf;
+out vec4 o;
+void main(){
+  vec3 d=normalize(vec3(v_ndc.x*u_tf.x, v_ndc.y*u_tf.y, -1.0))*mat3(u_view);
+  float h=clamp(d.y,0.0,1.0);
+  vec3 c=mix(vec3(0.53,0.81,0.92), vec3(0.25,0.50,0.88), pow(h,0.6));
+  float k=dot(d, normalize(vec3(0.5,0.7,0.4)));
+  c+=vec3(1.0,0.95,0.7)*smoothstep(0.9985,0.9995,k);
+  c+=vec3(1.0,0.9,0.6)*0.25*pow(max(k,0.0),64.0);
+  o=vec4(c,1.0);
+}";
+
+/// Sương mù: kín hoàn toàn trước mép vùng nạp (tầm stream 6 chunk = 96 block, xem launcher.rs).
+const FOG_START: f32 = 40.0;
+const FOG_END: f32 = 90.0;
 
 #[derive(Clone, Copy, PartialEq)]
 enum Role {
@@ -79,6 +112,10 @@ pub enum Phase {
 
 pub struct View {
     prog: u32,
+    sky: u32,
+    sky_view: i32,
+    sky_tf: i32,
+    u_fog: i32,
     gpu: HashMap<(i32, i32), Gpu>,
     stream: Option<Streamer>,
     tex: u32,
@@ -118,8 +155,12 @@ impl View {
     /// Cần context GL đang hiện hành.
     pub fn new(d: SceneData) -> Result<View, String> {
         let prog = build_program(VS, FS, &["a_pos", "a_uv", "a_col"])?;
+        let sky = build_program(VS_SKY, FS_SKY, &[])?;
         unsafe {
             let c = |s: &str| CString::new(s).unwrap();
+            let sky_view = glGetUniformLocation(sky, c("u_view").as_ptr());
+            let sky_tf = glGetUniformLocation(sky, c("u_tf").as_ptr());
+            let u_fog = glGetUniformLocation(prog, c("u_fog").as_ptr());
             let u_mvp = glGetUniformLocation(prog, c("u_mvp").as_ptr());
             let u_tex = glGetUniformLocation(prog, c("u_tex").as_ptr());
             let mut gpu = HashMap::new();
@@ -144,6 +185,10 @@ impl View {
             }
             Ok(View {
                 prog,
+                sky,
+                sky_view,
+                sky_tf,
+                u_fog,
                 gpu,
                 stream: d.stream,
                 tex,
@@ -268,22 +313,33 @@ impl View {
             glDisable(GL_SCISSOR_TEST);
             glClearColor(0.53, 0.81, 0.92, 1.0);
             glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+            // bầu trời: tam giác phủ màn hình, hướng nhìn tính từ ma trận view
+            glDisable(GL_DEPTH_TEST);
+            glDisable(GL_CULL_FACE);
+            glDisable(GL_BLEND);
+            for i in 0..3 {
+                glDisableVertexAttribArray(i);
+            }
+            glUseProgram(self.sky);
+            let vm = math::view(self.pos, self.yaw, self.pitch);
+            glUniformMatrix4fv(self.sky_view, 1, 0, vm.as_ptr());
+            let tf = (1.2f32 / 2.0).tan();
+            glUniform2f(self.sky_tf, tf * aspect, tf);
+            glDrawArrays(GL_TRIANGLES, 0, 3);
             glEnable(GL_DEPTH_TEST);
             glDepthFunc(GL_LEQUAL);
             glDisable(GL_BLEND);
             glEnable(GL_CULL_FACE);
             glUseProgram(self.prog);
+            glUniform2f(self.u_fog, FOG_START, FOG_END);
             glUniformMatrix4fv(self.u_mvp, 1, 0, mvp.as_ptr());
             glActiveTexture(GL_TEXTURE0);
             glBindTexture(GL_TEXTURE_2D, self.tex);
             glUniform1i(self.u_tex, 0);
             let stride = std::mem::size_of::<V>() as i32;
             let fr = math::frustum(&mvp);
-            let (mut dc, mut dv) = (0, 0);
-            for c in self.gpu.values() {
-                if !math::aabb_visible(&fr, &c.bb) {
-                    continue;
-                }
+            let vis: Vec<&Gpu> = self.gpu.values().filter(|c| math::aabb_visible(&fr, &c.bb)).collect();
+            let bind = |c: &Gpu| {
                 glBindBuffer(GL_ARRAY_BUFFER, c.vbo);
                 glEnableVertexAttribArray(0);
                 glVertexAttribPointer(0, 3, GL_FLOAT, 0, stride, 0 as *const _);
@@ -292,12 +348,28 @@ impl View {
                 glEnableVertexAttribArray(2);
                 glVertexAttribPointer(2, 4, GL_UNSIGNED_BYTE, 1, stride, 20 as *const _);
                 glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, c.ebo);
+            };
+            // lượt 1: khối đặc
+            for c in &vis {
+                bind(c);
                 glDrawElements(GL_TRIANGLES, c.count, GL_UNSIGNED_INT, 0 as *const _);
-                dc += 1;
-                dv += c.nverts;
             }
-            self.drawn_chunks = dc;
-            self.drawn_verts = dv;
+            // lượt 2: nước nửa trong suốt (không ghi độ sâu)
+            if vis.iter().any(|c| c.cw > 0) {
+                glEnable(GL_BLEND);
+                glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+                glDepthMask(0);
+                for c in &vis {
+                    if c.cw > 0 {
+                        bind(c);
+                        glDrawElements(GL_TRIANGLES, c.cw, GL_UNSIGNED_INT, (c.count as usize * 4) as *const _);
+                    }
+                }
+                glDepthMask(1);
+                glDisable(GL_BLEND);
+            }
+            self.drawn_chunks = vis.len();
+            self.drawn_verts = vis.iter().map(|c| c.nverts).sum();
             glDisable(GL_DEPTH_TEST);
             glDisable(GL_CULL_FACE);
         }
@@ -310,7 +382,7 @@ impl View {
             self.fps_t = Instant::now();
         }
         g.begin();
-        g.text(12.0 * s, 84.0 * s, 13.0 * s, 0xffffffff, &format!("FPS {}  x {:.1} y {:.1} z {:.1}  chunk {}/{}  đỉnh {}/{}", self.fps, self.pos[0], self.pos[1], self.pos[2], self.drawn_chunks, self.gpu.len(), self.drawn_verts, self.nverts));
+        g.text(12.0 * s, 84.0 * s, 13.0 * s, 0xffffffff, &format!("FPS {}  x{:.0} y{:.0} z{:.0}  chunk {}/{}  đỉnh {}k", self.fps, self.pos[0], self.pos[1], self.pos[2], self.drawn_chunks, self.gpu.len(), self.drawn_verts / 1000));
         for (r, label, col) in [
             (rect_exit(g), "Thoát", 0xc0392bd0u32),
             (rect_up(g), "Lên", 0x00000090),

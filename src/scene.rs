@@ -21,6 +21,7 @@ pub struct ChunkMesh {
     pub cz: i32,
     pub v: Vec<V>,
     pub i: Vec<u32>,
+    pub iw: Vec<u32>,
     pub bb: [f32; 6],
 }
 
@@ -33,7 +34,7 @@ impl ChunkMesh {
                 bb[3 + k] = bb[3 + k].max(v.p[k]);
             }
         }
-        ChunkMesh { cx, cz, v: m.v, i: m.i, bb }
+        ChunkMesh { cx, cz, v: m.v, i: m.i, iw: m.iw, bb }
     }
 }
 
@@ -171,7 +172,13 @@ fn mesh_chunk(world: &World, states: &[State], cx: i32, cz: i32) -> Mesh {
                                 continue;
                             }
                         }
-                        mesh.push_face(f, [x as f32, y as f32, z as f32], if f.tint { st.tint } else { [255; 3] });
+                        let at = [x as f32, y as f32, z as f32];
+                        let col = if f.tint { st.tint } else { [255; 3] };
+                        if st.fluid == 1 {
+                            mesh.push_water(f, at, col);
+                        } else {
+                            mesh.push_face(f, at, col);
+                        }
                     }
                 }
             }
