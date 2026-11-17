@@ -25,6 +25,7 @@ mod view;
 mod world;
 mod zipr;
 mod account;
+mod auth;
 mod keyboard;
 mod ui;
 

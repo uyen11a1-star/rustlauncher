@@ -2,7 +2,8 @@
 use std::sync::atomic::Ordering::Relaxed;
 
 use crate::{
-    account::{Accounts, Kind},
+    account::Accounts,
+    auth::{self, Shared, Status},
     gfx::Gfx,
     keyboard::{Kb, Keyboard},
     launcher::Launcher,
@@ -20,6 +21,8 @@ enum Page {
     Versions,
     Accounts,
     AddName,
+    Ely,
+    Ms,
     Log,
 }
 
@@ -32,6 +35,11 @@ pub struct Screen {
     name_buf: String,
     name_err: Option<&'static str>,
     hint: Option<&'static str>,
+    auth: Shared,
+    fields: [String; 3],
+    focus: usize,
+    need_totp: bool,
+    ms_started: bool,
     press: Option<(f32, f32)>,
     last: (f32, f32),
     dragging: bool,
@@ -56,6 +64,11 @@ impl Screen {
             name_buf: String::new(),
             name_err: None,
             hint: None,
+            auth: auth::new_shared(),
+            fields: Default::default(),
+            focus: 0,
+            need_totp: false,
+            ms_started: false,
             press: None,
             last: (0.0, 0.0),
             dragging: false,
@@ -149,6 +162,24 @@ impl Screen {
             self.accounts = Some(Accounts::load(&l.root));
         }
         let tap = self.tap.take();
+        let done = {
+            let mut st = self.auth.lock().unwrap();
+            if let Status::Done(a) = &*st {
+                let a = a.clone();
+                *st = Status::Idle;
+                Some(a)
+            } else {
+                None
+            }
+        };
+        if let Some(a) = done {
+            if let Some(acc) = self.accounts.as_mut() {
+                acc.add(a);
+            }
+            self.fields = Default::default();
+            self.need_totp = false;
+            self.go(Page::Main);
+        }
         g.begin();
         let mut act = None;
         match self.page {
@@ -156,6 +187,8 @@ impl Screen {
             Page::Versions => self.page_versions(g, l, tap),
             Page::Accounts => self.page_accounts(g, tap),
             Page::AddName => self.page_addname(g, tap),
+            Page::Ely => self.page_ely(g, tap),
+            Page::Ms => self.page_ms(g, l, tap),
             Page::Log => self.page_log(g, l, tap),
         }
         if !g.has_font() {
@@ -183,7 +216,6 @@ impl Screen {
             self.selected = pick;
         }
         let acc_name = self.accounts.as_ref().and_then(|a| a.current()).map(|a| a.name.clone());
-        let l17 = g.line_height(17.0 * s);
 
         // thanh trên: tài khoản + nhật ký
         g.rect(0.0, 0.0, w, inset + tb, BAR);
@@ -215,23 +247,16 @@ impl Screen {
         let l40 = g.line_height(40.0 * s);
         g.text(m, hy + 30.0 * s, 40.0 * s, ACCENT, "RUST");
         g.text(m, hy + 30.0 * s + l40, 40.0 * s, TEXT, "LAUNCHER");
-        g.text(m, hy + hh - 30.0 * s, 13.0 * s, DIM, "Minecraft voxel không JVM  ·  đọc thế giới Java thật");
 
         // menu
-        let sub_acc = acc_name.clone().unwrap_or_else(|| "Chưa đăng nhập".to_string());
-        let items: [(&[u8; 8], &str, String); 3] = [
-            (&ICON_USER, "TÀI KHOẢN", sub_acc),
-            (&ICON_CUBE, "XEM KHỐI MẪU", "Cảnh thử khối thật".to_string()),
-            (&ICON_LOG, "NHẬT KÝ", "Tiến trình và lỗi".to_string()),
-        ];
-        let rh = 72.0 * s;
+        let items: [(&[u8; 8], &str); 3] = [(&ICON_USER, "TÀI KHOẢN"), (&ICON_CUBE, "XEM KHỐI MẪU"), (&ICON_LOG, "NHẬT KÝ")];
+        let rh = 64.0 * s;
         let mut y = hy + hh + 4.0 * s;
         let busy = l.busy.load(Relaxed);
-        for (i, (ic, label, sub)) in items.iter().enumerate() {
+        for (i, (ic, label)) in items.iter().enumerate() {
             let r = Rect::new(0.0, y, w, rh);
             icon(g, ic, m + 4.0 * s, y + (rh - 32.0 * s) / 2.0, 4.0 * s, ACCENT);
-            g.text(m + 64.0 * s, y + 14.0 * s, 17.0 * s, TEXT, label);
-            g.text(m + 64.0 * s, y + 14.0 * s + l17 + 2.0 * s, 12.0 * s, DIM, sub);
+            text_v(g, m + 64.0 * s, r, 18.0 * s, TEXT, label);
             g.rect(m, y + rh - 1.0, w - 2.0 * m, 1.0, LINE);
             if hit(r, tap) {
                 match i {
@@ -259,7 +284,9 @@ impl Screen {
         if ft > 0 {
             info = format!("{info}  ·  {fd}/{ft} file");
         }
-        g.text(m, bar_top - 44.0 * s, 12.0 * s, DIM, &info);
+        if busy || t > 0 {
+            g.text(m, bar_top - 44.0 * s, 12.0 * s, DIM, &info);
+        }
         if t > 0 {
             let by = bar_top - 16.0 * s;
             g.rect(m, by, w - 2.0 * m, 5.0 * s, OFF);
@@ -272,8 +299,7 @@ impl Screen {
         vgrad(g, tile, ACCENT, ACCENT_DK);
         text_c(g, tile, 16.0 * s, 0x022b25ff, "MC");
         let vlabel = self.selected.clone().unwrap_or_else(|| "Chọn phiên bản".to_string());
-        g.text(card.x + 60.0 * s, card.y + 9.0 * s, 17.0 * s, TEXT, &vlabel);
-        g.text(card.x + 60.0 * s, card.y + 9.0 * s + l17 + 1.0 * s, 12.0 * s, DIM, "Phiên bản Minecraft");
+        text_v(g, card.x + 60.0 * s, card, 18.0 * s, TEXT, &vlabel);
         icon(g, &ICON_UP, card.x + card.w - 40.0 * s, card.y + (card.h - 24.0 * s) / 2.0, 3.0 * s, DIM);
         if hit(card, tap) {
             nav = Some(Page::Versions);
@@ -388,12 +414,7 @@ impl Screen {
             Some(a) => (
                 a.list
                     .iter()
-                    .map(|x| {
-                        let label = match x.kind {
-                            Kind::Offline => "Ngoại tuyến",
-                        };
-                        (x.name.clone(), label)
-                    })
+                    .map(|x| (x.name.clone(), x.kind.label()))
                     .collect(),
                 a.sel,
             ),
@@ -439,12 +460,10 @@ impl Screen {
         let r0 = bx(0);
         vgrad(g, r0, ACCENT, ACCENT_DK);
         text_c(g, r0, 16.0 * s, 0x022b25ff, "+  NGOẠI TUYẾN");
-        for (i, name) in ["MICROSOFT", "ELY.BY"].iter().enumerate() {
-            let r = bx(i + 1);
-            g.rect(r.x, r.y, r.w, r.h, OFF);
-            text_v(g, r.x + 16.0 * s, r, 15.0 * s, DIM, name);
-            let tw = g.text_width("sắp có", 12.0 * s);
-            text_v(g, r.x + r.w - 16.0 * s - tw, r, 12.0 * s, DIM, "sắp có");
+        let (r1, r2) = (bx(1), bx(2));
+        for (r, name) in [(r1, "MICROSOFT"), (r2, "ELY.BY")] {
+            g.rect(r.x, r.y, r.w, r.h, CARD_HI);
+            text_c(g, r, 16.0 * s, TEXT, name);
         }
 
         if let Some(i) = del {
@@ -461,6 +480,17 @@ impl Screen {
             self.name_err = None;
             self.kb.reset();
             self.go(Page::AddName);
+        } else if hit(r1, tap) {
+            *self.auth.lock().unwrap() = Status::Idle;
+            self.ms_started = false;
+            self.go(Page::Ms);
+        } else if hit(r2, tap) {
+            *self.auth.lock().unwrap() = Status::Idle;
+            self.fields = Default::default();
+            self.focus = 0;
+            self.need_totp = false;
+            self.kb.reset();
+            self.go(Page::Ely);
         }
     }
 
@@ -551,5 +581,150 @@ impl Screen {
             ly += lh;
         }
         g.clear_clip();
+    }
+
+    /// Vẽ đoạn chữ tự xuống dòng, trả về y sau dòng cuối.
+    fn para(&self, g: &mut Gfx, x: f32, y: f32, w: f32, size: f32, color: u32, text: &str) -> f32 {
+        let lh = g.line_height(size);
+        let mut y = y;
+        for line in g.wrap(text, size, w) {
+            g.text(x, y, size, color, &line);
+            y += lh;
+        }
+        y
+    }
+
+    fn page_ms(&mut self, g: &mut Gfx, l: &Launcher, tap: Option<(f32, f32)>) {
+        let (back, top) = self.header(g, "Đăng nhập Microsoft", tap);
+        if back {
+            *self.auth.lock().unwrap() = Status::Idle;
+            self.go(Page::Accounts);
+            return;
+        }
+        let path = l.root.join("ms_client_id.txt");
+        if !self.ms_started {
+            self.ms_started = true;
+            match std::fs::read_to_string(&path) {
+                Ok(t) if !t.trim().is_empty() => auth::ms_login(self.auth.clone(), t.trim().to_string()),
+                _ => {
+                    let msg = format!("Chưa có Client ID. Tạo file {} chỉ chứa Client ID của ứng dụng Azure đã được Mojang duyệt.", path.display());
+                    *self.auth.lock().unwrap() = Status::Failed(msg);
+                }
+            }
+        }
+        let st = self.auth.lock().unwrap().clone();
+        let s = g.scale;
+        let (w, h) = (g.w as f32, g.h as f32);
+        let m = 16.0 * s;
+        let mut y = top + 28.0 * s;
+        let mut retry = false;
+        match st {
+            Status::Code { code, url } => {
+                y = self.para(g, m, y, w - 2.0 * m, 15.0 * s, DIM, "Mở trang này trên trình duyệt:");
+                y = self.para(g, m, y + 6.0 * s, w - 2.0 * m, 18.0 * s, ACCENT, &url);
+                y = self.para(g, m, y + 20.0 * s, w - 2.0 * m, 15.0 * s, DIM, "rồi nhập mã:");
+                let bx = Rect::new(m, y + 8.0 * s, w - 2.0 * m, 80.0 * s);
+                g.rect(bx.x, bx.y, bx.w, bx.h, CARD);
+                text_c(g, bx, 40.0 * s, TEXT, &code);
+                self.para(g, m, bx.y + bx.h + 24.0 * s, w - 2.0 * m, 14.0 * s, DIM, "Đang chờ bạn xác nhận trên trình duyệt...");
+            }
+            Status::Failed(msg) => {
+                self.para(g, m, y, w - 2.0 * m, 15.0 * s, WARN, &msg);
+                retry = true;
+            }
+            Status::Working(msg) => {
+                self.para(g, m, y, w - 2.0 * m, 15.0 * s, DIM, &msg);
+            }
+            _ => {
+                self.para(g, m, y, w - 2.0 * m, 15.0 * s, DIM, "Đang kết nối...");
+            }
+        }
+        if retry {
+            let b = Rect::new(m, h - 36.0 * s - 76.0 * s, w - 2.0 * m, 52.0 * s);
+            vgrad(g, b, ACCENT, ACCENT_DK);
+            text_c(g, b, 16.0 * s, 0x022b25ff, "THỬ LẠI");
+            if hit(b, tap) {
+                self.ms_started = false;
+                *self.auth.lock().unwrap() = Status::Idle;
+            }
+        }
+    }
+
+    fn page_ely(&mut self, g: &mut Gfx, tap: Option<(f32, f32)>) {
+        let (back, top) = self.header(g, "Đăng nhập Ely.by", tap);
+        if back {
+            *self.auth.lock().unwrap() = Status::Idle;
+            self.fields = Default::default();
+            self.go(Page::Accounts);
+            return;
+        }
+        let st = self.auth.lock().unwrap().clone();
+        if let Status::NeedTotp = st {
+            self.need_totp = true;
+            self.focus = 2;
+            *self.auth.lock().unwrap() = Status::Idle;
+        }
+        let s = g.scale;
+        let (w, h) = (g.w as f32, g.h as f32);
+        let m = 16.0 * s;
+        let n = if self.need_totp { 3 } else { 2 };
+        let labels = ["Tên hoặc email", "Mật khẩu", "Mã xác thực 2 lớp"];
+        let mut y = top + 16.0 * s;
+        for i in 0..n {
+            let bx = Rect::new(m, y, w - 2.0 * m, 56.0 * s);
+            g.rect(bx.x, bx.y, bx.w, bx.h, CARD);
+            g.rect(bx.x, bx.y + bx.h - 2.0 * s, bx.w, 2.0 * s, if self.focus == i { ACCENT } else { LINE });
+            if self.fields[i].is_empty() {
+                text_v(g, bx.x + 16.0 * s, bx, 16.0 * s, DIM, labels[i]);
+            } else {
+                let shown = if i == 1 { "*".repeat(self.fields[i].chars().count()) } else { self.fields[i].clone() };
+                text_v(g, bx.x + 16.0 * s, bx, 18.0 * s, TEXT, &shown);
+            }
+            if hit(bx, tap) {
+                self.focus = i;
+            }
+            y += 64.0 * s;
+        }
+        let kh = 300.0 * s;
+        match &st {
+            Status::Working(msg) => {
+                self.para(g, m, y + 4.0 * s, w - 2.0 * m, 13.0 * s, DIM, msg);
+            }
+            Status::Failed(msg) => {
+                self.para(g, m, y + 4.0 * s, w - 2.0 * m, 13.0 * s, WARN, msg);
+            }
+            _ => {
+                if self.need_totp && self.fields[2].is_empty() {
+                    self.para(g, m, y + 4.0 * s, w - 2.0 * m, 13.0 * s, WARN, "Tài khoản bật xác thực 2 lớp: nhập mã rồi bấm XONG");
+                }
+            }
+        }
+
+        let area = Rect::new(0.0, h - 36.0 * s - kh, w, kh);
+        let working = matches!(st, Status::Working(_));
+        match self.kb.draw(g, area, tap) {
+            Some(Kb::Ch(c)) => {
+                if self.fields[self.focus].chars().count() < 64 {
+                    self.fields[self.focus].push(c);
+                }
+            }
+            Some(Kb::Back) => {
+                self.fields[self.focus].pop();
+            }
+            Some(Kb::Cancel) => {
+                *self.auth.lock().unwrap() = Status::Idle;
+                self.fields = Default::default();
+                self.go(Page::Accounts);
+            }
+            Some(Kb::Done) => {
+                if self.focus + 1 < n {
+                    self.focus += 1;
+                } else if !working && !self.fields[0].is_empty() && !self.fields[1].is_empty() {
+                    let totp = if self.need_totp { self.fields[2].clone() } else { String::new() };
+                    auth::ely_login(self.auth.clone(), self.fields[0].clone(), self.fields[1].clone(), totp);
+                }
+            }
+            _ => {}
+        }
     }
 }

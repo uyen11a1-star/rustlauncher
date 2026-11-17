@@ -1,4 +1,4 @@
-//! Bàn phím chữ-số vẽ tay (nhập tên tài khoản), không phụ thuộc bàn phím hệ thống.
+//! Bàn phím vẽ tay (chữ, số, ký tự đặc biệt) để nhập tên, email, mật khẩu; không phụ thuộc bàn phím hệ thống.
 use crate::{
     gfx::Gfx,
     ui::{hit, text_c, Rect, ACCENT_DK, CARD_HI, TEXT},
@@ -8,6 +8,7 @@ use crate::{
 pub enum Kb {
     Ch(char),
     Shift,
+    Sym,
     Back,
     Done,
     Cancel,
@@ -15,31 +16,53 @@ pub enum Kb {
 
 pub struct Keyboard {
     shift: bool,
+    sym: bool,
 }
 
 impl Keyboard {
     pub fn new() -> Keyboard {
-        Keyboard { shift: false }
+        Keyboard { shift: false, sym: false }
     }
 
     pub fn reset(&mut self) {
         self.shift = false;
+        self.sym = false;
     }
 
-    /// Vẽ bàn phím trong `area`; trả về phím vừa chạm (Shift tự xử lý bên trong).
+    /// Vẽ bàn phím trong `area`; trả về phím vừa chạm (Shift và ?123 tự xử lý bên trong).
     pub fn draw(&mut self, g: &mut Gfx, area: Rect, tap: Option<(f32, f32)>) -> Option<Kb> {
-        let sh = self.shift;
+        let (sh, sy) = (self.shift, self.sym);
         let ch = |c: char| {
             let c = if sh { c.to_ascii_uppercase() } else { c };
             (c.to_string(), 1.0f32, Kb::Ch(c))
         };
+        let plain = |c: char| (c.to_string(), 1.0f32, Kb::Ch(c));
         let row = |s: &str| s.chars().map(|c| ch(c)).collect::<Vec<_>>();
-        let mut rows: Vec<Vec<(String, f32, Kb)>> = vec![row("1234567890"), row("qwertyuiop"), row("asdfghjkl")];
-        let mut r3 = vec![("SHIFT".to_string(), 1.6f32, Kb::Shift)];
-        r3.extend(row("zxcvbnm"));
-        r3.push(("XÓA".to_string(), 1.6, Kb::Back));
-        rows.push(r3);
-        rows.push(vec![ch('_'), ("HỦY".to_string(), 2.5, Kb::Cancel), ("XONG".to_string(), 3.5, Kb::Done)]);
+        let prow = |s: &str| s.chars().map(|c| plain(c)).collect::<Vec<_>>();
+        let mut rows: Vec<Vec<(String, f32, Kb)>> = vec![prow("1234567890")];
+        if !sy {
+            rows.push(row("qwertyuiop"));
+            rows.push(row("asdfghjkl"));
+            let mut r3 = vec![("SHIFT".to_string(), 1.6f32, Kb::Shift)];
+            r3.extend(row("zxcvbnm"));
+            r3.push(("XÓA".to_string(), 1.6, Kb::Back));
+            rows.push(r3);
+        } else {
+            rows.push(prow("@#$%&-+()/"));
+            rows.push(prow("*'\":;!?,.="));
+            let mut r3 = prow("~^<>[]{}|");
+            r3.push(("XÓA".to_string(), 1.6, Kb::Back));
+            rows.push(r3);
+        }
+        rows.push(vec![
+            (if sy { "ABC" } else { "?123" }.to_string(), 1.8, Kb::Sym),
+            plain('.'),
+            plain('@'),
+            plain('_'),
+            plain('-'),
+            ("HỦY".to_string(), 1.8, Kb::Cancel),
+            ("XONG".to_string(), 2.4, Kb::Done),
+        ]);
 
         let s = g.scale;
         let gap = 6.0 * s;
@@ -58,10 +81,10 @@ impl Keyboard {
                 let size = if label.chars().count() > 1 { 13.0 * s } else { 18.0 * s };
                 text_c(g, rc, size, TEXT, label);
                 if hit(rc, tap) {
-                    if *code == Kb::Shift {
-                        self.shift = !self.shift;
-                    } else {
-                        out = Some(*code);
+                    match *code {
+                        Kb::Shift => self.shift = !self.shift,
+                        Kb::Sym => self.sym = !self.sym,
+                        c => out = Some(c),
                     }
                 }
                 x += kw + gap;
