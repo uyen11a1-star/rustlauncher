@@ -114,8 +114,55 @@ fn codes(b: &mut Bits, out: &mut Vec<u8>, lit: &Huff, dist: &Huff, limit: usize)
 
 /// Giải nén luồng deflate thô. `expected` là kích thước sau giải nén (dùng làm giới hạn và kiểm tra).
 pub fn inflate(src: &[u8], expected: usize) -> Result<Vec<u8>, String> {
+    inflate_impl(src, expected, true)
+}
+
+/// Giải nén khi không biết trước kích thước; `max` là giới hạn an toàn.
+pub fn inflate_any(src: &[u8], max: usize) -> Result<Vec<u8>, String> {
+    inflate_impl(src, max, false)
+}
+
+/// Bỏ header zlib (2 byte) rồi giải nén.
+pub fn zlib_any(src: &[u8], max: usize) -> Result<Vec<u8>, String> {
+    if src.len() < 3 {
+        return Err("zlib cụt".into());
+    }
+    inflate_any(&src[2..], max)
+}
+
+/// Bỏ header gzip rồi giải nén.
+pub fn gzip_any(src: &[u8], max: usize) -> Result<Vec<u8>, String> {
+    if src.len() < 18 || src[0] != 0x1f || src[1] != 0x8b || src[2] != 8 {
+        return Err("không phải gzip".into());
+    }
+    let flags = src[3];
+    let mut p = 10usize;
+    if flags & 4 != 0 {
+        if p + 2 > src.len() {
+            return Err("gzip cụt".into());
+        }
+        p += 2 + u16::from_le_bytes([src[p], src[p + 1]]) as usize;
+    }
+    for bit in [8u8, 16u8] {
+        if flags & bit != 0 {
+            while p < src.len() && src[p] != 0 {
+                p += 1;
+            }
+            p += 1;
+        }
+    }
+    if flags & 2 != 0 {
+        p += 2;
+    }
+    if p >= src.len() {
+        return Err("gzip cụt".into());
+    }
+    inflate_any(&src[p..], max)
+}
+
+fn inflate_impl(src: &[u8], expected: usize, exact: bool) -> Result<Vec<u8>, String> {
     let mut b = Bits { src, pos: 0, buf: 0, n: 0 };
-    let mut out: Vec<u8> = Vec::with_capacity(expected);
+    let mut out: Vec<u8> = Vec::with_capacity(if exact { expected } else { 1 << 16 });
     loop {
         let last = b.get(1)?;
         match b.get(2)? {
@@ -198,7 +245,7 @@ pub fn inflate(src: &[u8], expected: usize) -> Result<Vec<u8>, String> {
             break;
         }
     }
-    if out.len() != expected {
+    if exact && out.len() != expected {
         return Err(format!("deflate: ra {} byte, cần {}", out.len(), expected));
     }
     Ok(out)

@@ -13,6 +13,7 @@ const SEL: u32 = 0x2d5a8aff;
 
 pub enum Action {
     View(String),
+    World(String),
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -153,7 +154,7 @@ impl Screen {
         let mut y = 40.0 * s;
         g.text(m, y, 26.0 * s, TEXT, "Rust Launcher");
         y += 34.0 * s;
-        g.text(m, y, 12.0 * s, DIM, "Game Rust: G1 - texture và model thật từ client.jar");
+        g.text(m, y, 12.0 * s, DIM, "Game Rust: G2 - đọc world Java thật");
         y += 22.0 * s;
 
         // checkbox snapshot
@@ -225,7 +226,25 @@ impl Screen {
                 }
             }
         }
-        y += btn2.h + 12.0 * s;
+        y += btn2.h + 8.0 * s;
+
+        // nút mở thế giới thật (G2)
+        let btn3 = Rect { x: m, y, w: w - 2.0 * m, h: 46.0 * s };
+        g.rect(btn3.x, btn3.y, btn3.w, btn3.h, if can2 { 0xb8860bff } else { BTN_OFF });
+        let l3 = match &self.selected {
+            Some(v) => format!("Mở world thật bằng {v}"),
+            None => "Chọn một phiên bản".to_string(),
+        };
+        let tw3 = g.text_width(&l3, 16.0 * s);
+        g.text(btn3.x + (btn3.w - tw3) / 2.0, btn3.y + 12.0 * s, 16.0 * s, if can2 { 0xffffffff } else { DIM }, &l3);
+        if can2 {
+            if let Some(t) = tap {
+                if btn3.has(t) {
+                    run = self.selected.clone().map(Action::World);
+                }
+            }
+        }
+        y += btn3.h + 12.0 * s;
 
         // trạng thái + tiến trình
         let phase = l.shared.phase.lock().unwrap().clone();

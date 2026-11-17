@@ -50,10 +50,12 @@ pub enum Phase {
 pub struct View {
     prog: u32,
     vbo: u32,
+    ebo: u32,
     tex: u32,
     u_mvp: i32,
     u_tex: i32,
     count: i32,
+    nverts: usize,
     pos: [f32; 3],
     yaw: f32,
     pitch: f32,
@@ -93,6 +95,10 @@ impl View {
             glGenBuffers(1, &mut vbo);
             glBindBuffer(GL_ARRAY_BUFFER, vbo);
             glBufferData(GL_ARRAY_BUFFER, (d.verts.len() * std::mem::size_of::<V>()) as isize, d.verts.as_ptr() as *const _, GL_STATIC_DRAW);
+            let mut ebo = 0;
+            glGenBuffers(1, &mut ebo);
+            glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ebo);
+            glBufferData(GL_ELEMENT_ARRAY_BUFFER, (d.idx.len() * 4) as isize, d.idx.as_ptr() as *const _, GL_STATIC_DRAW);
             let mut tex = 0;
             glGenTextures(1, &mut tex);
             glBindTexture(GL_TEXTURE_2D, tex);
@@ -110,10 +116,12 @@ impl View {
             Ok(View {
                 prog,
                 vbo,
+                ebo,
                 tex,
                 u_mvp,
                 u_tex,
-                count: d.verts.len() as i32,
+                count: d.idx.len() as i32,
+                nverts: d.verts.len(),
                 pos: d.spawn,
                 yaw: 0.0,
                 pitch: -0.1,
@@ -187,7 +195,7 @@ impl View {
                 _ => {}
             }
         }
-        let speed = 6.0;
+        let speed = 14.0;
         let (sn, cs) = self.yaw.sin_cos();
         let fwd = [-sn, -cs];
         let right = [cs, -sn];
@@ -219,7 +227,8 @@ impl View {
             glVertexAttribPointer(1, 2, GL_FLOAT, 0, stride, 12 as *const _);
             glEnableVertexAttribArray(2);
             glVertexAttribPointer(2, 4, GL_UNSIGNED_BYTE, 1, stride, 20 as *const _);
-            glDrawArrays(GL_TRIANGLES, 0, self.count);
+            glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, self.ebo);
+            glDrawElements(GL_TRIANGLES, self.count, GL_UNSIGNED_INT, 0 as *const _);
             glDisable(GL_DEPTH_TEST);
         }
 
@@ -231,7 +240,7 @@ impl View {
             self.fps_t = Instant::now();
         }
         g.begin();
-        g.text(12.0 * s, 36.0 * s, 13.0 * s, 0xffffffff, &format!("FPS {}  x {:.1} y {:.1} z {:.1}  ({} đỉnh)", self.fps, self.pos[0], self.pos[1], self.pos[2], self.count));
+        g.text(12.0 * s, 36.0 * s, 13.0 * s, 0xffffffff, &format!("FPS {}  x {:.1} y {:.1} z {:.1}  ({} đỉnh)", self.fps, self.pos[0], self.pos[1], self.pos[2], self.nverts));
         for (r, label, col) in [
             (rect_exit(g), "Thoát", 0xc0392bd0u32),
             (rect_up(g), "Lên", 0x00000090),

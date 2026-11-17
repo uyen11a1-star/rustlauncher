@@ -68,6 +68,7 @@ extern "C" {
     pub fn glDisable(c: u32);
     pub fn glBlendFunc(s: u32, d: u32);
     pub fn glDrawArrays(mode: u32, first: i32, count: i32);
+    pub fn glDrawElements(mode: u32, count: i32, ty: u32, offset: *const c_void);
     pub fn glGetError() -> u32;
     pub fn glUniformMatrix4fv(loc: i32, count: i32, transpose: u8, v: *const f32);
     pub fn glDepthFunc(f: u32);
@@ -75,6 +76,8 @@ extern "C" {
 
 pub const GL_TEXTURE_2D: u32 = 0x0DE1;
 pub const GL_ARRAY_BUFFER: u32 = 0x8892;
+pub const GL_ELEMENT_ARRAY_BUFFER: u32 = 0x8893;
+pub const GL_UNSIGNED_INT: u32 = 0x1405;
 pub const GL_STREAM_DRAW: u32 = 0x88E0;
 pub const GL_FLOAT: u32 = 0x1406;
 pub const GL_UNSIGNED_BYTE: u32 = 0x1401;

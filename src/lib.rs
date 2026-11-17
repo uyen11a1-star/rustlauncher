@@ -7,6 +7,7 @@ use android_activity::{
 };
 
 mod assets;
+mod blocks;
 mod gfx;
 mod gles;
 mod inflate;
@@ -14,10 +15,12 @@ mod json;
 mod launcher;
 mod math;
 mod mc;
+mod nbt;
 mod png;
 mod scene;
 mod screen;
 mod view;
+mod world;
 mod zipr;
 
 enum Mode {
@@ -139,7 +142,8 @@ fn android_main(app: AndroidApp) {
                             }
                         }
                         match screen.draw(g, &launcher) {
-                                            Some(screen::Action::View(id)) => launcher.prepare_view(id),
+                                            Some(screen::Action::View(id)) => launcher.prepare(id, false),
+                            Some(screen::Action::World(id)) => launcher.prepare(id, true),
                             None => {}
                         }
                     }

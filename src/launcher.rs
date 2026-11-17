@@ -82,7 +82,7 @@ impl Launcher {
     }
 
     /// Tải client.jar rồi dựng cảnh 3D từ texture/model thật. Kết quả để vào `self.scene`.
-    pub fn prepare_view(&self, id: String) {
+    pub fn prepare(&self, id: String, world: bool) {
         if self.busy.swap(true, Relaxed) {
             return;
         }
@@ -110,7 +110,15 @@ impl Launcher {
                 }
                 Ok(jar) => {
                     shared.set_phase("Đang dựng texture và model...");
-                    match scene::build(&jar, &push) {
+                    let built = if world {
+                        match find_world(&root, &push) {
+                            Ok(dir) => scene::build_world(&jar, &dir, 6, &push),
+                            Err(e) => Err(e),
+                        }
+                    } else {
+                        scene::build_test(&jar, &push)
+                    };
+                    match built {
                         Ok(d) => {
                             *out.lock().unwrap() = Some(d);
                             shared.set_phase("Sẵn sàng");
@@ -125,4 +133,32 @@ impl Launcher {
             busy.store(false, Relaxed);
         });
     }
+}
+
+pub const WORLD_ROOT: &str = "/sdcard/RustVoxel";
+
+/// Tìm thư mục thế giới trong /sdcard/RustVoxel (có level.dat hoặc region/).
+fn find_world(_root: &std::path::Path, push: &dyn Fn(String)) -> Result<PathBuf, String> {
+    let base = PathBuf::from(WORLD_ROOT);
+    let rd = match std::fs::read_dir(&base) {
+        Ok(r) => r,
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            return Err(format!(
+                "Không có quyền đọc {WORLD_ROOT}. Vào Cài đặt > Ứng dụng > Rust Launcher > Quyền > Tệp và đa phương tiện, bật \"Cho phép quản lý mọi tệp\" rồi bấm lại."
+            ))
+        }
+        Err(_) => return Err(format!("Chưa có thư mục {WORLD_ROOT}. Chép thư mục world (có level.dat và region/) vào đó rồi bấm lại.")),
+    };
+    let mut dirs: Vec<PathBuf> = rd.flatten().map(|e| e.path()).filter(|p| p.is_dir()).collect();
+    dirs.sort();
+    // chính {WORLD_ROOT} cũng được coi là một world nếu có region/
+    let mut cands = dirs.clone();
+    cands.insert(0, base.clone());
+    for d in cands {
+        if d.join("region").is_dir() || d.join("level.dat").is_file() {
+            push(format!("World: {}", d.display()));
+            return Ok(d);
+        }
+    }
+    Err(format!("Trong {WORLD_ROOT} không có thư mục nào chứa level.dat hoặc region/."))
 }

@@ -1,6 +1,6 @@
 [package]
 name = "rustlauncher"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
 
 [lib]
@@ -35,6 +35,12 @@ build_targets = ["aarch64-linux-android"]
 
 [[package.metadata.android.uses_permission]]
 name = "android.permission.INTERNET"
+
+[[package.metadata.android.uses_permission]]
+name = "android.permission.READ_EXTERNAL_STORAGE"
+
+[[package.metadata.android.uses_permission]]
+name = "android.permission.MANAGE_EXTERNAL_STORAGE"
 
 [package.metadata.android.sdk]
 min_sdk_version = 26
