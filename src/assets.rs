@@ -422,8 +422,14 @@ pub struct Mesh {
 
 impl Mesh {
     pub fn push_face(&mut self, f: &BFace, at: [f32; 3], col: [u8; 3]) {
+        self.push_face_b(f, at, col, 1.0);
+    }
+
+    /// Như `push_face` nhưng nhân thêm độ sáng `br` (0..1) vào màu đỉnh.
+    pub fn push_face_b(&mut self, f: &BFace, at: [f32; 3], col: [u8; 3], br: f32) {
         let base = self.v.len() as u32;
-        let c = [(col[0] as f32 * f.shade) as u8, (col[1] as f32 * f.shade) as u8, (col[2] as f32 * f.shade) as u8, 255];
+        let s = f.shade * br;
+        let c = [(col[0] as f32 * s) as u8, (col[1] as f32 * s) as u8, (col[2] as f32 * s) as u8, 255];
         for k in 0..4 {
             self.v.push(V { p: [f.q[k][0] + at[0], f.q[k][1] + at[1], f.q[k][2] + at[2]], uv: f.uv[k], c });
         }
@@ -431,9 +437,10 @@ impl Mesh {
     }
 
     /// Như `push_face` nhưng cho mặt nước: alpha 200, chỉ số vào danh sách `iw`.
-    pub fn push_water(&mut self, f: &BFace, at: [f32; 3], col: [u8; 3]) {
+    pub fn push_water(&mut self, f: &BFace, at: [f32; 3], col: [u8; 3], br: f32) {
         let base = self.v.len() as u32;
-        let c = [(col[0] as f32 * f.shade) as u8, (col[1] as f32 * f.shade) as u8, (col[2] as f32 * f.shade) as u8, 200];
+        let s = f.shade * br;
+        let c = [(col[0] as f32 * s) as u8, (col[1] as f32 * s) as u8, (col[2] as f32 * s) as u8, 200];
         for k in 0..4 {
             self.v.push(V { p: [f.q[k][0] + at[0], f.q[k][1] + at[1], f.q[k][2] + at[2]], uv: f.uv[k], c });
         }

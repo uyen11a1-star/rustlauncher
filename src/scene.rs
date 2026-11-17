@@ -125,6 +125,12 @@ pub fn build_test(jar_path: &Path, log: &dyn Fn(String)) -> Result<SceneData, St
     Ok(SceneData { atlas: atlas.pixels, chunks: vec![ChunkMesh::new(mesh, 0, 0)], spawn: [7.0, 1.7, 4.0], stream: None })
 }
 
+/// Độ sáng 0..1 từ ánh sáng ô (lấy mức cao hơn giữa sáng trời và sáng khối), kèm một chút sáng nền.
+fn bright(l: u8) -> f32 {
+    let x = (l >> 4).max(l & 15) as f32 / 15.0;
+    0.03 + 0.97 * x / (4.0 - 3.0 * x)
+}
+
 fn mesh_chunk(world: &World, states: &[State], cx: i32, cz: i32) -> Mesh {
     let mut mesh = Mesh::default();
     let Some(chunk) = world.chunks.get(&(cx, cz)) else { return mesh };
@@ -174,10 +180,17 @@ fn mesh_chunk(world: &World, states: &[State], cx: i32, cz: i32) -> Mesh {
                         }
                         let at = [x as f32, y as f32, z as f32];
                         let col = if f.tint { st.tint } else { [255; 3] };
-                        if st.fluid == 1 {
-                            mesh.push_water(f, at, col);
+                        let lv = if f.cull != NOCULL {
+                            let d = f.cull as usize;
+                            world.light(x + DV[d][0], y + DV[d][1], z + DV[d][2])
                         } else {
-                            mesh.push_face(f, at, col);
+                            world.light(x, y, z)
+                        };
+                        let br = bright(lv);
+                        if st.fluid == 1 {
+                            mesh.push_water(f, at, col, br);
+                        } else {
+                            mesh.push_face_b(f, at, col, br);
                         }
                     }
                 }
@@ -234,7 +247,47 @@ fn ingest(w: &mut World, ids: &mut HashMap<String, u16>, keys: &mut Vec<String>,
                 }
             };
         }
-        w.chunks.insert((rc.cx, rc.cz), Chunk { secs });
+        // ánh sáng: SkyLight thiếu thì lấy lớp đáy của section phía trên (trên cùng = 15), BlockLight thiếu = 0
+        let mut sky: Vec<Option<Vec<u8>>> = vec![None; NSEC];
+        let mut blk: Vec<Option<Vec<u8>>> = vec![None; NSEC];
+        for (y, s, b) in rc.lights {
+            let si = y - SEC0;
+            if si >= 0 && si < NSEC as i32 {
+                sky[si as usize] = s;
+                blk[si as usize] = b;
+            }
+        }
+        let nib = |d: &Vec<u8>, i: usize| -> u8 {
+            let v = d[i >> 1];
+            if i & 1 == 0 { v & 15 } else { v >> 4 }
+        };
+        let mut lt: Vec<Option<Box<[u8; 4096]>>> = (0..NSEC).map(|_| None).collect();
+        let mut above = [15u8; 256];
+        for si in (0..NSEC).rev() {
+            let mut a = Box::new([0u8; 4096]);
+            let mut all = true;
+            for i in 0..4096usize {
+                let sk = match &sky[si] {
+                    Some(d) => nib(d, i),
+                    None => above[i & 255],
+                };
+                let bl = match &blk[si] {
+                    Some(d) => nib(d, i),
+                    None => 0,
+                };
+                a[i] = (sk << 4) | bl;
+                if a[i] != 0xF0 {
+                    all = false;
+                }
+            }
+            for j in 0..256 {
+                above[j] = a[j] >> 4;
+            }
+            if !all {
+                lt[si] = Some(a);
+            }
+        }
+        w.chunks.insert((rc.cx, rc.cz), Chunk { secs, lt });
     }
 }
 

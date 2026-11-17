@@ -25,6 +25,9 @@ pub enum Sec {
 
 pub struct Chunk {
     pub secs: Vec<Option<Sec>>,
+    /// Ánh sáng mỗi section: byte = (sáng trời << 4) | sáng khối, chỉ số y<<8|z<<4|x.
+    /// `None` = toàn section sáng trời 15, sáng khối 0.
+    pub lt: Vec<Option<Box<[u8; 4096]>>>,
 }
 
 #[derive(Default)]
@@ -45,6 +48,19 @@ impl World {
             Some(Sec::Full(a)) => a[(((y & 15) << 8) | ((z & 15) << 4) | (x & 15)) as usize],
         }
     }
+
+    /// Ánh sáng tại ô: (sáng trời << 4) | sáng khối. Chỗ chưa nạp coi như sáng hẳn.
+    pub fn light(&self, x: i32, y: i32, z: i32) -> u8 {
+        let Some(c) = self.chunks.get(&(x >> 4, z >> 4)) else { return 0xF0 };
+        let si = (y >> 4) - SEC0;
+        if si < 0 || si >= NSEC as i32 {
+            return 0xF0;
+        }
+        match &c.lt[si as usize] {
+            None => 0xF0,
+            Some(a) => a[(((y & 15) << 8) | ((z & 15) << 4) | (x & 15)) as usize],
+        }
+    }
 }
 
 /// Chunk thô: palette dạng chuỗi + chỉ số cục bộ (chưa gán id toàn cục).
@@ -58,6 +74,8 @@ pub struct RawChunk {
     pub cx: i32,
     pub cz: i32,
     pub secs: Vec<RawSection>,
+    /// (y section, SkyLight thô, BlockLight thô), mỗi mảng 2048 byte nếu có
+    pub lights: Vec<(i32, Option<Vec<u8>>, Option<Vec<u8>>)>,
 }
 
 pub struct LevelInfo {
@@ -173,8 +191,14 @@ fn parse_chunk(cx: i32, cz: i32, root: &Tag) -> Result<Option<RawChunk>, String>
     }
     let secs = root.get("sections").and_then(|s| s.as_list()).ok_or("chunk không có sections")?;
     let mut out = Vec::new();
+    let mut lights = Vec::new();
     for s in secs {
         let y = s.get("Y").and_then(|y| y.as_i64()).ok_or("section thiếu Y")? as i32;
+        let raw = |k: &str| match s.get(k) {
+            Some(Tag::Bytes(b)) if b.len() == 2048 => Some(b.clone()),
+            _ => None,
+        };
+        lights.push((y, raw("SkyLight"), raw("BlockLight")));
         let Some(bs) = s.get("block_states") else { continue };
         let pal = bs.get("palette").and_then(|p| p.as_list()).ok_or("thiếu palette")?;
         let palette: Vec<String> = pal.iter().filter_map(prop_key).collect();
@@ -203,7 +227,7 @@ fn parse_chunk(cx: i32, cz: i32, root: &Tag) -> Result<Option<RawChunk>, String>
         };
         out.push(RawSection { y, palette, idx });
     }
-    Ok(Some(RawChunk { cx, cz, secs: out }))
+    Ok(Some(RawChunk { cx, cz, secs: out, lights }))
 }
 
 pub struct LoadStats {
