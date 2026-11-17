@@ -14,10 +14,29 @@ use crate::{
     world::{self, Chunk, Sec, World, NSEC, SEC0, UNKNOWN},
 };
 
+/// Mesh của một chunk (chỉ số cục bộ) kèm hộp bao [minx,miny,minz,maxx,maxy,maxz].
+pub struct ChunkMesh {
+    pub v: Vec<V>,
+    pub i: Vec<u32>,
+    pub bb: [f32; 6],
+}
+
+impl ChunkMesh {
+    pub fn new(m: Mesh) -> ChunkMesh {
+        let mut bb = [f32::MAX, f32::MAX, f32::MAX, f32::MIN, f32::MIN, f32::MIN];
+        for v in &m.v {
+            for k in 0..3 {
+                bb[k] = bb[k].min(v.p[k]);
+                bb[3 + k] = bb[3 + k].max(v.p[k]);
+            }
+        }
+        ChunkMesh { v: m.v, i: m.i, bb }
+    }
+}
+
 pub struct SceneData {
     pub atlas: Vec<u8>,
-    pub verts: Vec<V>,
-    pub idx: Vec<u32>,
+    pub chunks: Vec<ChunkMesh>,
     pub spawn: [f32; 3],
 }
 
@@ -70,7 +89,7 @@ pub fn build_test(jar_path: &Path, log: &dyn Fn(String)) -> Result<SceneData, St
         log(m.clone());
     }
     log(format!("Dựng {} khối, {} đỉnh, mất {} ms", shown, mesh.v.len(), t0.elapsed().as_millis()));
-    Ok(SceneData { atlas: atlas.pixels, verts: mesh.v, idx: mesh.i, spawn: [7.0, 1.7, 4.0] })
+    Ok(SceneData { atlas: atlas.pixels, chunks: vec![ChunkMesh::new(mesh)], spawn: [7.0, 1.7, 4.0] })
 }
 
 fn mesh_chunk(world: &World, states: &[State], cx: i32, cz: i32) -> Mesh {
@@ -245,27 +264,26 @@ pub fn build_world(jar_path: &Path, dir: &Path, radius: i32, log: &dyn Fn(String
     let t3 = std::time::Instant::now();
     let coords: Vec<(i32, i32)> = w.chunks.keys().copied().collect();
     let next = AtomicUsize::new(0);
-    let parts: Mutex<Vec<Mesh>> = Mutex::new(Vec::new());
+    let parts: Mutex<Vec<ChunkMesh>> = Mutex::new(Vec::new());
     std::thread::scope(|sc| {
         for _ in 0..threads {
             sc.spawn(|| {
-                let mut mine = Mesh::default();
                 loop {
                     let i = next.fetch_add(1, Relaxed);
                     if i >= coords.len() {
                         break;
                     }
-                    mine.append(mesh_chunk(&w, &states, coords[i].0, coords[i].1));
+                    let m = mesh_chunk(&w, &states, coords[i].0, coords[i].1);
+                    if !m.v.is_empty() {
+                        parts.lock().unwrap().push(ChunkMesh::new(m));
+                    }
                 }
-                parts.lock().unwrap().push(mine);
             });
         }
     });
-    let mut mesh = Mesh::default();
-    for p in parts.into_inner().unwrap() {
-        mesh.append(p);
-    }
-    log(format!("Dựng mesh: {} đỉnh, {} tam giác ({} ms)", mesh.v.len(), mesh.i.len() / 3, t3.elapsed().as_millis()));
+    let chunks = parts.into_inner().unwrap();
+    let (nv, ni) = chunks.iter().fold((0, 0), |a, c| (a.0 + c.v.len(), a.1 + c.i.len()));
+    log(format!("Dựng mesh: {} chunk, {} đỉnh, {} tam giác ({} ms)", chunks.len(), nv, ni / 3, t3.elapsed().as_millis()));
 
     // vị trí camera
     let (sx, sz) = (center[0].floor() as i32, center[2].floor() as i32);
@@ -286,5 +304,5 @@ pub fn build_world(jar_path: &Path, dir: &Path, radius: i32, log: &dyn Fn(String
         found.map_or(100.0, |v| v as f32 + 3.0)
     };
     log(format!("Tổng thời gian dựng: {} ms", t0.elapsed().as_millis()));
-    Ok(SceneData { atlas: atlas.pixels, verts: mesh.v, idx: mesh.i, spawn: [center[0] as f32, y, center[2] as f32] })
+    Ok(SceneData { atlas: atlas.pixels, chunks, spawn: [center[0] as f32, y, center[2] as f32] })
 }

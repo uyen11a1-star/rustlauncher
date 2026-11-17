@@ -38,3 +38,32 @@ pub fn perspective(fovy: f32, aspect: f32, n: f32, f: f32) -> Mat4 {
 pub fn view(eye: [f32; 3], yaw: f32, pitch: f32) -> Mat4 {
     mul(&rot_x(-pitch), &mul(&rot_y(-yaw), &translate(-eye[0], -eye[1], -eye[2])))
 }
+
+/// 6 mặt phẳng frustum từ ma trận MVP (Gribb-Hartmann), mỗi mặt [a,b,c,d], điểm trong khi a*x+b*y+c*z+d >= 0.
+pub fn frustum(m: &Mat4) -> [[f32; 4]; 6] {
+    let r = |i: usize| [m[i], m[4 + i], m[8 + i], m[12 + i]];
+    let (r0, r1, r2, r3) = (r(0), r(1), r(2), r(3));
+    let mut p = [[0.0f32; 4]; 6];
+    for k in 0..4 {
+        p[0][k] = r3[k] + r0[k];
+        p[1][k] = r3[k] - r0[k];
+        p[2][k] = r3[k] + r1[k];
+        p[3][k] = r3[k] - r1[k];
+        p[4][k] = r3[k] + r2[k];
+        p[5][k] = r3[k] - r2[k];
+    }
+    p
+}
+
+/// Hộp [minx,miny,minz,maxx,maxy,maxz] có nằm (một phần) trong frustum không.
+pub fn aabb_visible(f: &[[f32; 4]; 6], b: &[f32; 6]) -> bool {
+    for p in f {
+        let x = if p[0] >= 0.0 { b[3] } else { b[0] };
+        let y = if p[1] >= 0.0 { b[4] } else { b[1] };
+        let z = if p[2] >= 0.0 { b[5] } else { b[2] };
+        if p[0] * x + p[1] * y + p[2] * z + p[3] < 0.0 {
+            return false;
+        }
+    }
+    true
+}

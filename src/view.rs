@@ -9,6 +9,14 @@ use crate::{
     scene::SceneData,
 };
 
+struct Gpu {
+    vbo: u32,
+    ebo: u32,
+    count: i32,
+    nverts: usize,
+    bb: [f32; 6],
+}
+
 const VS: &str = "#version 300 es
 in vec3 a_pos; in vec2 a_uv; in vec4 a_col;
 uniform mat4 u_mvp;
@@ -49,13 +57,13 @@ pub enum Phase {
 
 pub struct View {
     prog: u32,
-    vbo: u32,
-    ebo: u32,
+    gpu: Vec<Gpu>,
     tex: u32,
     u_mvp: i32,
     u_tex: i32,
-    count: i32,
     nverts: usize,
+    drawn_chunks: usize,
+    drawn_verts: usize,
     pos: [f32; 3],
     yaw: f32,
     pitch: f32,
@@ -91,14 +99,19 @@ impl View {
             let c = |s: &str| CString::new(s).unwrap();
             let u_mvp = glGetUniformLocation(prog, c("u_mvp").as_ptr());
             let u_tex = glGetUniformLocation(prog, c("u_tex").as_ptr());
-            let mut vbo = 0;
-            glGenBuffers(1, &mut vbo);
-            glBindBuffer(GL_ARRAY_BUFFER, vbo);
-            glBufferData(GL_ARRAY_BUFFER, (d.verts.len() * std::mem::size_of::<V>()) as isize, d.verts.as_ptr() as *const _, GL_STATIC_DRAW);
-            let mut ebo = 0;
-            glGenBuffers(1, &mut ebo);
-            glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ebo);
-            glBufferData(GL_ELEMENT_ARRAY_BUFFER, (d.idx.len() * 4) as isize, d.idx.as_ptr() as *const _, GL_STATIC_DRAW);
+            let mut gpu = Vec::with_capacity(d.chunks.len());
+            let mut nverts = 0;
+            for c in &d.chunks {
+                let (mut vbo, mut ebo) = (0, 0);
+                glGenBuffers(1, &mut vbo);
+                glBindBuffer(GL_ARRAY_BUFFER, vbo);
+                glBufferData(GL_ARRAY_BUFFER, (c.v.len() * std::mem::size_of::<V>()) as isize, c.v.as_ptr() as *const _, GL_STATIC_DRAW);
+                glGenBuffers(1, &mut ebo);
+                glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ebo);
+                glBufferData(GL_ELEMENT_ARRAY_BUFFER, (c.i.len() * 4) as isize, c.i.as_ptr() as *const _, GL_STATIC_DRAW);
+                nverts += c.v.len();
+                gpu.push(Gpu { vbo, ebo, count: c.i.len() as i32, nverts: c.v.len(), bb: c.bb });
+            }
             let mut tex = 0;
             glGenTextures(1, &mut tex);
             glBindTexture(GL_TEXTURE_2D, tex);
@@ -115,13 +128,13 @@ impl View {
             }
             Ok(View {
                 prog,
-                vbo,
-                ebo,
+                gpu,
                 tex,
                 u_mvp,
                 u_tex,
-                count: d.idx.len() as i32,
-                nverts: d.verts.len(),
+                nverts,
+                drawn_chunks: 0,
+                drawn_verts: 0,
                 pos: d.spawn,
                 yaw: 0.0,
                 pitch: -0.1,
@@ -219,16 +232,27 @@ impl View {
             glActiveTexture(GL_TEXTURE0);
             glBindTexture(GL_TEXTURE_2D, self.tex);
             glUniform1i(self.u_tex, 0);
-            glBindBuffer(GL_ARRAY_BUFFER, self.vbo);
             let stride = std::mem::size_of::<V>() as i32;
-            glEnableVertexAttribArray(0);
-            glVertexAttribPointer(0, 3, GL_FLOAT, 0, stride, 0 as *const _);
-            glEnableVertexAttribArray(1);
-            glVertexAttribPointer(1, 2, GL_FLOAT, 0, stride, 12 as *const _);
-            glEnableVertexAttribArray(2);
-            glVertexAttribPointer(2, 4, GL_UNSIGNED_BYTE, 1, stride, 20 as *const _);
-            glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, self.ebo);
-            glDrawElements(GL_TRIANGLES, self.count, GL_UNSIGNED_INT, 0 as *const _);
+            let fr = math::frustum(&mvp);
+            let (mut dc, mut dv) = (0, 0);
+            for c in &self.gpu {
+                if !math::aabb_visible(&fr, &c.bb) {
+                    continue;
+                }
+                glBindBuffer(GL_ARRAY_BUFFER, c.vbo);
+                glEnableVertexAttribArray(0);
+                glVertexAttribPointer(0, 3, GL_FLOAT, 0, stride, 0 as *const _);
+                glEnableVertexAttribArray(1);
+                glVertexAttribPointer(1, 2, GL_FLOAT, 0, stride, 12 as *const _);
+                glEnableVertexAttribArray(2);
+                glVertexAttribPointer(2, 4, GL_UNSIGNED_BYTE, 1, stride, 20 as *const _);
+                glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, c.ebo);
+                glDrawElements(GL_TRIANGLES, c.count, GL_UNSIGNED_INT, 0 as *const _);
+                dc += 1;
+                dv += c.nverts;
+            }
+            self.drawn_chunks = dc;
+            self.drawn_verts = dv;
             glDisable(GL_DEPTH_TEST);
             glDisable(GL_CULL_FACE);
         }
@@ -241,7 +265,7 @@ impl View {
             self.fps_t = Instant::now();
         }
         g.begin();
-        g.text(12.0 * s, 36.0 * s, 13.0 * s, 0xffffffff, &format!("FPS {}  x {:.1} y {:.1} z {:.1}  ({} đỉnh)", self.fps, self.pos[0], self.pos[1], self.pos[2], self.nverts));
+        g.text(12.0 * s, 36.0 * s, 13.0 * s, 0xffffffff, &format!("FPS {}  x {:.1} y {:.1} z {:.1}  chunk {}/{}  đỉnh {}/{}", self.fps, self.pos[0], self.pos[1], self.pos[2], self.drawn_chunks, self.gpu.len(), self.drawn_verts, self.nverts));
         for (r, label, col) in [
             (rect_exit(g), "Thoát", 0xc0392bd0u32),
             (rect_up(g), "Lên", 0x00000090),
