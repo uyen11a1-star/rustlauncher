@@ -1,12 +1,17 @@
 //! Màn hình xem cảnh 3D (G1): renderer GLES3 tự viết + điều khiển cảm ứng + HUD.
-use std::{ffi::CString, time::Instant};
+use std::{
+    collections::HashMap,
+    ffi::CString,
+    sync::atomic::Ordering::Relaxed,
+    time::Instant,
+};
 
 use crate::{
     assets::V,
     gfx::{build_program, Gfx},
     gles::*,
     math,
-    scene::SceneData,
+    scene::{pack, ChunkMesh, Msg, SceneData, Streamer},
 };
 
 struct Gpu {
@@ -15,6 +20,23 @@ struct Gpu {
     count: i32,
     nverts: usize,
     bb: [f32; 6],
+}
+
+/// Đưa mesh một chunk lên GPU. Cần context GL đang hiện hành.
+unsafe fn upload(c: &ChunkMesh) -> Gpu {
+    let (mut vbo, mut ebo) = (0, 0);
+    glGenBuffers(1, &mut vbo);
+    glBindBuffer(GL_ARRAY_BUFFER, vbo);
+    glBufferData(GL_ARRAY_BUFFER, (c.v.len() * std::mem::size_of::<V>()) as isize, c.v.as_ptr() as *const _, GL_STATIC_DRAW);
+    glGenBuffers(1, &mut ebo);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ebo);
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER, (c.i.len() * 4) as isize, c.i.as_ptr() as *const _, GL_STATIC_DRAW);
+    Gpu { vbo, ebo, count: c.i.len() as i32, nverts: c.v.len(), bb: c.bb }
+}
+
+unsafe fn free(g: &Gpu) {
+    glDeleteBuffers(1, &g.vbo);
+    glDeleteBuffers(1, &g.ebo);
 }
 
 const VS: &str = "#version 300 es
@@ -57,7 +79,8 @@ pub enum Phase {
 
 pub struct View {
     prog: u32,
-    gpu: Vec<Gpu>,
+    gpu: HashMap<(i32, i32), Gpu>,
+    stream: Option<Streamer>,
     tex: u32,
     u_mvp: i32,
     u_tex: i32,
@@ -99,18 +122,11 @@ impl View {
             let c = |s: &str| CString::new(s).unwrap();
             let u_mvp = glGetUniformLocation(prog, c("u_mvp").as_ptr());
             let u_tex = glGetUniformLocation(prog, c("u_tex").as_ptr());
-            let mut gpu = Vec::with_capacity(d.chunks.len());
+            let mut gpu = HashMap::new();
             let mut nverts = 0;
             for c in &d.chunks {
-                let (mut vbo, mut ebo) = (0, 0);
-                glGenBuffers(1, &mut vbo);
-                glBindBuffer(GL_ARRAY_BUFFER, vbo);
-                glBufferData(GL_ARRAY_BUFFER, (c.v.len() * std::mem::size_of::<V>()) as isize, c.v.as_ptr() as *const _, GL_STATIC_DRAW);
-                glGenBuffers(1, &mut ebo);
-                glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ebo);
-                glBufferData(GL_ELEMENT_ARRAY_BUFFER, (c.i.len() * 4) as isize, c.i.as_ptr() as *const _, GL_STATIC_DRAW);
                 nverts += c.v.len();
-                gpu.push(Gpu { vbo, ebo, count: c.i.len() as i32, nverts: c.v.len(), bb: c.bb });
+                gpu.insert((c.cx, c.cz), upload(c));
             }
             let mut tex = 0;
             glGenTextures(1, &mut tex);
@@ -129,6 +145,7 @@ impl View {
             Ok(View {
                 prog,
                 gpu,
+                stream: d.stream,
                 tex,
                 u_mvp,
                 u_tex,
@@ -194,6 +211,34 @@ impl View {
         self.last = now;
         let s = g.scale;
 
+        // stream chunk: báo vị trí cho luồng nền, nhận mesh mới (tối đa 4 chunk/khung để không giật)
+        if let Some(st) = &self.stream {
+            st.pos.store(pack((self.pos[0].floor() as i32) >> 4, (self.pos[2].floor() as i32) >> 4), Relaxed);
+        }
+        for _ in 0..4 {
+            let m = match &self.stream {
+                Some(st) => st.rx.try_recv().ok(),
+                None => None,
+            };
+            let Some(m) = m else { break };
+            match m {
+                Msg::Add(c) => {
+                    let g = unsafe { upload(&c) };
+                    self.nverts += c.v.len();
+                    if let Some(old) = self.gpu.insert((c.cx, c.cz), g) {
+                        self.nverts -= old.nverts;
+                        unsafe { free(&old) };
+                    }
+                }
+                Msg::Drop(x, z) => {
+                    if let Some(old) = self.gpu.remove(&(x, z)) {
+                        self.nverts -= old.nverts;
+                        unsafe { free(&old) };
+                    }
+                }
+            }
+        }
+
         // di chuyển: cần trái = (dịch chuyển ngón tay so với lúc chạm) / 70dp
         let (mut sx, mut sy) = (0.0f32, 0.0f32);
         let mut vy = 0.0f32;
@@ -235,7 +280,7 @@ impl View {
             let stride = std::mem::size_of::<V>() as i32;
             let fr = math::frustum(&mvp);
             let (mut dc, mut dv) = (0, 0);
-            for c in &self.gpu {
+            for c in self.gpu.values() {
                 if !math::aabb_visible(&fr, &c.bb) {
                     continue;
                 }
@@ -265,7 +310,7 @@ impl View {
             self.fps_t = Instant::now();
         }
         g.begin();
-        g.text(12.0 * s, 36.0 * s, 13.0 * s, 0xffffffff, &format!("FPS {}  x {:.1} y {:.1} z {:.1}  chunk {}/{}  đỉnh {}/{}", self.fps, self.pos[0], self.pos[1], self.pos[2], self.drawn_chunks, self.gpu.len(), self.drawn_verts, self.nverts));
+        g.text(12.0 * s, 84.0 * s, 13.0 * s, 0xffffffff, &format!("FPS {}  x {:.1} y {:.1} z {:.1}  chunk {}/{}  đỉnh {}/{}", self.fps, self.pos[0], self.pos[1], self.pos[2], self.drawn_chunks, self.gpu.len(), self.drawn_verts, self.nverts));
         for (r, label, col) in [
             (rect_exit(g), "Thoát", 0xc0392bd0u32),
             (rect_up(g), "Lên", 0x00000090),
