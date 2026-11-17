@@ -302,6 +302,7 @@ impl Player {
                 self.vel[1] += 0.04;
             }
             self.move_relative(0.02, f, s, yaw);
+            let old_y = self.pos[1];
             self.step_move(col);
             if water {
                 let d = if self.sprinting { 0.9 } else { 0.8 };
@@ -314,6 +315,15 @@ impl Player {
                     *v *= 0.5;
                 }
                 self.vel[1] -= 0.02;
+            }
+            // trèo lên bờ: đang đụng khối bên cạnh mà phía trên 0,6 khối còn trống thì được đẩy lên 0,3 (như Java)
+            if self.hcol {
+                if let Some(c) = col {
+                    let probe = shift3(self.bb(), [self.vel[0], self.vel[1] + 0.6 - self.pos[1] + old_y, self.vel[2]]);
+                    if !c.intersects(probe) {
+                        self.vel[1] = 0.3;
+                    }
+                }
             }
         } else {
             if inp.jump && self.on_ground && self.jump_delay == 0 {
