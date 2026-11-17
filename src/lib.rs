@@ -17,6 +17,7 @@ mod math;
 mod mc;
 mod nbt;
 mod perm;
+mod phys;
 mod png;
 mod scene;
 mod screen;

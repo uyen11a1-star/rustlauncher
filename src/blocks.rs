@@ -3,7 +3,7 @@
 use std::{collections::HashMap, sync::Arc};
 
 use crate::{
-    assets::{bake, load_model, occlusion_mask, Atlas, BFace, Jar, Model},
+    assets::{bake, load_model, occlusion_mask, rot_vec, Atlas, BFace, Jar, Model},
     json::{self, Value},
 };
 
@@ -15,6 +15,29 @@ pub struct State {
     pub occl: u8,
     pub tint: [u8; 3],
     pub faces: Vec<BFace>,
+    /// hộp va chạm [minx,miny,minz,maxx,maxy,maxz] trong khối 1x1x1 (có thể cao hơn 1, như hàng rào)
+    pub boxes: Vec<[f32; 6]>,
+    pub climb: bool,
+}
+
+/// Phần của block state mà luồng vật lý cần.
+#[derive(Clone)]
+pub struct Shape {
+    pub boxes: Vec<[f32; 6]>,
+    pub fluid: u8,
+    pub climb: bool,
+}
+
+impl State {
+    pub fn shape(&self) -> Shape {
+        Shape { boxes: self.boxes.clone(), fluid: self.fluid, climb: self.climb }
+    }
+}
+
+/// Khối không cản người (đuốc, nút, ray, biển, cỏ dây...). Hoa/cỏ đã được loại qua model "cross".
+fn no_collision(name: &str) -> bool {
+    const PARTS: [&str; 15] = ["torch", "button", "pressure_plate", "sign", "banner", "rail", "lever", "redstone_wire", "tripwire", "vine", "cobweb", "kelp", "seagrass", "coral_fan", "lichen"];
+    name == "fire" || name == "soul_fire" || PARTS.iter().any(|p| name.contains(p))
 }
 
 pub struct Resolver<'a> {
@@ -174,11 +197,12 @@ impl<'a> Resolver<'a> {
 
     pub fn state(&mut self, key: &str) -> State {
         let (name, props) = split_key(key);
-        let air = |_: ()| State { air: true, fluid: 0, occl: 0, tint: [255; 3], faces: Vec::new() };
+        let air = |_: ()| State { air: true, fluid: 0, occl: 0, tint: [255; 3], faces: Vec::new(), boxes: Vec::new(), climb: false };
         if matches!(name.as_str(), "air" | "cave_air" | "void_air" | "light" | "barrier" | "structure_void" | "bubble_column") {
             return air(());
         }
         let tint = tint_for(&name);
+        let mut boxes: Vec<[f32; 6]> = Vec::new();
         let (faces, fluid): (Vec<BFace>, u8) = if name == "water" || name == "lava" {
             let tex = if name == "water" { "water_still" } else { "lava_still" };
             let b = bake(&Model::cube(tex), self.atlas, 0, 0);
@@ -197,10 +221,43 @@ impl<'a> Resolver<'a> {
                 if let Some(b) = self.baked(&m, rx, ry) {
                     faces.extend(b.iter().cloned());
                 }
+                if let Some(model) = self.model(&m) {
+                    if !model.nocol {
+                        let (kx, ky) = (rx.rem_euclid(360) / 90, ry.rem_euclid(360) / 90);
+                        for el in &model.elements {
+                            let a = rot_vec([el.from[0] / 16.0 - 0.5, el.from[1] / 16.0 - 0.5, el.from[2] / 16.0 - 0.5], kx, ky);
+                            let b = rot_vec([el.to[0] / 16.0 - 0.5, el.to[1] / 16.0 - 0.5, el.to[2] / 16.0 - 0.5], kx, ky);
+                            let mut bx = [0.0f32; 6];
+                            for k in 0..3 {
+                                bx[k] = a[k].min(b[k]) + 0.5;
+                                bx[3 + k] = a[k].max(b[k]) + 0.5;
+                            }
+                            boxes.push(bx);
+                        }
+                    }
+                }
             }
             (faces, 0)
         };
         let occl = if fluid == 0 { occlusion_mask(&faces, self.atlas) } else { 0 };
-        State { air: false, fluid, occl, tint, faces }
+        // va chạm: khối không có model (rương, giường...) và các ngoại lệ theo tên
+        if no_collision(&name) || fluid != 0 || props.iter().any(|(k, v)| k == "open" && v == "true" && (name.ends_with("fence_gate"))) {
+            boxes.clear();
+        } else if boxes.is_empty() && faces.is_empty() {
+            if name.ends_with("chest") {
+                boxes.push([0.0625, 0.0, 0.0625, 0.9375, 0.875, 0.9375]);
+            } else if name.ends_with("_bed") {
+                boxes.push([0.0, 0.0, 0.0, 1.0, 0.5625, 1.0]);
+            }
+        }
+        if name.ends_with("_fence") || name.ends_with("_wall") || name.ends_with("fence_gate") {
+            for b in boxes.iter_mut() {
+                if b[4] > 0.99 {
+                    b[4] = 1.5; // hàng rào, tường cao 1,5 khối khi va chạm
+                }
+            }
+        }
+        let climb = name == "ladder" || name.ends_with("vine") || name.ends_with("vines") || name.ends_with("vines_plant");
+        State { air: false, fluid, occl, tint, faces, boxes, climb }
     }
 }

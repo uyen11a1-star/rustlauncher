@@ -11,7 +11,7 @@ use std::{
 
 use crate::{
     assets::{build_atlas, Atlas, Jar, Mesh, NOCULL, V},
-    blocks::{Resolver, State},
+    blocks::{Resolver, Shape, State},
     world::{self, Chunk, RawChunk, Sec, World, NSEC, SEC0, UNKNOWN},
 };
 
@@ -41,14 +41,23 @@ impl ChunkMesh {
 pub struct SceneData {
     pub atlas: Vec<u8>,
     pub chunks: Vec<ChunkMesh>,
+    /// vị trí mắt lúc vào game
     pub spawn: [f32; 3],
     pub stream: Option<Streamer>,
+    /// dữ liệu va chạm ban đầu (rỗng với cảnh thử: bay tự do)
+    pub shapes: Vec<Shape>,
+    pub col: Vec<((i32, i32), Arc<Chunk>)>,
 }
 
 /// Tin từ luồng stream gửi sang luồng vẽ.
 pub enum Msg {
     Add(ChunkMesh),
     Drop(i32, i32),
+    /// hình dạng va chạm của các block state mới (nối tiếp vào danh sách)
+    Shapes(Vec<Shape>),
+    /// chunk mới nạp (dữ liệu khối) cho vật lý
+    Col(i32, i32, Arc<Chunk>),
+    ColDrop(i32, i32),
 }
 
 /// Đầu nhận của luồng nền nạp/dựng chunk theo vị trí người chơi. Thả đi thì luồng nền tự dừng.
@@ -122,7 +131,7 @@ pub fn build_test(jar_path: &Path, log: &dyn Fn(String)) -> Result<SceneData, St
         log(m.clone());
     }
     log(format!("Dựng {} khối, {} đỉnh, mất {} ms", shown, mesh.v.len(), t0.elapsed().as_millis()));
-    Ok(SceneData { atlas: atlas.pixels, chunks: vec![ChunkMesh::new(mesh, 0, 0)], spawn: [7.0, 1.7, 4.0], stream: None })
+    Ok(SceneData { atlas: atlas.pixels, chunks: vec![ChunkMesh::new(mesh, 0, 0)], spawn: [7.0, 1.7, 4.0], stream: None, shapes: Vec::new(), col: Vec::new() })
 }
 
 /// Độ sáng 0..1 từ ánh sáng ô (lấy mức cao hơn giữa sáng trời và sáng khối), kèm một chút sáng nền.
@@ -204,7 +213,8 @@ fn mesh_chunk(world: &World, states: &[State], cx: i32, cz: i32) -> Mesh {
 const INIT_R: i32 = 2;
 
 /// Gán id toàn cục cho block state của các chunk thô rồi đưa vào thế giới.
-fn ingest(w: &mut World, ids: &mut HashMap<String, u16>, keys: &mut Vec<String>, raws: Vec<RawChunk>) {
+fn ingest(w: &mut World, ids: &mut HashMap<String, u16>, keys: &mut Vec<String>, raws: Vec<RawChunk>) -> Vec<(i32, i32, Arc<Chunk>)> {
+    let mut added = Vec::new();
     for rc in raws {
         let mut secs: Vec<Option<Sec>> = (0..NSEC).map(|_| None).collect();
         for s in rc.secs {
@@ -287,8 +297,11 @@ fn ingest(w: &mut World, ids: &mut HashMap<String, u16>, keys: &mut Vec<String>,
                 lt[si] = Some(a);
             }
         }
-        w.chunks.insert((rc.cx, rc.cz), Chunk { secs, lt });
+        let ch = Arc::new(Chunk { secs, lt });
+        w.chunks.insert((rc.cx, rc.cz), ch.clone());
+        added.push((rc.cx, rc.cz, ch));
     }
+    added
 }
 
 /// Dịch thêm các block state mới (từ `keys`) sang model.
@@ -323,6 +336,9 @@ impl Worker {
             let gone: Vec<(i32, i32)> = self.w.chunks.keys().copied().filter(|&(x, z)| far(x, z)).collect();
             for k in gone {
                 self.w.chunks.remove(&k);
+                if tx.send(Msg::ColDrop(k.0, k.1)).is_err() {
+                    return;
+                }
             }
             self.tried.retain(|&(x, z)| !far(x, z));
             let dropped: Vec<(i32, i32)> = self.meshed.iter().copied().filter(|&(x, z)| far(x, z)).collect();
@@ -351,8 +367,20 @@ impl Worker {
                 for c in &want {
                     self.tried.insert(*c);
                 }
-                ingest(&mut self.w, &mut self.ids, &mut self.keys, raws);
+                let added = ingest(&mut self.w, &mut self.ids, &mut self.keys, raws);
+                let before = self.states.len();
                 grow_states(&mut res, &self.keys, &mut self.states);
+                if self.states.len() > before {
+                    let sh: Vec<Shape> = self.states[before..].iter().map(|s| s.shape()).collect();
+                    if tx.send(Msg::Shapes(sh)).is_err() {
+                        return;
+                    }
+                }
+                for (x, z, ch) in added {
+                    if tx.send(Msg::Col(x, z, ch)).is_err() {
+                        return;
+                    }
+                }
             }
 
             // dựng mesh chunk nào đã đủ 4 chunk kề (đã thử đọc), gần trước
@@ -431,7 +459,7 @@ pub fn build_world(jar_path: &Path, dir: &Path, radius: i32, log: &dyn Fn(String
     let mut keys: Vec<String> = vec!["minecraft:air".into()];
     ids.insert("minecraft:air".into(), 0);
     let mut w = World::default();
-    ingest(&mut w, &mut ids, &mut keys, raws);
+    let _ = ingest(&mut w, &mut ids, &mut keys, raws);
     log(format!("{} loại block state khác nhau", keys.len()));
 
     let t2 = std::time::Instant::now();
@@ -498,6 +526,9 @@ pub fn build_world(jar_path: &Path, dir: &Path, radius: i32, log: &dyn Fn(String
         found.map_or(100.0, |v| v as f32 + 3.0)
     };
 
+    let shapes: Vec<Shape> = states.iter().map(|s| s.shape()).collect();
+    let col: Vec<((i32, i32), Arc<Chunk>)> = w.chunks.iter().map(|(k, v)| (*k, v.clone())).collect();
+
     // giao thế giới cho luồng stream
     let pos = Arc::new(AtomicI64::new(pack(ccx, ccz)));
     let stop = Arc::new(AtomicBool::new(false));
@@ -507,5 +538,5 @@ pub fn build_world(jar_path: &Path, dir: &Path, radius: i32, log: &dyn Fn(String
     let (p2, s2) = (pos.clone(), stop.clone());
     std::thread::spawn(move || worker.run(jar, atlas, radius, p2, s2, tx));
     log(format!("Tổng thời gian dựng: {} ms", t0.elapsed().as_millis()));
-    Ok(SceneData { atlas: pixels, chunks, spawn: [center[0] as f32, y, center[2] as f32], stream: Some(Streamer { rx, pos, stop }) })
+    Ok(SceneData { atlas: pixels, chunks, spawn: [center[0] as f32, y, center[2] as f32], stream: Some(Streamer { rx, pos, stop }), shapes, col })
 }

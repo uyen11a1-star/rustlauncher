@@ -1,6 +1,7 @@
 //! Đọc thế giới Minecraft Java: level.dat, file vùng .mca, chunk (NBT) -> mảng id block state.
 use std::{
     collections::HashMap,
+    sync::Arc,
     fs::File,
     io::{Read, Seek, SeekFrom},
     path::{Path, PathBuf},
@@ -32,7 +33,7 @@ pub struct Chunk {
 
 #[derive(Default)]
 pub struct World {
-    pub chunks: HashMap<(i32, i32), Chunk>,
+    pub chunks: HashMap<(i32, i32), Arc<Chunk>>,
 }
 
 impl World {

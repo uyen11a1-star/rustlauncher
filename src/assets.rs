@@ -131,6 +131,8 @@ pub struct Element {
 pub struct Model {
     pub elements: Vec<Element>,
     pub textures: HashMap<String, String>,
+    /// model kiểu "cross"/"crop" (cỏ, hoa, mạ...): đi xuyên qua được
+    pub nocol: bool,
 }
 
 impl Model {
@@ -141,7 +143,7 @@ impl Model {
             .collect();
         let mut textures = HashMap::new();
         textures.insert("all".to_string(), format!("block/{tex}"));
-        Model { elements: vec![Element { from: [0.0; 3], to: [16.0; 3], shade: true, rot: None, faces }], textures }
+        Model { elements: vec![Element { from: [0.0; 3], to: [16.0; 3], shade: true, rot: None, faces }], textures, nocol: false }
     }
 }
 
@@ -216,6 +218,9 @@ pub fn load_model(jar: &Jar, name: &str, depth: u32) -> Result<Model, String> {
         Some(p) if !p.contains("builtin/") => load_model(jar, p, depth + 1)?,
         _ => Model::default(),
     };
+    if name.contains("cross") || name.contains("crop") {
+        m.nocol = true;
+    }
     if let Some(Value::Obj(t)) = v.get("textures") {
         for (k, val) in t {
             if let Some(s) = val.as_str() {
@@ -261,7 +266,7 @@ const SHADE: [f32; 6] = [0.5, 1.0, 0.8, 0.8, 0.6, 0.6];
 const DV: [[f32; 3]; 6] = [[0.0, -1.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, -1.0], [0.0, 0.0, 1.0], [-1.0, 0.0, 0.0], [1.0, 0.0, 0.0]];
 
 /// Xoay vector (tương đối tâm) `kx` bước 90° quanh X rồi `ky` bước quanh Y, theo quy ước của Minecraft.
-fn rot_vec(mut v: [f32; 3], kx: i32, ky: i32) -> [f32; 3] {
+pub fn rot_vec(mut v: [f32; 3], kx: i32, ky: i32) -> [f32; 3] {
     for _ in 0..kx {
         v = [v[0], v[2], -v[1]];
     }

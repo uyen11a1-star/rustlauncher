@@ -11,7 +11,9 @@ use crate::{
     gfx::{build_program, Gfx},
     gles::*,
     math,
+    phys::{Collider, Input, Player, TICK},
     scene::{pack, ChunkMesh, Msg, SceneData, Streamer},
+    world::World,
 };
 
 struct Gpu {
@@ -89,8 +91,10 @@ const FOG_END: f32 = 90.0;
 enum Role {
     Move,
     Look,
-    Up,
-    Down,
+    Jump,
+    Sneak,
+    Fly,
+    Sprint,
     Exit,
 }
 
@@ -124,7 +128,17 @@ pub struct View {
     nverts: usize,
     drawn_chunks: usize,
     drawn_verts: usize,
+    /// vị trí mắt (đã nội suy) — dùng cho camera, stream và HUD
     pos: [f32; 3],
+    col: Option<Collider>,
+    player: Player,
+    prev: [f64; 3],
+    prev_eye: f64,
+    acc: f32,
+    spawn: [f64; 3],
+    jump_held: bool,
+    sneak_on: bool,
+    sprint_on: bool,
     yaw: f32,
     pitch: f32,
     touches: Vec<Touch>,
@@ -139,13 +153,21 @@ fn rect_exit(g: &Gfx) -> [f32; 4] {
     let s = g.scale;
     [g.w as f32 - 92.0 * s, 36.0 * s, 80.0 * s, 40.0 * s]
 }
-fn rect_up(g: &Gfx) -> [f32; 4] {
+fn rect_jump(g: &Gfx) -> [f32; 4] {
     let s = g.scale;
-    [g.w as f32 - 76.0 * s, g.h as f32 - 190.0 * s, 64.0 * s, 64.0 * s]
+    [g.w as f32 - 88.0 * s, g.h as f32 - 200.0 * s, 76.0 * s, 76.0 * s]
 }
-fn rect_down(g: &Gfx) -> [f32; 4] {
+fn rect_sneak(g: &Gfx) -> [f32; 4] {
     let s = g.scale;
-    [g.w as f32 - 76.0 * s, g.h as f32 - 110.0 * s, 64.0 * s, 64.0 * s]
+    [g.w as f32 - 88.0 * s, g.h as f32 - 116.0 * s, 76.0 * s, 48.0 * s]
+}
+fn rect_fly(g: &Gfx) -> [f32; 4] {
+    let s = g.scale;
+    [12.0 * s, g.h as f32 - 200.0 * s, 76.0 * s, 48.0 * s]
+}
+fn rect_sprint(g: &Gfx) -> [f32; 4] {
+    let s = g.scale;
+    [12.0 * s, g.h as f32 - 144.0 * s, 76.0 * s, 48.0 * s]
 }
 fn inside(r: [f32; 4], x: f32, y: f32) -> bool {
     x >= r[0] && x < r[0] + r[2] && y >= r[1] && y < r[1] + r[3]
@@ -163,6 +185,16 @@ impl View {
             let u_fog = glGetUniformLocation(prog, c("u_fog").as_ptr());
             let u_mvp = glGetUniformLocation(prog, c("u_mvp").as_ptr());
             let u_tex = glGetUniformLocation(prog, c("u_tex").as_ptr());
+            let col = if d.stream.is_some() {
+                let mut world = World::default();
+                for (k, ch) in &d.col {
+                    world.chunks.insert(*k, ch.clone());
+                }
+                Some(Collider { world, shapes: d.shapes.clone() })
+            } else {
+                None
+            };
+            let feet = [d.spawn[0] as f64, d.spawn[1] as f64 - 1.62, d.spawn[2] as f64];
             let mut gpu = HashMap::new();
             let mut nverts = 0;
             for c in &d.chunks {
@@ -198,6 +230,15 @@ impl View {
                 drawn_chunks: 0,
                 drawn_verts: 0,
                 pos: d.spawn,
+                player: Player::new(feet, col.is_none()),
+                col,
+                prev: feet,
+                prev_eye: 1.62,
+                acc: 0.0,
+                spawn: feet,
+                jump_held: false,
+                sneak_on: false,
+                sprint_on: false,
                 yaw: 0.0,
                 pitch: -0.1,
                 touches: Vec::new(),
@@ -215,10 +256,14 @@ impl View {
             Phase::Down => {
                 let role = if inside(rect_exit(g), x, y) {
                     Role::Exit
-                } else if inside(rect_up(g), x, y) {
-                    Role::Up
-                } else if inside(rect_down(g), x, y) {
-                    Role::Down
+                } else if inside(rect_jump(g), x, y) {
+                    Role::Jump
+                } else if inside(rect_sneak(g), x, y) {
+                    Role::Sneak
+                } else if inside(rect_fly(g), x, y) {
+                    Role::Fly
+                } else if inside(rect_sprint(g), x, y) {
+                    Role::Sprint
                 } else if x < g.w as f32 * 0.5 {
                     Role::Move
                 } else {
@@ -241,8 +286,18 @@ impl View {
             Phase::Up => {
                 if let Some(i) = self.touches.iter().position(|t| t.id == id) {
                     let t = self.touches.remove(i);
-                    if t.role == Role::Exit && inside(rect_exit(g), x, y) {
-                        self.exit = true;
+                    // nút bật/tắt: kích hoạt khi nhả ngón trong chính nút đó
+                    match t.role {
+                        Role::Exit if inside(rect_exit(g), x, y) => self.exit = true,
+                        Role::Sneak if inside(rect_sneak(g), x, y) => self.sneak_on = !self.sneak_on,
+                        Role::Sprint if inside(rect_sprint(g), x, y) => self.sprint_on = !self.sprint_on,
+                        Role::Fly if inside(rect_fly(g), x, y) && self.col.is_some() => {
+                            self.player.fly = !self.player.fly;
+                            if self.player.fly {
+                                self.player.vel[1] = 0.0;
+                            }
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -260,7 +315,8 @@ impl View {
         if let Some(st) = &self.stream {
             st.pos.store(pack((self.pos[0].floor() as i32) >> 4, (self.pos[2].floor() as i32) >> 4), Relaxed);
         }
-        for _ in 0..4 {
+        let mut uploads = 0;
+        while uploads < 4 {
             let m = match &self.stream {
                 Some(st) => st.rx.try_recv().ok(),
                 None => None,
@@ -268,6 +324,7 @@ impl View {
             let Some(m) = m else { break };
             match m {
                 Msg::Add(c) => {
+                    uploads += 1;
                     let g = unsafe { upload(&c) };
                     self.nverts += c.v.len();
                     if let Some(old) = self.gpu.insert((c.cx, c.cz), g) {
@@ -281,30 +338,62 @@ impl View {
                         unsafe { free(&old) };
                     }
                 }
+                Msg::Shapes(sh) => {
+                    if let Some(c) = self.col.as_mut() {
+                        c.shapes.extend(sh);
+                    }
+                }
+                Msg::Col(x, z, ch) => {
+                    if let Some(c) = self.col.as_mut() {
+                        c.world.chunks.insert((x, z), ch);
+                    }
+                }
+                Msg::ColDrop(x, z) => {
+                    if let Some(c) = self.col.as_mut() {
+                        c.world.chunks.remove(&(x, z));
+                    }
+                }
             }
         }
 
-        // di chuyển: cần trái = (dịch chuyển ngón tay so với lúc chạm) / 70dp
+        // đầu vào: cần trái = (dịch chuyển ngón tay so với lúc chạm) / 70dp; kéo lên = tiến
         let (mut sx, mut sy) = (0.0f32, 0.0f32);
-        let mut vy = 0.0f32;
+        self.jump_held = false;
         for t in &self.touches {
             match t.role {
                 Role::Move => {
                     sx = ((t.x - t.sx) / (70.0 * s)).clamp(-1.0, 1.0);
                     sy = ((t.y - t.sy) / (70.0 * s)).clamp(-1.0, 1.0);
                 }
-                Role::Up => vy += 1.0,
-                Role::Down => vy -= 1.0,
+                Role::Jump => self.jump_held = true,
                 _ => {}
             }
         }
-        let speed = 14.0;
-        let (sn, cs) = self.yaw.sin_cos();
-        let fwd = [-sn, -cs];
-        let right = [cs, -sn];
-        self.pos[0] += (fwd[0] * -sy + right[0] * sx) * speed * dt;
-        self.pos[2] += (fwd[1] * -sy + right[1] * sx) * speed * dt;
-        self.pos[1] += vy * speed * dt;
+        let inp = Input { fwd: (-sy) as f64, strafe: sx as f64, jump: self.jump_held, sneak: self.sneak_on, sprint: self.sprint_on };
+
+        // vật lý theo tick cố định 20/giây, camera nội suy giữa hai tick
+        if self.col.as_ref().map_or(false, |c| c.loaded(self.player.pos[0].floor() as i32, self.player.pos[2].floor() as i32)) || self.col.is_none() {
+            self.acc += dt;
+            let mut n = 0;
+            while self.acc >= TICK && n < 5 {
+                self.acc -= TICK;
+                n += 1;
+                self.prev = self.player.pos;
+                self.prev_eye = self.player.eye_height();
+                self.player.tick(&inp, self.yaw as f64, self.col.as_ref());
+                if self.player.pos[1] < -100.0 {
+                    self.player.pos = self.spawn;
+                    self.player.vel = [0.0; 3];
+                }
+            }
+            if n == 5 {
+                self.acc = 0.0;
+            }
+        }
+        let a = (self.acc / TICK).clamp(0.0, 1.0) as f64;
+        let cam = |i: usize| self.prev[i] + (self.player.pos[i] - self.prev[i]) * a;
+        let eye = self.prev_eye + (self.player.eye_height() - self.prev_eye) * a;
+        self.pos = [cam(0) as f32, (cam(1) + eye) as f32, cam(2) as f32];
 
         let aspect = g.w as f32 / g.h as f32;
         let mvp = math::mul(&math::perspective(1.2, aspect, 0.05, 300.0), &math::view(self.pos, self.yaw, self.pitch));
@@ -382,11 +471,16 @@ impl View {
             self.fps_t = Instant::now();
         }
         g.begin();
-        g.text(12.0 * s, 84.0 * s, 13.0 * s, 0xffffffff, &format!("FPS {}  x{:.0} y{:.0} z{:.0}  chunk {}/{}  đỉnh {}k", self.fps, self.pos[0], self.pos[1], self.pos[2], self.drawn_chunks, self.gpu.len(), self.drawn_verts / 1000));
+        g.text(12.0 * s, 84.0 * s, 13.0 * s, 0xffffffff, &format!("FPS {}  x{:.0} y{:.0} z{:.0}  chunk {}/{}  đỉnh {}k  {}", self.fps, self.pos[0], self.pos[1], self.pos[2], self.drawn_chunks, self.gpu.len(), self.drawn_verts / 1000, if self.player.fly { "bay" } else if self.player.on_ground { "đất" } else { "không" }));
+        let on = 0x2e8b57c0u32;
+        let off = 0x00000090u32;
+        let fly_label = if self.player.fly { "Bay: bật" } else { "Bay: tắt" };
         for (r, label, col) in [
             (rect_exit(g), "Thoát", 0xc0392bd0u32),
-            (rect_up(g), "Lên", 0x00000090),
-            (rect_down(g), "Xuống", 0x00000090),
+            (rect_jump(g), if self.player.fly { "Lên" } else { "Nhảy" }, if self.jump_held { on } else { off }),
+            (rect_sneak(g), if self.player.fly { "Xuống" } else { "Lén" }, if self.sneak_on { on } else { off }),
+            (rect_fly(g), fly_label, if self.player.fly { on } else { off }),
+            (rect_sprint(g), "Chạy", if self.sprint_on { on } else { off }),
         ] {
             g.rect(r[0], r[1], r[2], r[3], col);
             let tw = g.text_width(label, 14.0 * s);
