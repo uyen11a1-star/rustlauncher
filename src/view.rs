@@ -55,11 +55,12 @@ precision highp float;
 in vec2 v_uv; in vec4 v_col; in float v_d;
 uniform sampler2D u_tex;
 uniform vec2 u_fog;
+uniform vec3 u_fogc;
 out vec4 o;
 void main(){
   vec4 t=texture(u_tex,v_uv); if(t.a<0.1) discard;
   float f=clamp((u_fog.y-v_d)/(u_fog.y-u_fog.x),0.0,1.0);
-  vec3 c=mix(vec3(0.53,0.81,0.92), t.rgb*v_col.rgb, f);
+  vec3 c=mix(u_fogc, t.rgb*v_col.rgb, f);
   o=vec4(c, t.a*v_col.a);
 }";
 
@@ -120,6 +121,7 @@ pub struct View {
     sky_view: i32,
     sky_tf: i32,
     u_fog: i32,
+    u_fogc: i32,
     gpu: HashMap<(i32, i32), Gpu>,
     stream: Option<Streamer>,
     tex: u32,
@@ -183,6 +185,7 @@ impl View {
             let sky_view = glGetUniformLocation(sky, c("u_view").as_ptr());
             let sky_tf = glGetUniformLocation(sky, c("u_tf").as_ptr());
             let u_fog = glGetUniformLocation(prog, c("u_fog").as_ptr());
+            let u_fogc = glGetUniformLocation(prog, c("u_fogc").as_ptr());
             let u_mvp = glGetUniformLocation(prog, c("u_mvp").as_ptr());
             let u_tex = glGetUniformLocation(prog, c("u_tex").as_ptr());
             let col = if d.stream.is_some() {
@@ -221,6 +224,7 @@ impl View {
                 sky_view,
                 sky_tf,
                 u_fog,
+                u_fogc,
                 gpu,
                 stream: d.stream,
                 tex,
@@ -380,7 +384,7 @@ impl View {
                 n += 1;
                 self.prev = self.player.pos;
                 self.prev_eye = self.player.eye_height();
-                self.player.tick(&inp, self.yaw as f64, self.col.as_ref());
+                self.player.tick(&inp, self.yaw as f64, self.pitch as f64, self.col.as_ref());
                 if self.player.pos[1] < -100.0 {
                     self.player.pos = self.spawn;
                     self.player.vel = [0.0; 3];
@@ -395,12 +399,19 @@ impl View {
         let eye = self.prev_eye + (self.player.eye_height() - self.prev_eye) * a;
         self.pos = [cam(0) as f32, (cam(1) + eye) as f32, cam(2) as f32];
 
+        // mắt đang ở trong nước / dung nham: sương mù dày màu xanh / cam, không thấy trời
+        let medium = self.col.as_ref().map_or(0, |c| c.fluid_at(self.pos[0].floor() as i32, self.pos[1].floor() as i32, self.pos[2].floor() as i32));
+        let (fog_c, fog_s, fog_e) = match medium {
+            1 => ([0.10f32, 0.22, 0.50], 0.0f32, 22.0f32),
+            2 => ([0.55, 0.10, 0.02], 0.0, 3.0),
+            _ => ([0.53, 0.81, 0.92], FOG_START, FOG_END),
+        };
         let aspect = g.w as f32 / g.h as f32;
         let mvp = math::mul(&math::perspective(1.2, aspect, 0.05, 300.0), &math::view(self.pos, self.yaw, self.pitch));
         unsafe {
             glViewport(0, 0, g.w, g.h);
             glDisable(GL_SCISSOR_TEST);
-            glClearColor(0.53, 0.81, 0.92, 1.0);
+            glClearColor(fog_c[0], fog_c[1], fog_c[2], 1.0);
             glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
             // bầu trời: tam giác phủ màn hình, hướng nhìn tính từ ma trận view
             glDisable(GL_DEPTH_TEST);
@@ -409,18 +420,21 @@ impl View {
             for i in 0..3 {
                 glDisableVertexAttribArray(i);
             }
-            glUseProgram(self.sky);
-            let vm = math::view(self.pos, self.yaw, self.pitch);
-            glUniformMatrix4fv(self.sky_view, 1, 0, vm.as_ptr());
-            let tf = (1.2f32 / 2.0).tan();
-            glUniform2f(self.sky_tf, tf * aspect, tf);
-            glDrawArrays(GL_TRIANGLES, 0, 3);
+            if medium == 0 {
+                glUseProgram(self.sky);
+                let vm = math::view(self.pos, self.yaw, self.pitch);
+                glUniformMatrix4fv(self.sky_view, 1, 0, vm.as_ptr());
+                let tf = (1.2f32 / 2.0).tan();
+                glUniform2f(self.sky_tf, tf * aspect, tf);
+                glDrawArrays(GL_TRIANGLES, 0, 3);
+            }
             glEnable(GL_DEPTH_TEST);
             glDepthFunc(GL_LEQUAL);
             glDisable(GL_BLEND);
             glEnable(GL_CULL_FACE);
             glUseProgram(self.prog);
-            glUniform2f(self.u_fog, FOG_START, FOG_END);
+            glUniform2f(self.u_fog, fog_s, fog_e);
+            glUniform3f(self.u_fogc, fog_c[0], fog_c[1], fog_c[2]);
             glUniformMatrix4fv(self.u_mvp, 1, 0, mvp.as_ptr());
             glActiveTexture(GL_TEXTURE0);
             glBindTexture(GL_TEXTURE_2D, self.tex);

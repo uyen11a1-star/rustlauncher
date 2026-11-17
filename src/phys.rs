@@ -261,7 +261,7 @@ impl Player {
     }
 
     /// Một tick (1/20 giây). `yaw` theo quy ước của màn hình xem.
-    pub fn tick(&mut self, inp: &Input, yaw: f64, col: Option<&Collider>) {
+    pub fn tick(&mut self, inp: &Input, yaw: f64, pitch: f64, col: Option<&Collider>) {
         let (bx, by, bz) = (self.pos[0].floor() as i32, self.pos[1].floor() as i32, self.pos[2].floor() as i32);
         let (mut water, mut lava, mut climbing) = (false, false, false);
         if let Some(c) = col {
@@ -298,6 +298,15 @@ impl Player {
                 self.fly = false; // chạm đất thì thôi bay
             }
         } else if water || lava {
+            if water && self.sprinting {
+                // bơi nhanh: vận tốc đứng nhích dần về hướng nhìn (nhìn lên thì bơi lên, nhìn xuống thì lặn)
+                let ly = pitch.sin();
+                let k = if ly < -0.2 { 0.085 } else { 0.06 };
+                let head_in_fluid = col.map_or(false, |c| c.fluid_at(bx, (self.pos[1] + 0.9).floor() as i32, bz) != 0);
+                if ly <= 0.0 || inp.jump || head_in_fluid {
+                    self.vel[1] += (ly - self.vel[1]) * k;
+                }
+            }
             if inp.jump {
                 self.vel[1] += 0.04;
             }
@@ -309,7 +318,9 @@ impl Player {
                 self.vel[0] *= d;
                 self.vel[1] *= 0.8;
                 self.vel[2] *= d;
-                self.vel[1] -= 0.02;
+                if !self.sprinting {
+                    self.vel[1] -= 0.005; // trọng lực dưới nước = 0,08 / 16 (bản mới)
+                }
             } else {
                 for v in self.vel.iter_mut() {
                     *v *= 0.5;

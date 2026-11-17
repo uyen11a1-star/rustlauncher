@@ -140,6 +140,43 @@ fn bright(l: u8) -> f32 {
     0.03 + 0.97 * x / (4.0 - 3.0 * x)
 }
 
+/// Smooth lighting: mỗi đỉnh lấy trung bình ánh sáng của 4 ô quanh nó (lớp ô phía trước mặt) nhân với AO
+/// (ô đặc làm tối như Minecraft). Trả về độ sáng 0..1 cho 4 đỉnh của mặt.
+fn smooth(world: &World, states: &[State], p: [i32; 3], f: &crate::assets::BFace) -> [f32; 4] {
+    let d = f.cull as usize;
+    let a = [1usize, 1, 2, 2, 0, 0][d] ;
+    let (t1, t2) = ((a + 1) % 3, (a + 2) % 3);
+    let n = [p[0] + DV[d][0], p[1] + DV[d][1], p[2] + DV[d][2]];
+    // lưới 3x3 các ô trong lớp phía trước: chỉ số (i+1, j+1) với i theo t1, j theo t2
+    let mut opaque = [[false; 3]; 3];
+    let mut light = [[0.0f32; 3]; 3];
+    let center = bright(world.light(n[0], n[1], n[2]));
+    for i in 0..3 {
+        for j in 0..3 {
+            let mut q = n;
+            q[t1] += i as i32 - 1;
+            q[t2] += j as i32 - 1;
+            let id = world.get(q[0], q[1], q[2]);
+            let op = id != UNKNOWN && id != 0 && states[id as usize].occl == 0x3f;
+            opaque[i][j] = op;
+            light[i][j] = if op { center } else { bright(world.light(q[0], q[1], q[2])) };
+        }
+    }
+    let mut out = [0.0f32; 4];
+    for k in 0..4 {
+        let s1 = if f.q[k][t1] > 0.5 { 2 } else { 0 };
+        let s2 = if f.q[k][t2] > 0.5 { 2 } else { 0 };
+        let (oa, ob) = (opaque[s1][1], opaque[1][s2]);
+        // ô góc: nếu cả hai ô bên cạnh đặc thì coi góc đặc luôn (ánh sáng không lọt qua khe chéo)
+        let (ok, lk) = if oa && ob { (true, center) } else { (opaque[s1][s2], light[s1][s2]) };
+        let l = (center + light[s1][1] + light[1][s2] + lk) / 4.0;
+        let sh = |o: bool| if o { 0.2f32 } else { 1.0 };
+        let ao = (1.0 + sh(oa) + sh(ob) + sh(ok)) / 4.0;
+        out[k] = l * ao;
+    }
+    out
+}
+
 fn mesh_chunk(world: &World, states: &[State], cx: i32, cz: i32) -> Mesh {
     let mut mesh = Mesh::default();
     let Some(chunk) = world.chunks.get(&(cx, cz)) else { return mesh };
@@ -189,16 +226,20 @@ fn mesh_chunk(world: &World, states: &[State], cx: i32, cz: i32) -> Mesh {
                         }
                         let at = [x as f32, y as f32, z as f32];
                         let col = if f.tint { st.tint } else { [255; 3] };
-                        let lv = if f.cull != NOCULL {
-                            let d = f.cull as usize;
-                            world.light(x + DV[d][0], y + DV[d][1], z + DV[d][2])
-                        } else {
-                            world.light(x, y, z)
-                        };
-                        let br = bright(lv);
                         if st.fluid == 1 {
-                            mesh.push_water(f, at, col, br);
+                            // nước: sáng phẳng theo ô phía trước mặt
+                            let lv = if f.cull != NOCULL {
+                                let d = f.cull as usize;
+                                world.light(x + DV[d][0], y + DV[d][1], z + DV[d][2])
+                            } else {
+                                world.light(x, y, z)
+                            };
+                            mesh.push_water(f, at, col, bright(lv));
+                        } else if f.cull != NOCULL {
+                            let br = smooth(world, states, [x, y, z], f);
+                            mesh.push_face_v(f, at, col, br);
                         } else {
+                            let br = bright(world.light(x, y, z));
                             mesh.push_face_b(f, at, col, br);
                         }
                     }

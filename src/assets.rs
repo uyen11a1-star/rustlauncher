@@ -441,6 +441,21 @@ impl Mesh {
         self.i.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
     }
 
+    /// Như `push_face_b` nhưng mỗi đỉnh một độ sáng (smooth lighting). Đường chéo chia tam giác chọn theo độ sáng để không lộ vệt.
+    pub fn push_face_v(&mut self, f: &BFace, at: [f32; 3], col: [u8; 3], br: [f32; 4]) {
+        let base = self.v.len() as u32;
+        for k in 0..4 {
+            let s = f.shade * br[k];
+            let c = [(col[0] as f32 * s) as u8, (col[1] as f32 * s) as u8, (col[2] as f32 * s) as u8, 255];
+            self.v.push(V { p: [f.q[k][0] + at[0], f.q[k][1] + at[1], f.q[k][2] + at[2]], uv: f.uv[k], c });
+        }
+        if br[0] + br[2] >= br[1] + br[3] {
+            self.i.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+        } else {
+            self.i.extend_from_slice(&[base + 1, base + 2, base + 3, base + 1, base + 3, base]);
+        }
+    }
+
     /// Như `push_face` nhưng cho mặt nước: alpha 200, chỉ số vào danh sách `iw`.
     pub fn push_water(&mut self, f: &BFace, at: [f32; 3], col: [u8; 3], br: f32) {
         let base = self.v.len() as u32;
