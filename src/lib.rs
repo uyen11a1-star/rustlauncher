@@ -16,6 +16,7 @@ mod launcher;
 mod math;
 mod mc;
 mod nbt;
+mod perm;
 mod png;
 mod scene;
 mod screen;
@@ -142,8 +143,19 @@ fn android_main(app: AndroidApp) {
                             }
                         }
                         match screen.draw(g, &launcher) {
-                                            Some(screen::Action::View(id)) => launcher.prepare(id, false),
-                            Some(screen::Action::World(id)) => launcher.prepare(id, true),
+                            Some(screen::Action::View(id)) => launcher.prepare(id, false),
+                            Some(screen::Action::World(id)) => {
+                                let vm = app.vm_as_ptr();
+                                if perm::has_all_files(vm) {
+                                    launcher.prepare(id, true);
+                                } else {
+                                    let say = launcher::pusher(&launcher.log);
+                                    match perm::request_all_files(vm, app.activity_as_ptr(), "dev.rustlauncher.app") {
+                                        Ok(()) => say("Cần quyền quản lý mọi tệp: bật cho Rust Launcher ở trang vừa mở, rồi quay lại và bấm nút vàng lần nữa.".into()),
+                                        Err(e) => say(format!("Không mở được trang cấp quyền ({e}). Tự vào Cài đặt > Ứng dụng > Rust Launcher > Quyền để bật quản lý mọi tệp.")),
+                                    }
+                                }
+                            }
                             None => {}
                         }
                     }
