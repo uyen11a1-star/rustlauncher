@@ -157,6 +157,11 @@ pub struct View {
     u_fog: i32,
     u_fogc: i32,
     u_tint: i32,
+    inv_tex: Option<(u32, f32, f32)>,
+    hot_tex: Option<(u32, f32, f32, [f32; 4])>,
+    sel_tex: Option<(u32, f32, f32, [f32; 4])>,
+    body_gpu: Gpu,
+    quad_vbo: u32,
     items: Vec<Item>,
     items_gpu: Gpu,
     arm_gpu: Gpu,
@@ -201,17 +206,17 @@ pub struct View {
     exit: bool,
 }
 
-/// Số lượng ở góc dưới-phải ô (có bóng đen), ẩn khi chỉ có 1.
+/// Số lượng ở góc dưới-phải ô vật phẩm 16x16 (có bóng xám như vanilla), ẩn khi chỉ có 1.
 fn draw_count(g: &mut Gfx, r: [f32; 4], n: u8) {
     if n <= 1 {
         return;
     }
-    let s = g.scale;
-    let size = r[2] * 0.34;
+    let k = r[2] / 16.0;
+    let size = 9.0 * k;
     let txt = n.to_string();
     let tw = g.text_width(&txt, size);
-    let (x, y) = (r[0] + r[2] - tw - 3.0 * s, r[1] + r[3] - size * 1.3 - 1.0 * s);
-    g.text(x + 0.8 * s, y + 0.8 * s, size, 0x000000ff, &txt);
+    let (x, y) = (r[0] + 17.0 * k - tw, r[1] + 17.0 * k - size * 1.25);
+    g.text(x + k, y + k, size, 0x3f3f3fff, &txt);
     g.text(x, y, size, 0xffffffff, &txt);
 }
 
@@ -220,36 +225,49 @@ fn rect_bag(g: &Gfx) -> [f32; 4] {
     [g.w as f32 - 92.0 * s, 84.0 * s, 80.0 * s, 40.0 * s]
 }
 
-/// Thanh nhanh: (x trái, y trên, cỡ ô).
-fn hot_geom(g: &Gfx) -> (f32, f32, f32) {
-    let s = g.scale;
-    let slot = ((g.w as f32 - 16.0 * s) / 9.0).min(44.0 * s);
-    ((g.w as f32 - 9.0 * slot) / 2.0, g.h as f32 - slot - 8.0 * s, slot)
+/// Hệ số phóng GUI nguyên như Minecraft ("GUI scale auto"): lớn nhất mà vẫn còn ≥ 320x240 đơn vị.
+fn gs(g: &Gfx) -> f32 {
+    ((g.w as f32 / 320.0).floor().min((g.h as f32 / 240.0).floor())).max(1.0)
 }
 
-/// Khung túi đồ: (x, y, rộng, cao, cỡ ô, lề, cao tiêu đề, khoảng cách giữa túi và thanh nhanh).
-fn inv_geom(g: &Gfx) -> (f32, f32, f32, f32, f32, f32, f32, f32) {
-    let s = g.scale;
-    let slot = ((g.h as f32 - 100.0 * s) / 4.5).min((g.w as f32 - 24.0 * s) / 9.4).min(46.0 * s).max(20.0 * s);
-    let (pad, title, gap) = (10.0 * s, 26.0 * s, 10.0 * s);
-    let (pw, ph) = (9.0 * slot + 2.0 * pad, title + 4.0 * slot + gap + 2.0 * pad);
-    ((g.w as f32 - pw) / 2.0, (g.h as f32 - ph) / 2.0, pw, ph, slot, pad, title, gap)
+/// Góc trên-trái ảnh thanh nhanh (182x22 đơn vị GUI, sát đáy giữa màn hình).
+fn hot_origin(g: &Gfx) -> (f32, f32) {
+    let k = gs(g);
+    ((g.w as f32 - 182.0 * k) / 2.0, g.h as f32 - 22.0 * k)
 }
 
-/// Hình chữ nhật ô túi `i` (0..8 thanh nhanh, 9..35 túi) khi mở túi đồ.
-fn inv_slot_rect(g: &Gfx, i: usize) -> [f32; 4] {
-    let (px, py, _, _, slot, pad, title, gap) = inv_geom(g);
-    if i < 9 {
-        [px + pad + i as f32 * slot, py + pad + title + 3.0 * slot + gap, slot, slot]
-    } else {
-        let (r, c) = ((i - 9) / 9, (i - 9) % 9);
-        [px + pad + c as f32 * slot, py + pad + title + r as f32 * slot, slot, slot]
-    }
+/// Ô vật phẩm 16x16 của ô thanh nhanh i.
+fn hot_item_rect(g: &Gfx, i: usize) -> [f32; 4] {
+    let (bx, by) = hot_origin(g);
+    let k = gs(g);
+    [bx + (3.0 + 20.0 * i as f32) * k, by + 3.0 * k, 16.0 * k, 16.0 * k]
 }
 
 fn hot_slot_rect(g: &Gfx, i: usize) -> [f32; 4] {
-    let (x, y, slot) = hot_geom(g);
-    [x + i as f32 * slot, y, slot, slot]
+    let (bx, by) = hot_origin(g);
+    let k = gs(g);
+    [bx + 20.0 * i as f32 * k, by, 20.0 * k, 22.0 * k]
+}
+
+/// Khung túi đồ 176x166 đơn vị GUI, giữa màn hình: [x, y, rộng, cao].
+fn inv_panel(g: &Gfx) -> [f32; 4] {
+    let k = gs(g);
+    [(g.w as f32 - 176.0 * k) / 2.0, (g.h as f32 - 166.0 * k) / 2.0, 176.0 * k, 166.0 * k]
+}
+
+/// Ô vật phẩm 16x16 của ô túi i (0..8 thanh nhanh, 9..35 túi) theo bố cục inventory.png của Minecraft.
+fn inv_item_rect(g: &Gfx, i: usize) -> [f32; 4] {
+    let p = inv_panel(g);
+    let k = gs(g);
+    let (x, y) = if i < 9 { (8.0 + 18.0 * i as f32, 142.0) } else { (8.0 + 18.0 * ((i - 9) % 9) as f32, 84.0 + 18.0 * ((i - 9) / 9) as f32) };
+    [p[0] + x * k, p[1] + y * k, 16.0 * k, 16.0 * k]
+}
+
+/// Vùng chạm 18x18 của ô túi i.
+fn inv_slot_rect(g: &Gfx, i: usize) -> [f32; 4] {
+    let r = inv_item_rect(g, i);
+    let k = gs(g);
+    [r[0] - k, r[1] - k, 18.0 * k, 18.0 * k]
 }
 
 fn rect_exit(g: &Gfx) -> [f32; 4] {
@@ -320,6 +338,12 @@ impl View {
             ] {
                 glTexParameteri(GL_TEXTURE_2D, p, v);
             }
+            let inv_tex = d.items.inv.as_ref().map(|t| (make_tex(&t.rgba, t.w, t.h), t.w as f32, t.h as f32));
+            let hot_tex = d.items.hot.as_ref().map(|(t, r)| (make_tex(&t.rgba, t.w, t.h), t.w as f32, t.h as f32, *r));
+            let sel_tex = d.items.sel.as_ref().map(|(t, r)| (make_tex(&t.rgba, t.w, t.h), t.w as f32, t.h as f32, *r));
+            let body_gpu = upload_raw(&d.items.body_v, &d.items.body_i);
+            let mut quad_vbo = 0;
+            glGenBuffers(1, &mut quad_vbo);
             let items_gpu = upload_raw(&d.items.v, &d.items.i);
             let arm_gpu = upload_raw(&d.items.arm_v, &d.items.arm_i);
             let skin_tex = make_tex(&d.items.skin.rgba, d.items.skin.w, d.items.skin.h);
@@ -327,6 +351,11 @@ impl View {
             let n_items = d.items.list.len();
             Ok(View {
                 u_tint,
+                inv_tex,
+                hot_tex,
+                sel_tex,
+                body_gpu,
+                quad_vbo,
                 items: d.items.list,
                 items_gpu,
                 arm_gpu,
@@ -375,6 +404,26 @@ impl View {
                 exit: false,
             })
         }
+    }
+
+    /// Vẽ một hình chữ nhật có ảnh: `dst` pixel màn hình, `src` điểm ảnh trong ảnh cỡ (tw, th). Cần chương trình + ma trận ortho đã đặt.
+    unsafe fn quad(&self, tex: u32, dst: [f32; 4], src: [f32; 4], tw: f32, th: f32) {
+        glBindTexture(GL_TEXTURE_2D, tex);
+        let (u0, v0, u1, v1) = (src[0] / tw, src[1] / th, (src[0] + src[2]) / tw, (src[1] + src[3]) / th);
+        let (x0, y0, x1, y1) = (dst[0], dst[1], dst[0] + dst[2], dst[1] + dst[3]);
+        let c = [255u8; 4];
+        let v = |x: f32, y: f32, u: f32, vv: f32| V { p: [x, y, 0.0], uv: [u, vv], c };
+        let q = [v(x0, y0, u0, v0), v(x1, y0, u1, v0), v(x1, y1, u1, v1), v(x0, y0, u0, v0), v(x1, y1, u1, v1), v(x0, y1, u0, v1)];
+        glBindBuffer(GL_ARRAY_BUFFER, self.quad_vbo);
+        glBufferData(GL_ARRAY_BUFFER, (q.len() * std::mem::size_of::<V>()) as isize, q.as_ptr() as *const _, GL_STREAM_DRAW);
+        let stride = std::mem::size_of::<V>() as i32;
+        glEnableVertexAttribArray(0);
+        glVertexAttribPointer(0, 3, GL_FLOAT, 0, stride, 0 as *const _);
+        glEnableVertexAttribArray(1);
+        glVertexAttribPointer(1, 2, GL_FLOAT, 0, stride, 12 as *const _);
+        glEnableVertexAttribArray(2);
+        glVertexAttribPointer(2, 4, GL_UNSIGNED_BYTE, 1, stride, 20 as *const _);
+        glDrawArrays(GL_TRIANGLES, 0, 6);
     }
 
     pub fn touch(&mut self, id: i32, phase: Phase, x: f32, y: f32, g: &Gfx) {
@@ -457,8 +506,7 @@ impl View {
                                 (Some((d, true)), Some(u)) if d != u => self.inv.click(u),
                                 // thả ra ngoài khung túi khi đang cầm: vứt bỏ
                                 (_, None) if self.inv.cursor.is_some() => {
-                                    let (px, py, pw, ph, ..) = inv_geom(g);
-                                    if !inside([px, py, pw, ph], x, y) {
+                                    if !inside(inv_panel(g), x, y) {
                                         self.inv.cursor = None;
                                     }
                                 }
@@ -713,25 +761,22 @@ impl View {
             self.fps_t = Instant::now();
         }
         let (w, h) = (g.w as f32, g.h as f32);
-        let slots: Vec<(usize, [f32; 4])> = if self.inv_open { (0..36).map(|i| (i, inv_slot_rect(g, i))).collect() } else { (0..9).map(|i| (i, hot_slot_rect(g, i))).collect() };
+        let k = gs(g);
+        let slots: Vec<(usize, [f32; 4])> = if self.inv_open { (0..36).map(|i| (i, inv_item_rect(g, i))).collect() } else { (0..9).map(|i| (i, hot_item_rect(g, i))).collect() };
 
-        // lượt 1 (2D): nền túi đồ / thanh nhanh, nút, chữ HUD
+        // lượt 1 (2D): nền tối, chữ HUD, dấu ngắm, nút
         g.begin();
         if self.inv_open {
-            g.rect(0.0, 0.0, w, h, 0x000000a0);
-            let (px, py, pw, ph, _slot, pad, _title, _gap) = inv_geom(g);
-            g.rect(px - 2.0 * s, py - 2.0 * s, pw + 4.0 * s, ph + 4.0 * s, 0x000000ff);
-            g.rect(px, py, pw, ph, 0xc6c6c6ff);
-            g.text(px + pad, py + pad * 0.7, 15.0 * s, 0x404040ff, "Túi đồ");
-            for (_, r) in &slots {
-                g.rect(r[0], r[1], r[2], r[3], 0x373737ff);
-                g.rect(r[0] + 2.0 * s, r[1] + 2.0 * s, r[2] - 4.0 * s, r[3] - 4.0 * s, 0x8b8b8bff);
-            }
+            g.rect(0.0, 0.0, w, h, 0xc8101010);
         } else {
             g.text(12.0 * s, 84.0 * s, 13.0 * s, 0xffffffff, &format!("FPS {}  x{:.0} y{:.0} z{:.0}  chunk {}/{}  đỉnh {}k  {}", self.fps, self.pos[0], self.pos[1], self.pos[2], self.drawn_chunks, self.gpu.len(), self.drawn_verts / 1000, if self.player.fly { "bay" } else if self.player.on_ground { "đất" } else { "không" }));
-            for (_, r) in &slots {
-                g.rect(r[0], r[1], r[2], r[3], 0x000000a0);
-                g.rect(r[0] + 1.0 * s, r[1] + 1.0 * s, r[2] - 2.0 * s, r[3] - 2.0 * s, 0x55555580);
+            // dấu ngắm 15x15 đơn vị GUI giữa màn hình
+            let (cx, cy) = (w / 2.0, h / 2.0);
+            g.rect(cx - 7.5 * k, cy - 0.5 * k, 15.0 * k, k, 0xf0f0f0d0);
+            g.rect(cx - 0.5 * k, cy - 7.5 * k, k, 15.0 * k, 0xf0f0f0d0);
+            if self.hot_tex.is_none() {
+                let (bx, by) = hot_origin(g);
+                g.rect(bx, by, 182.0 * k, 22.0 * k, 0x000000b0);
             }
         }
         let on = 0x2e8b57c0u32;
@@ -752,31 +797,68 @@ impl View {
         }
         g.end(None);
 
-        // lượt 2 (3D): icon khối trong các ô (và vật đang cầm theo ngón tay)
-        if !self.items.is_empty() {
-            unsafe {
-                glDisable(GL_SCISSOR_TEST);
-                glDisable(GL_BLEND);
-                glDisable(GL_CULL_FACE);
-                glEnable(GL_DEPTH_TEST);
-                glDepthFunc(GL_LEQUAL);
-                glDepthMask(1);
-                glClear(GL_DEPTH_BUFFER_BIT);
-                glUseProgram(self.prog);
-                glUniform2f(self.u_fog, 1.0e6, 2.0e6);
-                glUniform3f(self.u_tint, 1.0, 1.0, 1.0);
-                glActiveTexture(GL_TEXTURE0);
-                glBindTexture(GL_TEXTURE_2D, self.tex);
-                glUniform1i(self.u_tex, 0);
-                let stride = std::mem::size_of::<V>() as i32;
-                glBindBuffer(GL_ARRAY_BUFFER, self.items_gpu.vbo);
+        // lượt 2 (3D/ảnh): nền túi đồ & thanh nhanh bằng ảnh thật, Steve trong khung nhân vật, icon khối
+        unsafe {
+            glDisable(GL_SCISSOR_TEST);
+            glDisable(GL_CULL_FACE);
+            glDisable(GL_DEPTH_TEST);
+            glEnable(GL_BLEND);
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+            glUseProgram(self.prog);
+            glUniform2f(self.u_fog, 1.0e6, 2.0e6);
+            glUniform3f(self.u_tint, 1.0, 1.0, 1.0);
+            glActiveTexture(GL_TEXTURE0);
+            glUniform1i(self.u_tex, 0);
+            let om = items::ortho(w, h);
+            glUniformMatrix4fv(self.u_mvp, 1, 0, om.as_ptr());
+            if self.inv_open {
+                if let Some((t, tw, th)) = self.inv_tex {
+                    let p = inv_panel(g);
+                    self.quad(t, [p[0], p[1], p[2], p[3]], [0.0, 0.0, 176.0, 166.0], tw, th);
+                }
+            } else {
+                if let Some((t, tw, th, src)) = self.hot_tex {
+                    let (bx, by) = hot_origin(g);
+                    self.quad(t, [bx, by, 182.0 * k, 22.0 * k], src, tw, th);
+                }
+                if let Some((t, tw, th, src)) = self.sel_tex {
+                    let r = hot_slot_rect(g, self.inv.sel);
+                    self.quad(t, [r[0] - k, r[1] - k, 24.0 * k, 24.0 * k], src, tw, th);
+                } else {
+                    let r = hot_slot_rect(g, self.inv.sel);
+                    // không có ảnh khung chọn: không vẽ gì (khung trắng vẽ ở lượt 3)
+                    let _ = r;
+                }
+            }
+            glDisable(GL_BLEND);
+            glEnable(GL_DEPTH_TEST);
+            glDepthFunc(GL_LEQUAL);
+            glDepthMask(1);
+            glClear(GL_DEPTH_BUFFER_BIT);
+            let stride = std::mem::size_of::<V>() as i32;
+            let attrs = |vbo: u32, ebo: u32| {
+                glBindBuffer(GL_ARRAY_BUFFER, vbo);
                 glEnableVertexAttribArray(0);
                 glVertexAttribPointer(0, 3, GL_FLOAT, 0, stride, 0 as *const _);
                 glEnableVertexAttribArray(1);
                 glVertexAttribPointer(1, 2, GL_FLOAT, 0, stride, 12 as *const _);
                 glEnableVertexAttribArray(2);
                 glVertexAttribPointer(2, 4, GL_UNSIGNED_BYTE, 1, stride, 20 as *const _);
-                glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, self.items_gpu.ebo);
+                glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ebo);
+            };
+            // Steve đứng trong khung nhân vật (vị trí 26..75 x 8..75, chân ở (51, 75))
+            if self.inv_open && self.inv_tex.is_some() {
+                let p = inv_panel(g);
+                let ks = 30.0 / 16.0 * 0.9375 * k;
+                let m = items::body_matrix(w, h, p[0] + 51.0 * k, p[1] + 75.0 * k, ks);
+                glUniformMatrix4fv(self.u_mvp, 1, 0, m.as_ptr());
+                glBindTexture(GL_TEXTURE_2D, self.skin_tex);
+                attrs(self.body_gpu.vbo, self.body_gpu.ebo);
+                glDrawElements(GL_TRIANGLES, self.body_gpu.count, GL_UNSIGNED_INT, 0 as *const _);
+            }
+            if !self.items.is_empty() {
+                glBindTexture(GL_TEXTURE_2D, self.tex);
+                attrs(self.items_gpu.vbo, self.items_gpu.ebo);
                 let draw = |item: u16, cx: f32, cy: f32, sz: f32, zoff: f32| {
                     if let Some(it) = self.items.get(item as usize) {
                         let m = items::gui_matrix(w, h, cx, cy, sz, zoff);
@@ -786,34 +868,45 @@ impl View {
                 };
                 for (i, r) in &slots {
                     if let Some(st) = self.inv.slots[*i] {
-                        draw(st.item, r[0] + r[2] / 2.0, r[1] + r[3] / 2.0, r[2] * 0.8, 0.0);
+                        draw(st.item, r[0] + r[2] / 2.0, r[1] + r[3] / 2.0, 16.0 * k, 0.0);
                     }
                 }
                 if self.inv_open {
                     if let Some(c) = self.inv.cursor {
-                        let sz = inv_geom(g).4 * 0.8;
-                        draw(c.item, self.ui_pt.0, self.ui_pt.1, sz, sz * 3.0);
+                        // vật đang cầm nằm phía trên ngón tay để không bị che
+                        draw(c.item, self.ui_pt.0, self.ui_pt.1 - 14.0 * k, 16.0 * k, 16.0 * k * 3.0);
                     }
                 }
-                glDisable(GL_DEPTH_TEST);
             }
+            glDisable(GL_DEPTH_TEST);
         }
 
-        // lượt 3 (2D): khung chọn, số lượng, tên vật
+        // lượt 3 (2D): đánh dấu ô, khung chọn dự phòng, số lượng, tên vật
         g.begin();
-        if !self.inv_open {
-            let r = hot_slot_rect(g, self.inv.sel);
-            let t = 3.0 * s;
-            for q in [[r[0] - t, r[1] - t, r[2] + 2.0 * t, t], [r[0] - t, r[1] + r[3], r[2] + 2.0 * t, t], [r[0] - t, r[1], t, r[3]], [r[0] + r[2], r[1], t, r[3]]] {
-                g.rect(q[0], q[1], q[2], q[3], 0xffffffff);
+        if self.inv_open {
+            // ô đang bị ngón tay chạm: phủ trắng mờ như vanilla
+            if self.touches.iter().any(|t| t.role == Role::Ui) {
+                if let Some(i) = (0..36).find(|&i| inside(inv_slot_rect(g, i), self.ui_pt.0, self.ui_pt.1)) {
+                    let r = inv_item_rect(g, i);
+                    g.rect(r[0], r[1], r[2], r[3], 0x80ffffff);
+                }
+            }
+        } else {
+            if self.sel_tex.is_none() {
+                let r = hot_slot_rect(g, self.inv.sel);
+                let t = 2.0 * k;
+                for q in [[r[0], r[1], r[2], t], [r[0], r[1] + r[3] - t, r[2], t], [r[0], r[1], t, r[3]], [r[0] + r[2] - t, r[1], t, r[3]]] {
+                    g.rect(q[0], q[1], q[2], q[3], 0xffffffff);
+                }
             }
             if self.name_t > 0.0 {
                 if let Some(it) = self.shown.or(self.inv.held()).and_then(|i| self.items.get(i as usize)) {
                     let a = (255.0 * (self.name_t / 0.5).min(1.0)) as u32;
-                    let tw = g.text_width(&it.name, 15.0 * s);
-                    let (tx, ty) = ((w - tw) / 2.0, hot_geom(g).1 - 30.0 * s);
-                    g.text(tx + s, ty + s, 15.0 * s, a, &it.name);
-                    g.text(tx, ty, 15.0 * s, 0xffffff00 | a, &it.name);
+                    let size = 9.0 * k;
+                    let tw = g.text_width(&it.name, size);
+                    let (tx, ty) = ((w - tw) / 2.0, hot_origin(g).1 - 24.0 * k);
+                    g.text(tx + k, ty + k, size, 0x3f3f3f00 | a, &it.name);
+                    g.text(tx, ty, size, 0xffffff00 | a, &it.name);
                 }
             }
         }
@@ -824,8 +917,8 @@ impl View {
         }
         if self.inv_open {
             if let Some(c) = self.inv.cursor {
-                let sz = inv_geom(g).4;
-                draw_count(g, [self.ui_pt.0 - sz / 2.0, self.ui_pt.1 - sz / 2.0, sz, sz], c.n);
+                let sz = 16.0 * k;
+                draw_count(g, [self.ui_pt.0 - sz / 2.0, self.ui_pt.1 - 14.0 * k - sz / 2.0, sz, sz], c.n);
             }
         }
         g.end(None);
