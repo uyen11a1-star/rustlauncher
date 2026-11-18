@@ -29,6 +29,7 @@ mod zipr;
 mod account;
 mod auth;
 mod keyboard;
+mod terrain;
 mod ui;
 
 enum Mode {

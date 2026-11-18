@@ -406,7 +406,13 @@ impl Worker {
             want.truncate(6);
             let mut busy = !want.is_empty();
             if busy {
-                let (raws, _) = world::load_raw(&self.dir, &want, threads);
+                let (mut raws, _) = world::load_raw(&self.dir, &want, threads);
+                // chỗ không có trong file thế giới thì sinh địa hình
+                for c in &want {
+                    if !raws.iter().any(|r| r.cx == c.0 && r.cz == c.1) {
+                        raws.push(crate::terrain::chunk(c.0, c.1));
+                    }
+                }
                 for c in &want {
                     self.tried.insert(*c);
                 }
@@ -490,13 +496,18 @@ pub fn build_world(jar_path: &Path, dir: &Path, radius: i32, log: &dyn Fn(String
     }
     let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(2).min(4);
     let t1 = std::time::Instant::now();
-    let (raws, stats) = world::load_raw(dir, &list, threads);
+    let (mut raws, stats) = world::load_raw(dir, &list, threads);
     log(format!("Chunk: nạp {}, rỗng/chưa tạo {}, lỗi {} ({} ms)", stats.loaded, stats.empty, stats.errors, t1.elapsed().as_millis()));
     if let Some(e) = &stats.first_error {
         log(format!("lỗi đầu tiên: {e}"));
     }
     if raws.is_empty() {
         return Err("không nạp được chunk nào".into());
+    }
+    for c in &list {
+        if !raws.iter().any(|r| r.cx == c.0 && r.cz == c.1) {
+            raws.push(crate::terrain::chunk(c.0, c.1));
+        }
     }
 
     let mut ids: HashMap<String, u16> = HashMap::new();
