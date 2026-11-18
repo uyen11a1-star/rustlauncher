@@ -461,6 +461,11 @@ pub fn build_world(jar_path: &Path, dir: &Path, radius: i32, log: &dyn Fn(String
     let jar = Jar::open(jar_path)?;
     let atlas = build_atlas(&jar, log)?;
     log(format!("Atlas xong sau {} ms", t0.elapsed().as_millis()));
+    crate::vrng::selftest(log);
+    match crate::vrng::read_seed(dir) {
+        Some(sd) => log(format!("Hạt giống thế giới: {sd}")),
+        None => log("Không đọc được hạt giống thế giới từ level.dat".to_string()),
+    }
     let items = crate::items::build(&jar, &atlas, log);
 
     let level = world::read_level(dir);

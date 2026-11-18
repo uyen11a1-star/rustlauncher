@@ -31,6 +31,8 @@ mod account;
 mod auth;
 mod keyboard;
 mod ui;
+mod vnoise;
+mod vrng;
 
 enum Mode {
     Menu,
