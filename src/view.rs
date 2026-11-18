@@ -10,8 +10,8 @@ use crate::{
     assets::V,
     gfx::{build_program, Gfx},
     gles::*,
-    inv::Inv,
-    items::{self, Item, SWING_T},
+    inv::{Inv, SLOTS},
+    items::{self, Hud, Item, Spr, SWING_T},
     math,
     phys::{Collider, Input, Player, TICK},
     scene::{bright, pack, ChunkMesh, Msg, SceneData, Streamer},
@@ -161,6 +161,13 @@ pub struct View {
     hot_tex: Option<(u32, f32, f32, [f32; 4])>,
     sel_tex: Option<(u32, f32, f32, [f32; 4])>,
     body_gpu: Gpu,
+    head_n: i32,
+    hud: Option<Hud>,
+    hud_tex: Vec<(u32, f32, f32)>,
+    health: f32,
+    fall: f32,
+    hurt_t: f32,
+    regen_t: f32,
     quad_vbo: u32,
     items: Vec<Item>,
     items_gpu: Gpu,
@@ -259,7 +266,14 @@ fn inv_panel(g: &Gfx) -> [f32; 4] {
 fn inv_item_rect(g: &Gfx, i: usize) -> [f32; 4] {
     let p = inv_panel(g);
     let k = gs(g);
-    let (x, y) = if i < 9 { (8.0 + 18.0 * i as f32, 142.0) } else { (8.0 + 18.0 * ((i - 9) % 9) as f32, 84.0 + 18.0 * ((i - 9) / 9) as f32) };
+    let (x, y) = match i {
+        0..=8 => (8.0 + 18.0 * i as f32, 142.0),
+        9..=35 => (8.0 + 18.0 * ((i - 9) % 9) as f32, 84.0 + 18.0 * ((i - 9) / 9) as f32),
+        36..=39 => (8.0, 8.0 + 18.0 * (i - 36) as f32),
+        40 => (77.0, 62.0),
+        41..=44 => (98.0 + 18.0 * ((i - 41) % 2) as f32, 18.0 + 18.0 * ((i - 41) / 2) as f32),
+        _ => (154.0, 28.0),
+    };
     [p[0] + x * k, p[1] + y * k, 16.0 * k, 16.0 * k]
 }
 
@@ -342,6 +356,7 @@ impl View {
             let hot_tex = d.items.hot.as_ref().map(|(t, r)| (make_tex(&t.rgba, t.w, t.h), t.w as f32, t.h as f32, *r));
             let sel_tex = d.items.sel.as_ref().map(|(t, r)| (make_tex(&t.rgba, t.w, t.h), t.w as f32, t.h as f32, *r));
             let body_gpu = upload_raw(&d.items.body_v, &d.items.body_i);
+            let hud_tex: Vec<(u32, f32, f32)> = d.items.hud_tex.iter().map(|t| (make_tex(&t.rgba, t.w, t.h), t.w as f32, t.h as f32)).collect();
             let mut quad_vbo = 0;
             glGenBuffers(1, &mut quad_vbo);
             let items_gpu = upload_raw(&d.items.v, &d.items.i);
@@ -355,12 +370,19 @@ impl View {
                 hot_tex,
                 sel_tex,
                 body_gpu,
+                head_n: d.items.head_n,
+                hud: d.items.hud,
+                hud_tex,
+                health: 20.0,
+                fall: 0.0,
+                hurt_t: 0.0,
+                regen_t: 0.0,
                 quad_vbo,
                 items: d.items.list,
                 items_gpu,
                 arm_gpu,
                 skin_tex,
-                inv: Inv::new(n_items),
+                inv: Inv::new(n_items, d.items.wear, d.items.recipes),
                 inv_open: false,
                 ui_pt: (0.0, 0.0),
                 ui_down: None,
@@ -455,7 +477,7 @@ impl View {
                 if role == Role::Ui {
                     self.ui_pt = (x, y);
                     // chạm vào ô khi tay đang trống: nhấc luôn lên để kéo thả
-                    self.ui_down = (0..36).find(|&i| inside(inv_slot_rect(g, i), x, y)).map(|i| {
+                    self.ui_down = (0..SLOTS).find(|&i| inside(inv_slot_rect(g, i), x, y)).map(|i| {
                         let pick = self.inv.cursor.is_none() && self.inv.slots[i].is_some();
                         if pick {
                             self.inv.click(i);
@@ -491,6 +513,7 @@ impl View {
                             if self.inv_open {
                                 self.touches.clear();
                                 self.ui_down = None;
+                                self.ui_pt = (g.w as f32 / 2.0, g.h as f32 / 2.0);
                             } else {
                                 self.inv.stash();
                             }
@@ -498,7 +521,7 @@ impl View {
                         Role::Hot(i) if inside(hot_slot_rect(g, i), x, y) => self.inv.sel = i,
                         Role::Look if t.moved < 14.0 * g.scale && t.t0.elapsed().as_secs_f32() < 0.3 && self.swing.is_none() => self.swing = Some(0.0),
                         Role::Ui => {
-                            let up = (0..36).find(|&i| inside(inv_slot_rect(g, i), x, y));
+                            let up = (0..SLOTS).find(|&i| inside(inv_slot_rect(g, i), x, y));
                             match (self.ui_down.take(), up) {
                                 // đang cầm vật: thả vào ô dưới ngón tay
                                 (Some((_, false)), Some(u)) => self.inv.click(u),
@@ -557,6 +580,14 @@ impl View {
             self.name_t = 2.0;
         }
         self.name_t = (self.name_t - dt).max(0.0);
+        self.hurt_t = (self.hurt_t - dt).max(0.0);
+        if self.health < 20.0 {
+            self.regen_t += dt;
+            if self.regen_t >= 1.0 {
+                self.regen_t = 0.0;
+                self.health = (self.health + 1.0).min(20.0);
+            }
+        }
 
         // stream chunk: báo vị trí cho luồng nền, nhận mesh mới (tối đa 4 chunk/khung để không giật)
         if let Some(st) = &self.stream {
@@ -628,6 +659,28 @@ impl View {
                 self.prev = self.player.pos;
                 self.prev_eye = self.player.eye_height();
                 self.player.tick(&inp, self.yaw as f64, self.pitch as f64, self.col.as_ref());
+                // rơi: sát thương = quãng rơi - 3 (làm tròn lên), nước và bay thì không
+                if self.col.is_some() && !self.player.fly {
+                    if self.player.in_water {
+                        self.fall = 0.0;
+                    } else if self.player.on_ground {
+                        if self.fall > 3.0 {
+                            self.health -= (self.fall - 3.0).ceil();
+                            self.hurt_t = 0.4;
+                        }
+                        self.fall = 0.0;
+                    } else if self.player.pos[1] < self.prev[1] {
+                        self.fall += (self.prev[1] - self.player.pos[1]) as f32;
+                    }
+                } else {
+                    self.fall = 0.0;
+                }
+                if self.health <= 0.0 {
+                    self.player.pos = self.spawn;
+                    self.player.vel = [0.0; 3];
+                    self.health = 20.0;
+                    self.fall = 0.0;
+                }
                 if self.player.pos[1] < -100.0 {
                     self.player.pos = self.spawn;
                     self.player.vel = [0.0; 3];
@@ -762,12 +815,15 @@ impl View {
         }
         let (w, h) = (g.w as f32, g.h as f32);
         let k = gs(g);
-        let slots: Vec<(usize, [f32; 4])> = if self.inv_open { (0..36).map(|i| (i, inv_item_rect(g, i))).collect() } else { (0..9).map(|i| (i, hot_item_rect(g, i))).collect() };
+        let slots: Vec<(usize, [f32; 4])> = if self.inv_open { (0..SLOTS).map(|i| (i, inv_item_rect(g, i))).collect() } else { (0..9).map(|i| (i, hot_item_rect(g, i))).collect() };
 
         // lượt 1 (2D): nền tối, chữ HUD, dấu ngắm, nút
         g.begin();
+        if self.hurt_t > 0.0 {
+            g.rect(0.0, 0.0, w, h, 0xc0000000 | ((self.hurt_t / 0.4 * 110.0) as u32).min(255));
+        }
         if self.inv_open {
-            g.rect(0.0, 0.0, w, h, 0xc8101010);
+            g.rect(0.0, 0.0, w, h, 0x101010c8);
         } else {
             g.text(12.0 * s, 84.0 * s, 13.0 * s, 0xffffffff, &format!("FPS {}  x{:.0} y{:.0} z{:.0}  chunk {}/{}  đỉnh {}k  {}", self.fps, self.pos[0], self.pos[1], self.pos[2], self.drawn_chunks, self.gpu.len(), self.drawn_verts / 1000, if self.player.fly { "bay" } else if self.player.on_ground { "đất" } else { "không" }));
             // dấu ngắm 15x15 đơn vị GUI giữa màn hình
@@ -824,10 +880,32 @@ impl View {
                 if let Some((t, tw, th, src)) = self.sel_tex {
                     let r = hot_slot_rect(g, self.inv.sel);
                     self.quad(t, [r[0] - k, r[1] - k, 24.0 * k, 24.0 * k], src, tw, th);
-                } else {
-                    let r = hot_slot_rect(g, self.inv.sel);
-                    // không có ảnh khung chọn: không vẽ gì (khung trắng vẽ ở lượt 3)
-                    let _ = r;
+                }
+                // máu, đói, thanh kinh nghiệm (chế độ sinh tồn: ẩn khi đang bay)
+                if !self.player.fly {
+                    if let Some(hud) = &self.hud {
+                        let cx = w / 2.0;
+                        let hy = g.h as f32 - 39.0 * k;
+                        let sp = |sv: Spr, x: f32, y: f32, ww: f32, hh: f32| {
+                            if let Some(&(t, tw, th)) = self.hud_tex.get(sv.tex) {
+                                self.quad(t, [x, y, ww * k, hh * k], sv.r, tw, th);
+                            }
+                        };
+                        let hp = self.health.round() as i32;
+                        for i in 0..10 {
+                            let x = cx - 91.0 * k + 8.0 * k * i as f32;
+                            sp(hud.heart_bg, x, hy, 9.0, 9.0);
+                            if hp >= 2 * i + 2 {
+                                sp(hud.heart_full, x, hy, 9.0, 9.0);
+                            } else if hp == 2 * i + 1 {
+                                sp(hud.heart_half, x, hy, 9.0, 9.0);
+                            }
+                            let fx = cx + 91.0 * k - 8.0 * k * (i + 1) as f32 - k;
+                            sp(hud.food_bg, fx, hy, 9.0, 9.0);
+                            sp(hud.food_full, fx, hy, 9.0, 9.0);
+                        }
+                        sp(hud.xp_bg, cx - 91.0 * k, g.h as f32 - 29.0 * k, 182.0, 5.0);
+                    }
                 }
             }
             glDisable(GL_BLEND);
@@ -846,15 +924,20 @@ impl View {
                 glVertexAttribPointer(2, 4, GL_UNSIGNED_BYTE, 1, stride, 20 as *const _);
                 glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ebo);
             };
-            // Steve đứng trong khung nhân vật (vị trí 26..75 x 8..75, chân ở (51, 75))
+            // Steve trong khung nhân vật (vị trí 26..75 x 8..75, chân ở (51, 75)), thân và đầu quay theo ngón tay như vanilla
             if self.inv_open && self.inv_tex.is_some() {
                 let p = inv_panel(g);
                 let ks = 30.0 / 16.0 * 0.9375 * k;
-                let m = items::body_matrix(w, h, p[0] + 51.0 * k, p[1] + 75.0 * k, ks);
-                glUniformMatrix4fv(self.u_mvp, 1, 0, m.as_ptr());
+                let fx = ((p[0] + 51.0 * k - self.ui_pt.0) / k / 40.0).atan();
+                let fy = ((p[1] + 25.0 * k - self.ui_pt.1) / k / 40.0).atan();
+                let (mb, mh) = items::body_matrices(w, h, p[0] + 51.0 * k, p[1] + 75.0 * k, ks, fx * 20f32.to_radians(), fx * 20f32.to_radians(), -fy * 20f32.to_radians());
                 glBindTexture(GL_TEXTURE_2D, self.skin_tex);
                 attrs(self.body_gpu.vbo, self.body_gpu.ebo);
-                glDrawElements(GL_TRIANGLES, self.body_gpu.count, GL_UNSIGNED_INT, 0 as *const _);
+                let hn = self.head_n;
+                glUniformMatrix4fv(self.u_mvp, 1, 0, mh.as_ptr());
+                glDrawElements(GL_TRIANGLES, hn, GL_UNSIGNED_INT, 0 as *const _);
+                glUniformMatrix4fv(self.u_mvp, 1, 0, mb.as_ptr());
+                glDrawElements(GL_TRIANGLES, self.body_gpu.count - hn, GL_UNSIGNED_INT, (hn as usize * 4) as *const _);
             }
             if !self.items.is_empty() {
                 glBindTexture(GL_TEXTURE_2D, self.tex);
@@ -886,7 +969,7 @@ impl View {
         if self.inv_open {
             // ô đang bị ngón tay chạm: phủ trắng mờ như vanilla
             if self.touches.iter().any(|t| t.role == Role::Ui) {
-                if let Some(i) = (0..36).find(|&i| inside(inv_slot_rect(g, i), self.ui_pt.0, self.ui_pt.1)) {
+                if let Some(i) = (0..SLOTS).find(|&i| inside(inv_slot_rect(g, i), self.ui_pt.0, self.ui_pt.1)) {
                     let r = inv_item_rect(g, i);
                     g.rect(r[0], r[1], r[2], r[3], 0x80ffffff);
                 }

@@ -1,18 +1,20 @@
 //! Vật phẩm cầm tay và ô đồ: mesh khối cho icon GUI / khối cầm tay, tay Steve góc nhìn thứ nhất, ma trận hoạt ảnh như Minecraft.
-use std::f32::consts::PI;
+use std::{collections::HashMap, f32::consts::PI};
 
 use crate::{
     assets::{Atlas, BFace, Jar, Mesh, V},
+    craft::Recipe,
     blocks::Resolver,
-    json,
+    json::{self, Value},
     math::{self, Mat4},
     png,
 };
 
-/// Các khối đưa vào túi đồ (bỏ qua khối nào không dựng được).
-const KEYS: [&str; 36] = [
+/// Các khối đưa vào túi đồ (bỏ qua khối nào không dựng được). 36 khối đầu có sẵn trong túi, phần còn lại có qua chế tạo.
+const KEYS: &[&str] = &[
     "stone", "dirt", "grass_block", "cobblestone", "oak_planks", "oak_log", "sand", "glass", "oak_leaves", "gravel", "bricks", "bookshelf", "crafting_table", "furnace", "tnt", "stone_bricks", "sandstone", "obsidian", "glowstone",
-    "white_wool", "red_wool", "birch_planks", "spruce_planks", "birch_log", "spruce_log", "gold_block", "iron_block", "diamond_block", "coal_ore", "iron_ore", "snow_block", "clay", "netherrack", "pumpkin", "melon", "bedrock",
+    "white_wool", "red_wool", "birch_planks", "spruce_planks", "birch_log", "spruce_log", "gold_block", "iron_block", "diamond_block", "coal_ore", "iron_ore", "diorite", "granite", "andesite", "carved_pumpkin", "snow_block", "clay",
+    "netherrack", "pumpkin", "melon", "bedrock", "polished_andesite", "polished_diorite", "polished_granite", "cut_sandstone",
 ];
 
 pub struct Item {
@@ -34,7 +36,30 @@ pub struct Tex {
     pub h: i32,
 }
 
+/// Một hình nhỏ trong ảnh HUD: chỉ số ảnh + vùng [x,y,w,h].
+#[derive(Clone, Copy)]
+pub struct Spr {
+    pub tex: usize,
+    pub r: [f32; 4],
+}
+
+pub struct Hud {
+    pub heart_bg: Spr,
+    pub heart_full: Spr,
+    pub heart_half: Spr,
+    pub food_bg: Spr,
+    pub food_full: Spr,
+    pub food_half: Spr,
+    pub xp_bg: Spr,
+}
+
 pub struct Items {
+    pub hud: Option<Hud>,
+    pub hud_tex: Vec<Tex>,
+    /// số chỉ số của phần đầu (đầu + mũ) ở đầu `body_i`
+    pub head_n: i32,
+    pub wear: Vec<i8>,
+    pub recipes: Vec<Recipe>,
     /// ảnh nền túi đồ (256x256, vùng 176x166)
     pub inv: Option<Tex>,
     /// ảnh thanh nhanh + vùng nguồn [x,y,w,h] trong ảnh
@@ -159,12 +184,164 @@ fn load_tex(jar: &Jar, paths: &[&str]) -> Option<Tex> {
     None
 }
 
+fn load_hud(jar: &Jar) -> Option<(Hud, Vec<Tex>)> {
+    let names = ["heart/container", "heart/full", "heart/half", "food_empty", "food_full", "food_half", "experience_bar_background"];
+    let mut texs = Vec::new();
+    for n in names {
+        texs.push(load_tex(jar, &[&format!("assets/minecraft/textures/gui/sprites/hud/{n}.png")])?);
+    }
+    let sp = |i: usize| Spr { tex: i, r: [0.0, 0.0, texs[i].w as f32, texs[i].h as f32] };
+    let hud = Hud { heart_bg: sp(0), heart_full: sp(1), heart_half: sp(2), food_bg: sp(3), food_full: sp(4), food_half: sp(5), xp_bg: sp(6) };
+    Some((hud, texs))
+}
+
+/// HUD kiểu cũ: mọi biểu tượng nằm trong icons.png (256x256).
+fn load_hud_old(jar: &Jar) -> Option<(Hud, Vec<Tex>)> {
+    let t = load_tex(jar, &["assets/minecraft/textures/gui/icons.png"])?;
+    let s = |x: f32, y: f32, w: f32, h: f32| Spr { tex: 0, r: [x, y, w, h] };
+    let hud = Hud {
+        heart_bg: s(16.0, 0.0, 9.0, 9.0),
+        heart_full: s(52.0, 0.0, 9.0, 9.0),
+        heart_half: s(61.0, 0.0, 9.0, 9.0),
+        food_bg: s(16.0, 27.0, 9.0, 9.0),
+        food_full: s(52.0, 27.0, 9.0, 9.0),
+        food_half: s(61.0, 27.0, 9.0, 9.0),
+        xp_bg: s(0.0, 64.0, 182.0, 5.0),
+    };
+    Some((hud, vec![t]))
+}
+
+/// Tìm các vật phẩm trong tag (đệ quy các tag lồng nhau).
+fn tag_items(jar: &Jar, name: &str, depth: u32, out: &mut Vec<String>) {
+    if depth > 6 {
+        return;
+    }
+    let n = name.trim_start_matches('#').trim_start_matches("minecraft:");
+    for dir in ["items", "item"] {
+        let Ok(b) = jar.read(&format!("data/minecraft/tags/{dir}/{n}.json")) else { continue };
+        let Ok(text) = String::from_utf8(b) else { continue };
+        let Ok(v) = json::parse(&text) else { continue };
+        for e in v.get("values").and_then(|a| a.as_arr()).unwrap_or(&[]) {
+            let id = match e {
+                Value::Str(s) => Some(s.as_str()),
+                other => other.get("id").and_then(|i| i.as_str()),
+            };
+            if let Some(id) = id {
+                if id.starts_with('#') {
+                    tag_items(jar, id, depth + 1, out);
+                } else {
+                    out.push(id.to_string());
+                }
+            }
+        }
+        return;
+    }
+}
+
+/// Một nguyên liệu (chuỗi "minecraft:x" / "#tag", {"item"|"tag"|"id"}, hoặc mảng các lựa chọn) -> các chỉ số vật phẩm của ta.
+fn ingredient(jar: &Jar, v: &Value, idx: &HashMap<String, u16>, out: &mut Vec<u16>) {
+    match v {
+        Value::Str(s) => {
+            if s.starts_with('#') {
+                let mut names = Vec::new();
+                tag_items(jar, s, 0, &mut names);
+                for n in names {
+                    if let Some(&i) = idx.get(&n) {
+                        out.push(i);
+                    }
+                }
+            } else if let Some(&i) = idx.get(s.as_str()) {
+                out.push(i);
+            }
+        }
+        Value::Arr(a) => a.iter().for_each(|e| ingredient(jar, e, idx, out)),
+        Value::Obj(_) => {
+            if let Some(t) = v.get("tag").and_then(|t| t.as_str()) {
+                ingredient(jar, &Value::Str(format!("#{t}")), idx, out);
+            }
+            for k in ["item", "id"] {
+                if let Some(t) = v.get(k).and_then(|t| t.as_str()) {
+                    ingredient(jar, &Value::Str(t.to_string()), idx, out);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Công thức chế tạo có kết quả là một vật phẩm của ta (chỉ đọc file recipe trùng tên vật phẩm cho nhanh).
+fn load_recipes(jar: &Jar, keys: &[String]) -> Vec<Recipe> {
+    let idx: HashMap<String, u16> = keys.iter().enumerate().map(|(i, k)| (format!("minecraft:{k}"), i as u16)).collect();
+    let mut out = Vec::new();
+    for (i, k) in keys.iter().enumerate() {
+        for dir in ["recipes", "recipe"] {
+            let path = format!("data/minecraft/{dir}/{k}.json");
+            let Ok(b) = jar.read(&path) else { continue };
+            let Ok(text) = String::from_utf8(b) else { continue };
+            let Ok(v) = json::parse(&text) else { continue };
+            let ty = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
+            let count = v.get("result").and_then(|r| r.get("count")).and_then(|c| c.as_f64()).unwrap_or(1.0) as u8;
+            let out_item = (i as u16, count.max(1));
+            if ty.ends_with("crafting_shaped") {
+                let (Some(pat), Some(key)) = (v.get("pattern").and_then(|p| p.as_arr()), v.get("key")) else { continue };
+                let rows: Vec<&str> = pat.iter().filter_map(|r| r.as_str()).collect();
+                let (h, w) = (rows.len(), rows.iter().map(|r| r.chars().count()).max().unwrap_or(0));
+                if h == 0 || w == 0 || h > 2 || w > 2 {
+                    continue;
+                }
+                let mut cells = Vec::new();
+                let mut ok = true;
+                for r in &rows {
+                    let mut chars: Vec<char> = r.chars().collect();
+                    chars.resize(w, ' ');
+                    for c in chars {
+                        let mut opts = Vec::new();
+                        if c != ' ' {
+                            if let Some(ing) = key.get(&c.to_string()) {
+                                ingredient(jar, ing, &idx, &mut opts);
+                            }
+                            if opts.is_empty() {
+                                ok = false;
+                            }
+                        }
+                        cells.push(opts);
+                    }
+                }
+                if ok {
+                    out.push(Recipe { shaped: true, w, h, cells, out: out_item });
+                }
+            } else if ty.ends_with("crafting_shapeless") {
+                let Some(ings) = v.get("ingredients").and_then(|a| a.as_arr()) else { continue };
+                if ings.is_empty() || ings.len() > 4 {
+                    continue;
+                }
+                let mut cells = Vec::new();
+                let mut ok = true;
+                for ing in ings {
+                    let mut opts = Vec::new();
+                    ingredient(jar, ing, &idx, &mut opts);
+                    if opts.is_empty() {
+                        ok = false;
+                    }
+                    cells.push(opts);
+                }
+                if ok {
+                    out.push(Recipe { shaped: false, w: 0, h: 0, cells, out: out_item });
+                }
+            }
+            break;
+        }
+    }
+    out
+}
+
 pub fn build(jar: &Jar, atlas: &Atlas, log: &dyn Fn(String)) -> Items {
     let mut res = Resolver::new(jar, atlas);
     let lang = jar.read("assets/minecraft/lang/en_us.json").ok().and_then(|b| String::from_utf8(b).ok()).and_then(|s| json::parse(&s).ok());
     let mut m = Mesh::default();
     let mut list = Vec::new();
-    for key in KEYS {
+    let mut keys: Vec<String> = Vec::new();
+    for key in KEYS.iter().copied() {
         let st = res.state(&format!("minecraft:{key}"));
         if st.faces.is_empty() {
             continue;
@@ -184,6 +361,7 @@ pub fn build(jar: &Jar, atlas: &Atlas, log: &dyn Fn(String)) -> Items {
         let c = m.i.len() as i32;
         let name = lang.as_ref().and_then(|l| l.get(&format!("block.minecraft.{key}"))).and_then(|n| n.as_str()).map(|s| s.to_string()).unwrap_or_else(|| pretty(key));
         list.push(Item { name, gui: (a, b - a), hand: (b, c - b) });
+        keys.push(key.to_string());
     }
     let skin = load_skin(jar);
     let (arm_v, arm_i) = arm_mesh(skin.w, skin.h);
@@ -195,9 +373,16 @@ pub fn build(jar: &Jar, atlas: &Atlas, log: &dyn Fn(String)) -> Items {
         let r = [0.0, 0.0, t.w as f32, t.h as f32];
         (t, r)
     }).or_else(|| load_tex(jar, &["assets/minecraft/textures/gui/widgets.png"]).map(|t| (t, [0.0, 22.0, 24.0, 24.0])));
+    let recipes = load_recipes(jar, &keys);
+    let wear: Vec<i8> = keys.iter().map(|k| if k == "carved_pumpkin" { 0 } else { -1 }).collect();
+    let (hud, hud_tex) = match load_hud(jar).or_else(|| load_hud_old(jar)) {
+        Some((h, t)) => (Some(h), t),
+        None => (None, Vec::new()),
+    };
+    log(format!("Công thức 2x2: {}, HUD: {}", recipes.len(), hud.is_some()));
     log(format!("GUI: túi đồ {}, thanh nhanh {}, khung chọn {}", inv.is_some(), hot.is_some(), sel.is_some()));
     log(format!("Vật phẩm: {} khối, skin {}x{}", list.len(), skin.w, skin.h));
-    Items { inv, hot, sel, body_v, body_i, v: m.v, i: m.i, list, skin, arm_v, arm_i }
+    Items { hud, hud_tex, head_n: 72, wear, recipes, inv, hot, sel, body_v, body_i, v: m.v, i: m.i, list, skin, arm_v, arm_i }
 }
 
 /// Thời gian một nhịp vung tay (6 tick = 0.3 giây như Minecraft).
@@ -264,7 +449,10 @@ pub fn ortho(w: f32, h: f32) -> Mat4 {
     [2.0 / w, 0.0, 0.0, 0.0, 0.0, -2.0 / h, 0.0, 0.0, 0.0, 0.0, -1.0 / 4000.0, 0.0, -1.0, 1.0, 0.0, 1.0]
 }
 
-/// Steve trong khung nhân vật của túi đồ: chân ở (cx, feet), `ks` pixel mỗi điểm ảnh model, xoay nhẹ như nhìn sang bên.
-pub fn body_matrix(w: f32, h: f32, cx: f32, feet: f32, ks: f32) -> Mat4 {
-    math::chain(&[ortho(w, h), math::translate(cx, feet - 24.0 * ks, 0.0), math::scale(ks, ks, -ks), math::rot_y(0.45)])
+/// Steve trong khung nhân vật: chân ở (cx, feet), `ks` pixel mỗi điểm ảnh model. `body` xoay thân quanh Y, `head`/`pitch` xoay đầu thêm (radian).
+/// Trả về (ma trận thân, ma trận đầu).
+pub fn body_matrices(w: f32, h: f32, cx: f32, feet: f32, ks: f32, body: f32, head: f32, pitch: f32) -> (Mat4, Mat4) {
+    let base = math::chain(&[ortho(w, h), math::translate(cx, feet - 24.0 * ks, 0.0), math::scale(ks, ks, -ks), math::rot_y(body)]);
+    let hd = math::chain(&[base, math::rot_y(head), math::rot_x(pitch)]);
+    (base, hd)
 }

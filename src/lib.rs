@@ -8,6 +8,7 @@ use android_activity::{
 
 mod assets;
 mod blocks;
+mod craft;
 mod gfx;
 mod gles;
 mod inflate;
@@ -29,7 +30,6 @@ mod zipr;
 mod account;
 mod auth;
 mod keyboard;
-mod terrain;
 mod ui;
 
 enum Mode {
