@@ -47,6 +47,7 @@ pub struct SceneData {
     /// dữ liệu va chạm ban đầu (rỗng với cảnh thử: bay tự do)
     pub shapes: Vec<Shape>,
     pub col: Vec<((i32, i32), Arc<Chunk>)>,
+    pub items: crate::items::Items,
 }
 
 /// Tin từ luồng stream gửi sang luồng vẽ.
@@ -97,6 +98,7 @@ pub fn build_test(jar_path: &Path, log: &dyn Fn(String)) -> Result<SceneData, St
     let jar = Jar::open(jar_path)?;
     log(format!("jar có {} mục", jar.entries.len()));
     let atlas = build_atlas(&jar, log)?;
+    let items = crate::items::build(&jar, &atlas, log);
     let mut res = Resolver::new(&jar, &atlas);
     let mut mesh = Mesh::default();
 
@@ -131,11 +133,11 @@ pub fn build_test(jar_path: &Path, log: &dyn Fn(String)) -> Result<SceneData, St
         log(m.clone());
     }
     log(format!("Dựng {} khối, {} đỉnh, mất {} ms", shown, mesh.v.len(), t0.elapsed().as_millis()));
-    Ok(SceneData { atlas: atlas.pixels, chunks: vec![ChunkMesh::new(mesh, 0, 0)], spawn: [7.0, 1.7, 4.0], stream: None, shapes: Vec::new(), col: Vec::new() })
+    Ok(SceneData { atlas: atlas.pixels, chunks: vec![ChunkMesh::new(mesh, 0, 0)], spawn: [7.0, 1.7, 4.0], stream: None, shapes: Vec::new(), col: Vec::new(), items })
 }
 
 /// Độ sáng 0..1 từ ánh sáng ô (lấy mức cao hơn giữa sáng trời và sáng khối), kèm một chút sáng nền.
-fn bright(l: u8) -> f32 {
+pub fn bright(l: u8) -> f32 {
     let x = (l >> 4).max(l & 15) as f32 / 15.0;
     0.03 + 0.97 * x / (4.0 - 3.0 * x)
 }
@@ -459,6 +461,7 @@ pub fn build_world(jar_path: &Path, dir: &Path, radius: i32, log: &dyn Fn(String
     let jar = Jar::open(jar_path)?;
     let atlas = build_atlas(&jar, log)?;
     log(format!("Atlas xong sau {} ms", t0.elapsed().as_millis()));
+    let items = crate::items::build(&jar, &atlas, log);
 
     let level = world::read_level(dir);
     let (spawn, from_player) = match &level {
@@ -579,5 +582,5 @@ pub fn build_world(jar_path: &Path, dir: &Path, radius: i32, log: &dyn Fn(String
     let (p2, s2) = (pos.clone(), stop.clone());
     std::thread::spawn(move || worker.run(jar, atlas, radius, p2, s2, tx));
     log(format!("Tổng thời gian dựng: {} ms", t0.elapsed().as_millis()));
-    Ok(SceneData { atlas: pixels, chunks, spawn: [center[0] as f32, y, center[2] as f32], stream: Some(Streamer { rx, pos, stop }), shapes, col })
+    Ok(SceneData { atlas: pixels, chunks, spawn: [center[0] as f32, y, center[2] as f32], stream: Some(Streamer { rx, pos, stop }), shapes, col, items })
 }

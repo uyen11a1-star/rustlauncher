@@ -10,9 +10,11 @@ use crate::{
     assets::V,
     gfx::{build_program, Gfx},
     gles::*,
+    inv::Inv,
+    items::{self, Item, SWING_T},
     math,
     phys::{Collider, Input, Player, TICK},
-    scene::{pack, ChunkMesh, Msg, SceneData, Streamer},
+    scene::{bright, pack, ChunkMesh, Msg, SceneData, Streamer},
     world::World,
 };
 
@@ -39,6 +41,30 @@ unsafe fn upload(c: &ChunkMesh) -> Gpu {
     Gpu { vbo, ebo, count: c.i.len() as i32, cw: c.iw.len() as i32, nverts: c.v.len(), bb: c.bb }
 }
 
+/// Đưa một lưới đỉnh/chỉ số bất kỳ lên GPU (vật phẩm, tay).
+unsafe fn upload_raw(v: &[V], i: &[u32]) -> Gpu {
+    let (mut vbo, mut ebo) = (0, 0);
+    glGenBuffers(1, &mut vbo);
+    glBindBuffer(GL_ARRAY_BUFFER, vbo);
+    glBufferData(GL_ARRAY_BUFFER, (v.len() * std::mem::size_of::<V>()) as isize, v.as_ptr() as *const _, GL_STATIC_DRAW);
+    glGenBuffers(1, &mut ebo);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ebo);
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER, (i.len() * 4) as isize, i.as_ptr() as *const _, GL_STATIC_DRAW);
+    Gpu { vbo, ebo, count: i.len() as i32, cw: 0, nverts: v.len(), bb: [0.0; 6] }
+}
+
+unsafe fn make_tex(rgba: &[u8], w: i32, h: i32) -> u32 {
+    let mut tex = 0;
+    glGenTextures(1, &mut tex);
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba.as_ptr() as *const _);
+    for (p, v) in [(GL_TEXTURE_MIN_FILTER, GL_NEAREST), (GL_TEXTURE_MAG_FILTER, GL_NEAREST), (GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE), (GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)] {
+        glTexParameteri(GL_TEXTURE_2D, p, v);
+    }
+    tex
+}
+
 unsafe fn free(g: &Gpu) {
     glDeleteBuffers(1, &g.vbo);
     glDeleteBuffers(1, &g.ebo);
@@ -56,11 +82,12 @@ in vec2 v_uv; in vec4 v_col; in float v_d;
 uniform sampler2D u_tex;
 uniform vec2 u_fog;
 uniform vec3 u_fogc;
+uniform vec3 u_tint;
 out vec4 o;
 void main(){
   vec4 t=texture(u_tex,v_uv); if(t.a<0.1) discard;
   float f=clamp((u_fog.y-v_d)/(u_fog.y-u_fog.x),0.0,1.0);
-  vec3 c=mix(u_fogc, t.rgb*v_col.rgb, f);
+  vec3 c=mix(u_fogc, t.rgb*v_col.rgb*u_tint, f);
   o=vec4(c, t.a*v_col.a);
 }";
 
@@ -97,6 +124,11 @@ enum Role {
     Fly,
     Sprint,
     Exit,
+    Bag,
+    /// ô thanh nhanh số i (khi túi đóng)
+    Hot(usize),
+    /// chạm trong màn hình túi đồ
+    Ui,
 }
 
 struct Touch {
@@ -106,6 +138,8 @@ struct Touch {
     sy: f32,
     x: f32,
     y: f32,
+    t0: Instant,
+    moved: f32,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -122,6 +156,22 @@ pub struct View {
     sky_tf: i32,
     u_fog: i32,
     u_fogc: i32,
+    u_tint: i32,
+    items: Vec<Item>,
+    items_gpu: Gpu,
+    arm_gpu: Gpu,
+    skin_tex: u32,
+    inv: Inv,
+    inv_open: bool,
+    ui_pt: (f32, f32),
+    /// (ô chạm xuống, đã nhấc vật lên lúc chạm xuống)
+    ui_down: Option<(usize, bool)>,
+    swing: Option<f32>,
+    lower: f32,
+    shown: Option<u16>,
+    hand_b: f32,
+    name_t: f32,
+    last_held: (usize, Option<u16>),
     gpu: HashMap<(i32, i32), Gpu>,
     stream: Option<Streamer>,
     tex: u32,
@@ -149,6 +199,57 @@ pub struct View {
     frames: u32,
     fps: u32,
     exit: bool,
+}
+
+/// Số lượng ở góc dưới-phải ô (có bóng đen), ẩn khi chỉ có 1.
+fn draw_count(g: &mut Gfx, r: [f32; 4], n: u8) {
+    if n <= 1 {
+        return;
+    }
+    let s = g.scale;
+    let size = r[2] * 0.34;
+    let txt = n.to_string();
+    let tw = g.text_width(&txt, size);
+    let (x, y) = (r[0] + r[2] - tw - 3.0 * s, r[1] + r[3] - size * 1.3 - 1.0 * s);
+    g.text(x + 0.8 * s, y + 0.8 * s, size, 0x000000ff, &txt);
+    g.text(x, y, size, 0xffffffff, &txt);
+}
+
+fn rect_bag(g: &Gfx) -> [f32; 4] {
+    let s = g.scale;
+    [g.w as f32 - 92.0 * s, 84.0 * s, 80.0 * s, 40.0 * s]
+}
+
+/// Thanh nhanh: (x trái, y trên, cỡ ô).
+fn hot_geom(g: &Gfx) -> (f32, f32, f32) {
+    let s = g.scale;
+    let slot = ((g.w as f32 - 16.0 * s) / 9.0).min(44.0 * s);
+    ((g.w as f32 - 9.0 * slot) / 2.0, g.h as f32 - slot - 8.0 * s, slot)
+}
+
+/// Khung túi đồ: (x, y, rộng, cao, cỡ ô, lề, cao tiêu đề, khoảng cách giữa túi và thanh nhanh).
+fn inv_geom(g: &Gfx) -> (f32, f32, f32, f32, f32, f32, f32, f32) {
+    let s = g.scale;
+    let slot = ((g.h as f32 - 100.0 * s) / 4.5).min((g.w as f32 - 24.0 * s) / 9.4).min(46.0 * s).max(20.0 * s);
+    let (pad, title, gap) = (10.0 * s, 26.0 * s, 10.0 * s);
+    let (pw, ph) = (9.0 * slot + 2.0 * pad, title + 4.0 * slot + gap + 2.0 * pad);
+    ((g.w as f32 - pw) / 2.0, (g.h as f32 - ph) / 2.0, pw, ph, slot, pad, title, gap)
+}
+
+/// Hình chữ nhật ô túi `i` (0..8 thanh nhanh, 9..35 túi) khi mở túi đồ.
+fn inv_slot_rect(g: &Gfx, i: usize) -> [f32; 4] {
+    let (px, py, _, _, slot, pad, title, gap) = inv_geom(g);
+    if i < 9 {
+        [px + pad + i as f32 * slot, py + pad + title + 3.0 * slot + gap, slot, slot]
+    } else {
+        let (r, c) = ((i - 9) / 9, (i - 9) % 9);
+        [px + pad + c as f32 * slot, py + pad + title + r as f32 * slot, slot, slot]
+    }
+}
+
+fn hot_slot_rect(g: &Gfx, i: usize) -> [f32; 4] {
+    let (x, y, slot) = hot_geom(g);
+    [x + i as f32 * slot, y, slot, slot]
 }
 
 fn rect_exit(g: &Gfx) -> [f32; 4] {
@@ -188,6 +289,7 @@ impl View {
             let u_fogc = glGetUniformLocation(prog, c("u_fogc").as_ptr());
             let u_mvp = glGetUniformLocation(prog, c("u_mvp").as_ptr());
             let u_tex = glGetUniformLocation(prog, c("u_tex").as_ptr());
+            let u_tint = glGetUniformLocation(prog, c("u_tint").as_ptr());
             let col = if d.stream.is_some() {
                 let mut world = World::default();
                 for (k, ch) in &d.col {
@@ -218,7 +320,27 @@ impl View {
             ] {
                 glTexParameteri(GL_TEXTURE_2D, p, v);
             }
+            let items_gpu = upload_raw(&d.items.v, &d.items.i);
+            let arm_gpu = upload_raw(&d.items.arm_v, &d.items.arm_i);
+            let skin_tex = make_tex(&d.items.skin.rgba, d.items.skin.w, d.items.skin.h);
+            glBindTexture(GL_TEXTURE_2D, tex);
+            let n_items = d.items.list.len();
             Ok(View {
+                u_tint,
+                items: d.items.list,
+                items_gpu,
+                arm_gpu,
+                skin_tex,
+                inv: Inv::new(n_items),
+                inv_open: false,
+                ui_pt: (0.0, 0.0),
+                ui_down: None,
+                swing: None,
+                lower: 1.0,
+                shown: None,
+                hand_b: 1.0,
+                name_t: 0.0,
+                last_held: (0, None),
                 prog,
                 sky,
                 sky_view,
@@ -258,8 +380,15 @@ impl View {
     pub fn touch(&mut self, id: i32, phase: Phase, x: f32, y: f32, g: &Gfx) {
         match phase {
             Phase::Down => {
+                let hot = if self.inv_open { None } else { (0..9).find(|&i| inside(hot_slot_rect(g, i), x, y)) };
                 let role = if inside(rect_exit(g), x, y) {
                     Role::Exit
+                } else if inside(rect_bag(g), x, y) {
+                    Role::Bag
+                } else if self.inv_open {
+                    Role::Ui
+                } else if let Some(i) = hot {
+                    Role::Hot(i)
                 } else if inside(rect_jump(g), x, y) {
                     Role::Jump
                 } else if inside(rect_sneak(g), x, y) {
@@ -274,7 +403,18 @@ impl View {
                     Role::Look
                 };
                 self.touches.retain(|t| t.id != id);
-                self.touches.push(Touch { id, role, sx: x, sy: y, x, y });
+                if role == Role::Ui {
+                    self.ui_pt = (x, y);
+                    // chạm vào ô khi tay đang trống: nhấc luôn lên để kéo thả
+                    self.ui_down = (0..36).find(|&i| inside(inv_slot_rect(g, i), x, y)).map(|i| {
+                        let pick = self.inv.cursor.is_none() && self.inv.slots[i].is_some();
+                        if pick {
+                            self.inv.click(i);
+                        }
+                        (i, pick)
+                    });
+                }
+                self.touches.push(Touch { id, role, sx: x, sy: y, x, y, t0: Instant::now(), moved: 0.0 });
             }
             Phase::Move => {
                 let sens = 0.0035; // rad / pixel
@@ -282,6 +422,10 @@ impl View {
                     if t.role == Role::Look {
                         self.yaw -= (x - t.x) * sens;
                         self.pitch = (self.pitch - (y - t.y) * sens).clamp(-1.5, 1.5);
+                        t.moved += (x - t.x).abs() + (y - t.y).abs();
+                    }
+                    if t.role == Role::Ui {
+                        self.ui_pt = (x, y);
                     }
                     t.x = x;
                     t.y = y;
@@ -293,6 +437,34 @@ impl View {
                     // nút bật/tắt: kích hoạt khi nhả ngón trong chính nút đó
                     match t.role {
                         Role::Exit if inside(rect_exit(g), x, y) => self.exit = true,
+                        Role::Bag if inside(rect_bag(g), x, y) => {
+                            self.inv_open = !self.inv_open;
+                            if self.inv_open {
+                                self.touches.clear();
+                                self.ui_down = None;
+                            } else {
+                                self.inv.stash();
+                            }
+                        }
+                        Role::Hot(i) if inside(hot_slot_rect(g, i), x, y) => self.inv.sel = i,
+                        Role::Look if t.moved < 14.0 * g.scale && t.t0.elapsed().as_secs_f32() < 0.3 && self.swing.is_none() => self.swing = Some(0.0),
+                        Role::Ui => {
+                            let up = (0..36).find(|&i| inside(inv_slot_rect(g, i), x, y));
+                            match (self.ui_down.take(), up) {
+                                // đang cầm vật: thả vào ô dưới ngón tay
+                                (Some((_, false)), Some(u)) => self.inv.click(u),
+                                // kéo từ ô này sang ô khác: thả
+                                (Some((d, true)), Some(u)) if d != u => self.inv.click(u),
+                                // thả ra ngoài khung túi khi đang cầm: vứt bỏ
+                                (_, None) if self.inv.cursor.is_some() => {
+                                    let (px, py, pw, ph, ..) = inv_geom(g);
+                                    if !inside([px, py, pw, ph], x, y) {
+                                        self.inv.cursor = None;
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
                         Role::Sneak if inside(rect_sneak(g), x, y) => self.sneak_on = !self.sneak_on,
                         Role::Sprint if inside(rect_sprint(g), x, y) => self.sprint_on = !self.sprint_on,
                         Role::Fly if inside(rect_fly(g), x, y) && self.col.is_some() => {
@@ -314,6 +486,29 @@ impl View {
         let dt = (now - self.last).as_secs_f32().min(0.1);
         self.last = now;
         let s = g.scale;
+
+        // tay / khối cầm: hạ xuống rồi nâng lên khi đổi vật; vung khi chạm
+        let want = self.inv.held();
+        if self.shown != want {
+            self.lower += dt / 0.12;
+            if self.lower >= 1.0 {
+                self.lower = 1.0;
+                self.shown = want;
+            }
+        } else {
+            self.lower = (self.lower - dt / 0.12).max(0.0);
+        }
+        if let Some(t) = self.swing.as_mut() {
+            *t += dt;
+            if *t >= SWING_T {
+                self.swing = None;
+            }
+        }
+        if self.last_held != (self.inv.sel, want) {
+            self.last_held = (self.inv.sel, want);
+            self.name_t = 2.0;
+        }
+        self.name_t = (self.name_t - dt).max(0.0);
 
         // stream chunk: báo vị trí cho luồng nền, nhận mesh mới (tối đa 4 chunk/khung để không giật)
         if let Some(st) = &self.stream {
@@ -399,6 +594,10 @@ impl View {
         let eye = self.prev_eye + (self.player.eye_height() - self.prev_eye) * a;
         self.pos = [cam(0) as f32, (cam(1) + eye) as f32, cam(2) as f32];
 
+        // độ sáng của tay theo ánh sáng thế giới tại mắt (làm mượt)
+        let target_b = self.col.as_ref().map_or(1.0, |c| bright(c.world.light(self.pos[0].floor() as i32, self.pos[1].floor() as i32, self.pos[2].floor() as i32)));
+        self.hand_b += (target_b - self.hand_b) * (dt * 8.0).min(1.0);
+
         // mắt đang ở trong nước / dung nham: sương mù dày màu xanh / cam, không thấy trời
         let medium = self.col.as_ref().map_or(0, |c| c.fluid_at(self.pos[0].floor() as i32, self.pos[1].floor() as i32, self.pos[2].floor() as i32));
         let (fog_c, fog_s, fog_e) = match medium {
@@ -435,6 +634,7 @@ impl View {
             glUseProgram(self.prog);
             glUniform2f(self.u_fog, fog_s, fog_e);
             glUniform3f(self.u_fogc, fog_c[0], fog_c[1], fog_c[2]);
+            glUniform3f(self.u_tint, 1.0, 1.0, 1.0);
             glUniformMatrix4fv(self.u_mvp, 1, 0, mvp.as_ptr());
             glActiveTexture(GL_TEXTURE0);
             glBindTexture(GL_TEXTURE_2D, self.tex);
@@ -473,6 +673,34 @@ impl View {
             }
             self.drawn_chunks = vis.len();
             self.drawn_verts = vis.iter().map(|c| c.nverts).sum();
+
+            // tay Steve / khối cầm: vẽ sau cùng, xoá độ sâu để không bị khối thế giới che
+            if !self.inv_open {
+                glClear(GL_DEPTH_BUFFER_BIT);
+                glDisable(GL_CULL_FACE);
+                glUniform2f(self.u_fog, 1.0e6, 2.0e6);
+                let hb = self.hand_b;
+                glUniform3f(self.u_tint, hb, hb, hb);
+                let proj = math::perspective(1.2, aspect, 0.05, 20.0);
+                let sw = self.swing.map_or(0.0, |t| (t / SWING_T).min(1.0));
+                match self.shown.and_then(|i| self.items.get(i as usize)) {
+                    Some(it) => {
+                        let m = math::mul(&proj, &items::hand_matrix(self.lower, sw));
+                        glUniformMatrix4fv(self.u_mvp, 1, 0, m.as_ptr());
+                        bind(&self.items_gpu);
+                        glDrawElements(GL_TRIANGLES, it.hand.1, GL_UNSIGNED_INT, (it.hand.0 as usize * 4) as *const _);
+                    }
+                    None => {
+                        let m = math::mul(&proj, &items::arm_matrix(self.lower, sw));
+                        glUniformMatrix4fv(self.u_mvp, 1, 0, m.as_ptr());
+                        glBindTexture(GL_TEXTURE_2D, self.skin_tex);
+                        bind(&self.arm_gpu);
+                        glDrawElements(GL_TRIANGLES, self.arm_gpu.count, GL_UNSIGNED_INT, 0 as *const _);
+                        glBindTexture(GL_TEXTURE_2D, self.tex);
+                    }
+                }
+                glUniform3f(self.u_tint, 1.0, 1.0, 1.0);
+            }
             glDisable(GL_DEPTH_TEST);
             glDisable(GL_CULL_FACE);
         }
@@ -484,21 +712,121 @@ impl View {
             self.frames = 0;
             self.fps_t = Instant::now();
         }
+        let (w, h) = (g.w as f32, g.h as f32);
+        let slots: Vec<(usize, [f32; 4])> = if self.inv_open { (0..36).map(|i| (i, inv_slot_rect(g, i))).collect() } else { (0..9).map(|i| (i, hot_slot_rect(g, i))).collect() };
+
+        // lượt 1 (2D): nền túi đồ / thanh nhanh, nút, chữ HUD
         g.begin();
-        g.text(12.0 * s, 84.0 * s, 13.0 * s, 0xffffffff, &format!("FPS {}  x{:.0} y{:.0} z{:.0}  chunk {}/{}  đỉnh {}k  {}", self.fps, self.pos[0], self.pos[1], self.pos[2], self.drawn_chunks, self.gpu.len(), self.drawn_verts / 1000, if self.player.fly { "bay" } else if self.player.on_ground { "đất" } else { "không" }));
+        if self.inv_open {
+            g.rect(0.0, 0.0, w, h, 0x000000a0);
+            let (px, py, pw, ph, _slot, pad, _title, _gap) = inv_geom(g);
+            g.rect(px - 2.0 * s, py - 2.0 * s, pw + 4.0 * s, ph + 4.0 * s, 0x000000ff);
+            g.rect(px, py, pw, ph, 0xc6c6c6ff);
+            g.text(px + pad, py + pad * 0.7, 15.0 * s, 0x404040ff, "Túi đồ");
+            for (_, r) in &slots {
+                g.rect(r[0], r[1], r[2], r[3], 0x373737ff);
+                g.rect(r[0] + 2.0 * s, r[1] + 2.0 * s, r[2] - 4.0 * s, r[3] - 4.0 * s, 0x8b8b8bff);
+            }
+        } else {
+            g.text(12.0 * s, 84.0 * s, 13.0 * s, 0xffffffff, &format!("FPS {}  x{:.0} y{:.0} z{:.0}  chunk {}/{}  đỉnh {}k  {}", self.fps, self.pos[0], self.pos[1], self.pos[2], self.drawn_chunks, self.gpu.len(), self.drawn_verts / 1000, if self.player.fly { "bay" } else if self.player.on_ground { "đất" } else { "không" }));
+            for (_, r) in &slots {
+                g.rect(r[0], r[1], r[2], r[3], 0x000000a0);
+                g.rect(r[0] + 1.0 * s, r[1] + 1.0 * s, r[2] - 2.0 * s, r[3] - 2.0 * s, 0x55555580);
+            }
+        }
         let on = 0x2e8b57c0u32;
         let off = 0x00000090u32;
         let fly_label = if self.player.fly { "Bay: bật" } else { "Bay: tắt" };
-        for (r, label, col) in [
-            (rect_exit(g), "Thoát", 0xc0392bd0u32),
-            (rect_jump(g), if self.player.fly { "Lên" } else { "Nhảy" }, if self.jump_held { on } else { off }),
-            (rect_sneak(g), if self.player.fly { "Xuống" } else { "Lén" }, if self.sneak_on { on } else { off }),
-            (rect_fly(g), fly_label, if self.player.fly { on } else { off }),
-            (rect_sprint(g), "Chạy", if self.sprint_on { on } else { off }),
-        ] {
+        let bag_label = if self.inv_open { "Đóng" } else { "Túi đồ" };
+        let mut buttons: Vec<([f32; 4], &str, u32)> = vec![(rect_exit(g), "Thoát", 0xc0392bd0u32), (rect_bag(g), bag_label, if self.inv_open { on } else { off })];
+        if !self.inv_open {
+            buttons.push((rect_jump(g), if self.player.fly { "Lên" } else { "Nhảy" }, if self.jump_held { on } else { off }));
+            buttons.push((rect_sneak(g), if self.player.fly { "Xuống" } else { "Lén" }, if self.sneak_on { on } else { off }));
+            buttons.push((rect_fly(g), fly_label, if self.player.fly { on } else { off }));
+            buttons.push((rect_sprint(g), "Chạy", if self.sprint_on { on } else { off }));
+        }
+        for (r, label, col) in buttons {
             g.rect(r[0], r[1], r[2], r[3], col);
             let tw = g.text_width(label, 14.0 * s);
             g.text(r[0] + (r[2] - tw) / 2.0, r[1] + (r[3] - 18.0 * s) / 2.0, 14.0 * s, 0xffffffff, label);
+        }
+        g.end(None);
+
+        // lượt 2 (3D): icon khối trong các ô (và vật đang cầm theo ngón tay)
+        if !self.items.is_empty() {
+            unsafe {
+                glDisable(GL_SCISSOR_TEST);
+                glDisable(GL_BLEND);
+                glDisable(GL_CULL_FACE);
+                glEnable(GL_DEPTH_TEST);
+                glDepthFunc(GL_LEQUAL);
+                glDepthMask(1);
+                glClear(GL_DEPTH_BUFFER_BIT);
+                glUseProgram(self.prog);
+                glUniform2f(self.u_fog, 1.0e6, 2.0e6);
+                glUniform3f(self.u_tint, 1.0, 1.0, 1.0);
+                glActiveTexture(GL_TEXTURE0);
+                glBindTexture(GL_TEXTURE_2D, self.tex);
+                glUniform1i(self.u_tex, 0);
+                let stride = std::mem::size_of::<V>() as i32;
+                glBindBuffer(GL_ARRAY_BUFFER, self.items_gpu.vbo);
+                glEnableVertexAttribArray(0);
+                glVertexAttribPointer(0, 3, GL_FLOAT, 0, stride, 0 as *const _);
+                glEnableVertexAttribArray(1);
+                glVertexAttribPointer(1, 2, GL_FLOAT, 0, stride, 12 as *const _);
+                glEnableVertexAttribArray(2);
+                glVertexAttribPointer(2, 4, GL_UNSIGNED_BYTE, 1, stride, 20 as *const _);
+                glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, self.items_gpu.ebo);
+                let draw = |item: u16, cx: f32, cy: f32, sz: f32, zoff: f32| {
+                    if let Some(it) = self.items.get(item as usize) {
+                        let m = items::gui_matrix(w, h, cx, cy, sz, zoff);
+                        glUniformMatrix4fv(self.u_mvp, 1, 0, m.as_ptr());
+                        glDrawElements(GL_TRIANGLES, it.gui.1, GL_UNSIGNED_INT, (it.gui.0 as usize * 4) as *const _);
+                    }
+                };
+                for (i, r) in &slots {
+                    if let Some(st) = self.inv.slots[*i] {
+                        draw(st.item, r[0] + r[2] / 2.0, r[1] + r[3] / 2.0, r[2] * 0.8, 0.0);
+                    }
+                }
+                if self.inv_open {
+                    if let Some(c) = self.inv.cursor {
+                        let sz = inv_geom(g).4 * 0.8;
+                        draw(c.item, self.ui_pt.0, self.ui_pt.1, sz, sz * 3.0);
+                    }
+                }
+                glDisable(GL_DEPTH_TEST);
+            }
+        }
+
+        // lượt 3 (2D): khung chọn, số lượng, tên vật
+        g.begin();
+        if !self.inv_open {
+            let r = hot_slot_rect(g, self.inv.sel);
+            let t = 3.0 * s;
+            for q in [[r[0] - t, r[1] - t, r[2] + 2.0 * t, t], [r[0] - t, r[1] + r[3], r[2] + 2.0 * t, t], [r[0] - t, r[1], t, r[3]], [r[0] + r[2], r[1], t, r[3]]] {
+                g.rect(q[0], q[1], q[2], q[3], 0xffffffff);
+            }
+            if self.name_t > 0.0 {
+                if let Some(it) = self.shown.or(self.inv.held()).and_then(|i| self.items.get(i as usize)) {
+                    let a = (255.0 * (self.name_t / 0.5).min(1.0)) as u32;
+                    let tw = g.text_width(&it.name, 15.0 * s);
+                    let (tx, ty) = ((w - tw) / 2.0, hot_geom(g).1 - 30.0 * s);
+                    g.text(tx + s, ty + s, 15.0 * s, a, &it.name);
+                    g.text(tx, ty, 15.0 * s, 0xffffff00 | a, &it.name);
+                }
+            }
+        }
+        for (i, r) in &slots {
+            if let Some(st) = self.inv.slots[*i] {
+                draw_count(g, *r, st.n);
+            }
+        }
+        if self.inv_open {
+            if let Some(c) = self.inv.cursor {
+                let sz = inv_geom(g).4;
+                draw_count(g, [self.ui_pt.0 - sz / 2.0, self.ui_pt.1 - sz / 2.0, sz, sz], c.n);
+            }
         }
         g.end(None);
         self.exit

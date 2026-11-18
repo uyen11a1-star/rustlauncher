@@ -11,6 +11,8 @@ mod blocks;
 mod gfx;
 mod gles;
 mod inflate;
+mod inv;
+mod items;
 mod json;
 mod launcher;
 mod math;

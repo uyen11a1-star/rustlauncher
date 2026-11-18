@@ -29,6 +29,24 @@ pub fn rot_y(a: f32) -> Mat4 {
     [c, 0.0, -s, 0.0, 0.0, 1.0, 0.0, 0.0, s, 0.0, c, 0.0, 0.0, 0.0, 0.0, 1.0]
 }
 
+pub fn rot_z(a: f32) -> Mat4 {
+    let (s, c) = a.sin_cos();
+    [c, s, 0.0, 0.0, -s, c, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0]
+}
+
+pub fn scale(x: f32, y: f32, z: f32) -> Mat4 {
+    [x, 0.0, 0.0, 0.0, 0.0, y, 0.0, 0.0, 0.0, 0.0, z, 0.0, 0.0, 0.0, 0.0, 1.0]
+}
+
+/// Nhân nhiều ma trận từ trái sang phải (như PoseStack: phép sau áp trong hệ tọa độ của phép trước).
+pub fn chain(ms: &[Mat4]) -> Mat4 {
+    let mut r = ms[0];
+    for m in &ms[1..] {
+        r = mul(&r, m);
+    }
+    r
+}
+
 pub fn perspective(fovy: f32, aspect: f32, n: f32, f: f32) -> Mat4 {
     let t = 1.0 / (fovy / 2.0).tan();
     [t / aspect, 0.0, 0.0, 0.0, 0.0, t, 0.0, 0.0, 0.0, 0.0, (f + n) / (n - f), -1.0, 0.0, 0.0, 2.0 * f * n / (n - f), 0.0]
