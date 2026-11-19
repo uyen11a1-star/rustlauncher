@@ -49,6 +49,7 @@ extern "C" {
     pub fn glUniform2f(loc: i32, a: f32, b: f32);
     pub fn glUniform3f(loc: i32, a: f32, b: f32, c: f32);
     pub fn glUniform1i(loc: i32, v: i32);
+    pub fn glUniform1f(loc: i32, v: f32);
     pub fn glGenBuffers(n: i32, out: *mut u32);
     pub fn glBindBuffer(t: u32, b: u32);
     pub fn glBufferData(t: u32, size: isize, data: *const c_void, usage: u32);

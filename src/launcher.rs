@@ -28,6 +28,8 @@ pub struct Launcher {
     pub busy: Arc<AtomicBool>,
     /// Cảnh 3D đã dựng xong (CPU), chờ luồng chính đưa lên GPU.
     pub scene: Arc<Mutex<Option<scene::SceneData>>>,
+    /// client.jar đã tải xong (đường dẫn) và id phiên bản, chờ luồng chính mở giao diện game.
+    pub jar_slot: Arc<Mutex<Option<(PathBuf, String)>>>,
 }
 
 pub fn pusher(log: &Arc<Mutex<Vec<String>>>) -> impl Fn(String) + Send + Sync + Clone + 'static {
@@ -58,6 +60,7 @@ impl Launcher {
             log: Arc::new(Mutex::new(first)),
             busy: Arc::new(AtomicBool::new(false)),
             scene: Arc::new(Mutex::new(None)),
+            jar_slot: Arc::new(Mutex::new(None)),
         };
         l.load_versions();
         l
@@ -78,6 +81,44 @@ impl Launcher {
                 Ok(()) => push(format!("Đã tải danh sách {} phiên bản.", shared.versions.lock().unwrap().len())),
                 Err(e) => push(format!("Không tải được danh sách phiên bản: {e}")),
             }
+        });
+    }
+
+
+    /// Chỉ tải client.jar (nếu chưa có); xong thì đặt vào `jar_slot` để mở giao diện game.
+    pub fn fetch_jar(&self, id: String) {
+        if self.busy.swap(true, Relaxed) {
+            return;
+        }
+        let (root, shared, log, busy, out) = (self.root.clone(), self.shared.clone(), self.log.clone(), self.busy.clone(), self.jar_slot.clone());
+        std::thread::spawn(move || {
+            let push = pusher(&log);
+            let rt = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
+                Ok(r) => r,
+                Err(e) => {
+                    push(format!("tokio: {e}"));
+                    busy.store(false, Relaxed);
+                    return;
+                }
+            };
+            let id2 = id.clone();
+            let res: mc::Res<std::path::PathBuf> = rt.block_on(async {
+                let client = mc::make_client()?;
+                let entry = shared.versions.lock().unwrap().iter().find(|v| v.id == id).cloned().ok_or("không thấy phiên bản trong danh sách")?;
+                let jar = mc::install_client(&client, &root, &entry, &shared).await?;
+                Ok::<_, Box<dyn std::error::Error + Send + Sync>>(jar)
+            });
+            match res {
+                Err(e) => {
+                    push(format!("LỖI: {e}"));
+                    shared.set_phase("Lỗi");
+                }
+                Ok(jar) => {
+                    shared.set_phase("Sẵn sàng");
+                    *out.lock().unwrap() = Some((jar, id2));
+                }
+            }
+            busy.store(false, Relaxed);
         });
     }
 

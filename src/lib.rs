@@ -11,6 +11,9 @@ mod blocks;
 mod craft;
 mod gfx;
 mod gles;
+mod glgui;
+mod guirun;
+mod mcgui;
 mod inflate;
 mod inv;
 mod items;
@@ -40,6 +43,7 @@ mod vrng;
 enum Mode {
     Menu,
     View(Box<view::View>),
+    Gui(Box<guirun::GuiRun>),
 }
 
 #[no_mangle]
@@ -56,7 +60,7 @@ fn android_main(app: AndroidApp) {
 
     while !quit {
         let (mut init, mut term) = (false, false);
-        let timeout = if matches!(mode, Mode::View(_)) { 1 } else { 33 };
+        let timeout = if matches!(mode, Mode::View(_) | Mode::Gui(_)) { 1 } else { 33 };
         app.poll_events(Some(Duration::from_millis(timeout)), |event| {
             if let PollEvent::Main(me) = event {
                 match me {
@@ -141,6 +145,17 @@ fn android_main(app: AndroidApp) {
             }
         }
 
+        // client.jar đã sẵn sàng (bấm PLAY) -> mở giao diện game kiểu Minecraft
+        if matches!(mode, Mode::Menu) && egl.as_ref().map_or(false, |e| !e.surface.is_null()) {
+            let jar = launcher.jar_slot.lock().unwrap().take();
+            if let Some((path, id)) = jar {
+                match guirun::GuiRun::new(path, id, launcher.log.clone()) {
+                    Ok(r) => mode = Mode::Gui(Box::new(r)),
+                    Err(e) => launcher.log.lock().unwrap().push(format!("LỖI mở giao diện game: {e}")),
+                }
+            }
+        }
+
         if let (Some(e), Some(g)) = (egl.as_ref(), gfx.as_mut()) {
             if !e.surface.is_null() {
                 let (w, h) = e.size();
@@ -160,7 +175,7 @@ fn android_main(app: AndroidApp) {
                             Some(screen::Action::World(id)) => {
                                 let vm = app.vm_as_ptr();
                                 if perm::has_all_files(vm) {
-                                    launcher.prepare(id, true);
+                                    launcher.fetch_jar(id);
                                 } else {
                                     let say = launcher::pusher(&launcher.log);
                                     match perm::request_all_files(vm, app.activity_as_ptr(), "dev.rustlauncher.app") {
@@ -170,6 +185,11 @@ fn android_main(app: AndroidApp) {
                                 }
                             }
                             None => {}
+                        }
+                    }
+                    Mode::Gui(r) => {
+                        if matches!(r.frame(g, w, h, &events), guirun::Out::Exit) {
+                            mode = Mode::Menu;
                         }
                     }
                     Mode::View(v) => {

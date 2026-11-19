@@ -211,6 +211,10 @@ pub struct View {
     frames: u32,
     fps: u32,
     exit: bool,
+    /// góc nhìn dọc (độ); đặt từ Options
+    pub fov_deg: f32,
+    /// tạm dừng: không nhận chạm, không cập nhật vật lý
+    pub frozen: bool,
 }
 
 /// Số lượng ở góc dưới-phải ô vật phẩm 16x16 (có bóng xám như vanilla), ẩn khi chỉ có 1.
@@ -424,6 +428,8 @@ impl View {
                 frames: 0,
                 fps: 0,
                 exit: false,
+                fov_deg: 70.0,
+                frozen: false,
             })
         }
     }
@@ -448,7 +454,17 @@ impl View {
         glDrawArrays(GL_TRIANGLES, 0, 6);
     }
 
+    pub fn set_frozen(&mut self, f: bool) {
+        self.frozen = f;
+        if f {
+            self.touches.clear();
+        }
+    }
+
     pub fn touch(&mut self, id: i32, phase: Phase, x: f32, y: f32, g: &Gfx) {
+        if self.frozen {
+            return;
+        }
         match phase {
             Phase::Down => {
                 let hot = if self.inv_open { None } else { (0..9).find(|&i| inside(hot_slot_rect(g, i), x, y)) };
@@ -554,7 +570,7 @@ impl View {
     /// Vẽ một khung hình. Trả về true khi người dùng bấm Thoát.
     pub fn frame(&mut self, g: &mut Gfx) -> bool {
         let now = Instant::now();
-        let dt = (now - self.last).as_secs_f32().min(0.1);
+        let dt = if self.frozen { 0.0 } else { (now - self.last).as_secs_f32().min(0.1) };
         self.last = now;
         let s = g.scale;
 
@@ -707,7 +723,7 @@ impl View {
             _ => ([0.53, 0.81, 0.92], FOG_START, FOG_END),
         };
         let aspect = g.w as f32 / g.h as f32;
-        let mvp = math::mul(&math::perspective(1.2, aspect, 0.05, 300.0), &math::view(self.pos, self.yaw, self.pitch));
+        let mvp = math::mul(&math::perspective(self.fov_deg.to_radians(), aspect, 0.05, 300.0), &math::view(self.pos, self.yaw, self.pitch));
         unsafe {
             glViewport(0, 0, g.w, g.h);
             glDisable(GL_SCISSOR_TEST);
@@ -839,7 +855,7 @@ impl View {
         let off = 0x00000090u32;
         let fly_label = if self.player.fly { "Bay: bật" } else { "Bay: tắt" };
         let bag_label = if self.inv_open { "Đóng" } else { "Túi đồ" };
-        let mut buttons: Vec<([f32; 4], &str, u32)> = vec![(rect_exit(g), "Thoát", 0xc0392bd0u32), (rect_bag(g), bag_label, if self.inv_open { on } else { off })];
+        let mut buttons: Vec<([f32; 4], &str, u32)> = vec![(rect_exit(g), "II", 0x404040d0u32), (rect_bag(g), bag_label, if self.inv_open { on } else { off })];
         if !self.inv_open {
             buttons.push((rect_jump(g), if self.player.fly { "Lên" } else { "Nhảy" }, if self.jump_held { on } else { off }));
             buttons.push((rect_sneak(g), if self.player.fly { "Xuống" } else { "Lén" }, if self.sneak_on { on } else { off }));
@@ -1005,6 +1021,6 @@ impl View {
             }
         }
         g.end(None);
-        self.exit
+        std::mem::take(&mut self.exit)
     }
 }
