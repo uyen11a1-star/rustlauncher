@@ -31,6 +31,8 @@ mod account;
 mod auth;
 mod keyboard;
 mod ui;
+mod vcompare;
+mod vdens;
 mod vnoise;
 mod vrng;
 

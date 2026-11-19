@@ -510,6 +510,10 @@ pub fn build_world(jar_path: &Path, dir: &Path, radius: i32, log: &dyn Fn(String
     let mut w = World::default();
     let _ = ingest(&mut w, &mut ids, &mut keys, raws);
     log(format!("{} loại block state khác nhau", keys.len()));
+    if let Some(sd) = crate::vrng::read_seed(dir) {
+        let cs: Vec<(i32, i32)> = [(ccx, ccz), (ccx + 1, ccz), (ccx, ccz + 1), (ccx + 1, ccz + 1)].into_iter().filter(|c| w.chunks.contains_key(c)).collect();
+        crate::vcompare::compare(&jar, sd, &w, &keys, &cs, log);
+    }
 
     let t2 = std::time::Instant::now();
     let mut states: Vec<State> = Vec::new();
