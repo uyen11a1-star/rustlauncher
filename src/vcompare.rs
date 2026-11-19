@@ -1,8 +1,11 @@
 //! Công cụ so sánh: sinh địa hình bằng bộ máy hàm mật độ rồi đối chiếu với chunk thật của thế giới.
+use std::{collections::HashMap, path::Path};
+
 use crate::{
     assets::Jar,
+    vbiome::BiomeSource,
     vdens::Router,
-    world::{World, UNKNOWN},
+    world::{self, World, UNKNOWN},
 };
 
 /// 1 = khối đặc tự nhiên, 2 = không khí hoặc chất lỏng, 0 = bỏ qua (cây, hoa, vật trang trí...).
@@ -27,7 +30,7 @@ fn pct(a: u64, b: u64) -> f64 {
     }
 }
 
-pub fn compare(jar: &Jar, seed: i64, w: &World, keys: &[String], chunks: &[(i32, i32)], log: &dyn Fn(String)) {
+pub fn compare(jar: &Jar, seed: i64, dir: &Path, w: &World, keys: &[String], chunks: &[(i32, i32)], log: &dyn Fn(String)) {
     let t0 = std::time::Instant::now();
     let router = match Router::build(jar, seed) {
         Ok(r) => r,
@@ -106,4 +109,43 @@ pub fn compare(jar: &Jar, seed: i64, w: &World, keys: &[String], chunks: &[(i32,
         cols,
         if col_both == 0 { 0.0 } else { col_diff as f64 / col_both as f64 }
     ));
+    compare_biomes(&router, dir, chunks, log);
+}
+
+/// So quần xã đoán được với quần xã thật lưu trong chunk, theo từng ô 4x4x4.
+fn compare_biomes(router: &Router, dir: &Path, chunks: &[(i32, i32)], log: &dyn Fn(String)) {
+    let t0 = std::time::Instant::now();
+    let src = BiomeSource::new();
+    let (raws, _) = world::load_raw(dir, chunks, 1);
+    let (mut tot, mut ok) = (0u64, 0u64);
+    let mut conf: HashMap<(String, String), u64> = HashMap::new();
+    for rc in &raws {
+        for (sy, pal, idx) in &rc.biomes {
+            for cy in 0..4usize {
+                for cz in 0..4usize {
+                    for cx in 0..4usize {
+                        let k = match idx {
+                            Some(v) => v[(cy * 4 + cz) * 4 + cx] as usize,
+                            None => 0,
+                        };
+                        let Some(real) = pal.get(k) else { continue };
+                        let real = real.strip_prefix("minecraft:").unwrap_or(real);
+                        let pred = src.find(&router.climate(rc.cx * 4 + cx as i32, sy * 4 + cy as i32, rc.cz * 4 + cz as i32));
+                        tot += 1;
+                        if pred == real {
+                            ok += 1;
+                        } else {
+                            *conf.entry((pred.to_string(), real.to_string())).or_insert(0) += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    log(format!("So sánh quần xã ({} mục bảng, {} ms): khớp {:.1}% trên {} ô", src.count(), t0.elapsed().as_millis(), pct(ok, tot), tot));
+    let mut v: Vec<_> = conf.into_iter().collect();
+    v.sort_by(|a, b| b.1.cmp(&a.1));
+    for ((p, r), n) in v.iter().take(6) {
+        log(format!("  lệch: đoán {p} nhưng thật là {r} ({n} ô)"));
+    }
 }

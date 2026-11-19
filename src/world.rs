@@ -77,6 +77,8 @@ pub struct RawChunk {
     pub secs: Vec<RawSection>,
     /// (y section, SkyLight thô, BlockLight thô), mỗi mảng 2048 byte nếu có
     pub lights: Vec<(i32, Option<Vec<u8>>, Option<Vec<u8>>)>,
+    /// (y section, bảng quần xã, chỉ số 4x4x4 theo thứ tự y,z,x nếu có)
+    pub biomes: Vec<(i32, Vec<String>, Option<Vec<u8>>)>,
 }
 
 pub struct LevelInfo {
@@ -193,6 +195,7 @@ fn parse_chunk(cx: i32, cz: i32, root: &Tag) -> Result<Option<RawChunk>, String>
     let secs = root.get("sections").and_then(|s| s.as_list()).ok_or("chunk không có sections")?;
     let mut out = Vec::new();
     let mut lights = Vec::new();
+    let mut biomes = Vec::new();
     for s in secs {
         let y = s.get("Y").and_then(|y| y.as_i64()).ok_or("section thiếu Y")? as i32;
         let raw = |k: &str| match s.get(k) {
@@ -200,6 +203,26 @@ fn parse_chunk(cx: i32, cz: i32, root: &Tag) -> Result<Option<RawChunk>, String>
             _ => None,
         };
         lights.push((y, raw("SkyLight"), raw("BlockLight")));
+        if let Some(b) = s.get("biomes") {
+            if let Some(p) = b.get("palette").and_then(|p| p.as_list()) {
+                let pal: Vec<String> = p.iter().filter_map(|t| t.as_str().map(|s| s.to_string())).collect();
+                if !pal.is_empty() {
+                    let idx = match b.get("data").and_then(|d| d.as_longs()) {
+                        Some(data) if pal.len() > 1 => {
+                            let mut bits = 1usize;
+                            while (1usize << bits) < pal.len() {
+                                bits += 1;
+                            }
+                            let per = 64 / bits;
+                            let mask = (1u64 << bits) - 1;
+                            Some((0..64usize).map(|i| ((data.get(i / per).copied().unwrap_or(0) as u64 >> ((i % per) * bits)) & mask) as u8).collect())
+                        }
+                        _ => None,
+                    };
+                    biomes.push((y, pal, idx));
+                }
+            }
+        }
         let Some(bs) = s.get("block_states") else { continue };
         let pal = bs.get("palette").and_then(|p| p.as_list()).ok_or("thiếu palette")?;
         let palette: Vec<String> = pal.iter().filter_map(prop_key).collect();
@@ -228,7 +251,7 @@ fn parse_chunk(cx: i32, cz: i32, root: &Tag) -> Result<Option<RawChunk>, String>
         };
         out.push(RawSection { y, palette, idx });
     }
-    Ok(Some(RawChunk { cx, cz, secs: out, lights }))
+    Ok(Some(RawChunk { cx, cz, secs: out, lights, biomes }))
 }
 
 pub struct LoadStats {

@@ -192,6 +192,7 @@ pub struct Router {
     origin: Cell<(i32, i32)>,
     min_y: i32,
     final_density: Rc<Df>,
+    climate: Vec<Rc<Df>>,
 }
 
 struct Comp<'a> {
@@ -362,8 +363,13 @@ impl Router {
         let min_y = settings.get("noise").and_then(|n| n.get("min_y")).and_then(|v| v.as_i64()).ok_or("thiếu noise.min_y")? as i32;
         let fd = settings.get("noise_router").and_then(|r| r.get("final_density")).ok_or("thiếu final_density")?;
         let final_density = c.df(fd)?;
+        let nr = settings.get("noise_router").ok_or("thiếu noise_router")?;
+        let mut climate = Vec::new();
+        for k in ["temperature", "vegetation", "continents", "erosion", "depth", "ridges"] {
+            climate.push(c.df(nr.get(k).ok_or_else(|| format!("router thiếu '{k}'"))?)?);
+        }
         let n = c.interps.len();
-        Ok(Router { noises: c.noises, blended: c.blended, interps: c.interps, grids: RefCell::new(vec![Vec::new(); n]), origin: Cell::new((0, 0)), min_y, final_density })
+        Ok(Router { noises: c.noises, blended: c.blended, interps: c.interps, grids: RefCell::new(vec![Vec::new(); n]), origin: Cell::new((0, 0)), min_y, final_density, climate })
     }
 
     /// Tính sẵn lưới các góc ô (4x8x4) cho các nút `interpolated` của chunk có góc tại (x0, z0).
@@ -381,6 +387,17 @@ impl Router {
             }
             self.grids.borrow_mut()[i] = vals;
         }
+    }
+
+    /// Điểm khí hậu (đã lượng tử hóa) tại ô quần xã (đơn vị 4 khối): nhiệt độ, độ ẩm, lục địa, xói mòn, độ sâu, độ kỳ quặc.
+    pub fn climate(&self, qx: i32, qy: i32, qz: i32) -> [i64; 6] {
+        let c = Ctx { x: qx << 2, y: qy << 2, z: qz << 2, corner: false };
+        let mut o = [0i64; 6];
+        for i in 0..6 {
+            let v = self.eval(&self.climate[i], &c);
+            o[i] = ((v as f32) * 10000.0f32) as i64;
+        }
+        o
     }
 
     /// Mật độ tại một khối; dương nghĩa là đặc. Gọi `prepare` cho chunk chứa khối trước.
@@ -513,7 +530,7 @@ impl Router {
             }
             Df::Pass(a) => self.eval(a, c),
             Df::Interp(i, inner) => {
-                if c.corner {
+                if c.corner || self.grids.borrow()[*i].is_empty() {
                     return self.eval(inner, c);
                 }
                 let (ox, oz) = self.origin.get();
