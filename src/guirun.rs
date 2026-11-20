@@ -73,6 +73,7 @@ pub struct GuiRun {
     version: String,
     tz: i64,
     root: PathBuf,
+    net_mode: bool,
 }
 
 #[cfg(target_os = "android")]
@@ -148,6 +149,7 @@ impl GuiRun {
             version,
             tz: tz_minutes(),
             root,
+            net_mode: false,
         })
     }
 
@@ -178,6 +180,21 @@ impl GuiRun {
         });
     }
 
+    fn start_net(&mut self, conn: crate::mcgui::net::Conn) {
+        self.ph = Ph::Loading;
+        self.net_mode = true;
+        if let Some(gui) = self.gui.as_mut() {
+            gui.online = true;
+        }
+        *self.build.lock().unwrap() = None;
+        let (jar, slot, log) = (self.jar_path.clone(), self.build.clone(), self.log.clone());
+        std::thread::spawn(move || {
+            let push = crate::launcher::pusher(&log);
+            let r = crate::netplay::start(conn).and_then(|link| scene::build_net(&jar, link, &push));
+            *slot.lock().unwrap() = Some(r);
+        });
+    }
+
     pub fn frame(&mut self, g: &mut Gfx, w: i32, h: i32, events: &[(i32, Phase, f32, f32)]) -> Out {
         let now = Instant::now();
         let dt = (now - self.last).as_secs_f32().min(0.1);
@@ -197,6 +214,7 @@ impl GuiRun {
                         }
                         gui.load_servers(self.root.join("servers.txt"));
                         self.gui = Some(gui);
+                        self.log.lock().unwrap().push(format!("Giao diện: {} ảnh, {} sprite, panorama {}", a.imgs.len(), a.sprites.len(), if a.pano.is_some() { "có" } else { "KHÔNG nạp được" }));
                         self.assets = a;
                         self.loaded = true;
                     }
@@ -243,6 +261,10 @@ impl GuiRun {
                 if let Some(v) = self.view.as_mut() {
                     for (id, ph, x, y) in events {
                         v.touch(*id, *ph, *x, *y, g);
+                    }
+                    if let Some(m) = v.take_kick() {
+                        self.leave_net(Some(m));
+                        return Out::Stay;
                     }
                     if v.frame(g) {
                         v.set_frozen(true);
@@ -306,6 +328,7 @@ impl GuiRun {
             p = Ptr::default();
         }
 
+        self.canvas.clear = self.ph != Ph::Paused;
         self.canvas.begin(w, h);
         let mut ev = None;
         {
@@ -323,6 +346,10 @@ impl GuiRun {
         }
         self.canvas.end();
 
+        // kết nối server đã đăng nhập xong -> bắt đầu phiên chơi
+        if let Some(c) = self.gui.as_mut().and_then(|g| g.joined.take()) {
+            self.start_net(c);
+        }
         // tiếp nhận sự kiện từ Gui
         let mut out = Out::Stay;
         if let Some(e) = ev {
@@ -335,6 +362,7 @@ impl GuiRun {
                     }
                     self.ph = Ph::Game;
                 }
+                Ev::QuitToTitle if self.net_mode => self.leave_net(None),
                 Ev::QuitToTitle => {
                     self.view = None;
                     self.ph = Ph::Gui;
@@ -356,7 +384,28 @@ impl GuiRun {
         out
     }
 
+    /// rời server (bị kick hoặc tự ngắt): về danh sách server, kèm lý do nếu có
+    fn leave_net(&mut self, reason: Option<String>) {
+        self.view = None;
+        self.ph = Ph::Gui;
+        self.net_mode = false;
+        if let Some(gui) = self.gui.as_mut() {
+            gui.in_game = false;
+            gui.online = false;
+            gui.reset_to(Screen::Title);
+            gui.open(Screen::Multi);
+            if let Some(m) = reason {
+                let m = m.strip_prefix("Disconnected: ").unwrap_or(&m).to_string();
+                gui.open(Screen::Disc("Disconnected".into(), m));
+            }
+        }
+    }
+
     fn fail(&mut self, msg: String) {
+        if self.net_mode {
+            self.leave_net(Some(msg));
+            return;
+        }
         self.log.lock().unwrap().push(format!("LỖI vào world: {msg}"));
         self.ph = Ph::Gui;
         if let Some(gui) = self.gui.as_mut() {

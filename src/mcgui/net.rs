@@ -60,7 +60,7 @@ pub fn put_varint(out: &mut Vec<u8>, mut v: u32) {
     }
 }
 
-fn put_str(out: &mut Vec<u8>, s: &str) {
+pub fn put_str(out: &mut Vec<u8>, s: &str) {
     put_varint(out, s.len() as u32);
     out.extend_from_slice(s.as_bytes());
 }
@@ -81,7 +81,7 @@ fn read_varint(r: &mut dyn Read) -> Result<i32, String> {
     }
 }
 
-fn send(s: &mut TcpStream, id: i32, body: &[u8], compress: bool) -> Result<(), String> {
+pub fn send(s: &mut TcpStream, id: i32, body: &[u8], compress: bool) -> Result<(), String> {
     let mut pkt = Vec::new();
     put_varint(&mut pkt, id as u32);
     pkt.extend_from_slice(body);
@@ -100,7 +100,7 @@ fn send(s: &mut TcpStream, id: i32, body: &[u8], compress: bool) -> Result<(), S
 }
 
 /// Đọc một gói; trả về (id, phần thân).
-fn recv(s: &mut TcpStream, compress: bool) -> Result<(i32, Vec<u8>), String> {
+pub fn recv(s: &mut TcpStream, compress: bool) -> Result<(i32, Vec<u8>), String> {
     let len = read_varint(s)? as usize;
     if len == 0 || len > 8 << 20 {
         return Err("Bad packet length".into());
@@ -119,7 +119,7 @@ fn recv(s: &mut TcpStream, compress: bool) -> Result<(i32, Vec<u8>), String> {
     Ok((id, c.to_vec()))
 }
 
-fn rd_varint(b: &[u8], i: &mut usize) -> Option<i32> {
+pub fn rd_varint(b: &[u8], i: &mut usize) -> Option<i32> {
     let (mut v, mut sh) = (0u32, 0);
     loop {
         let x = *b.get(*i)?;
@@ -135,7 +135,7 @@ fn rd_varint(b: &[u8], i: &mut usize) -> Option<i32> {
     }
 }
 
-fn rd_str(b: &[u8], i: &mut usize) -> Option<String> {
+pub fn rd_str(b: &[u8], i: &mut usize) -> Option<String> {
     let n = rd_varint(b, i)? as usize;
     let s = b.get(*i..*i + n)?;
     *i += n;
@@ -291,9 +291,15 @@ fn ping_inner(addr: &str, st: &mut Status) -> Result<(), String> {
     Ok(())
 }
 
+/// Kết nối đã đăng nhập xong, sẵn sàng vào giai đoạn cấu hình/chơi.
+pub struct Conn {
+    pub s: TcpStream,
+    pub comp: bool,
+}
+
 pub enum Login {
     /// Đăng nhập xong (server chế độ offline hoặc không cần xác thực)
-    Success { name: String },
+    Success { name: String, conn: Conn },
     /// Server từ chối, kèm lý do (đã đổi sang chữ có mã màu)
     Disconnected(String),
     /// Server bật xác thực Mojang (online-mode): cần mã hoá + token tài khoản
@@ -348,7 +354,8 @@ fn login_inner(addr: &str, name: &str) -> Result<Login, String> {
                 };
                 // Login Acknowledged
                 send(&mut s, 3, &[], comp)?;
-                return Ok(Login::Success { name: name2 });
+                s.set_read_timeout(None).ok();
+                return Ok(Login::Success { name: name2, conn: Conn { s, comp } });
             }
             // Set Compression
             3 => {

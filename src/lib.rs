@@ -14,6 +14,8 @@ mod gles;
 mod glgui;
 mod guirun;
 mod mcgui;
+mod netdata;
+mod netplay;
 mod inflate;
 mod inv;
 mod items;

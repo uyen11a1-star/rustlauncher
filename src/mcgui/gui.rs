@@ -296,6 +296,10 @@ pub struct Gui {
     shift: bool,
     conn: Option<Arc<Mutex<Option<net::Login>>>>,
     conn_t: f32,
+    /// kết nối đã đăng nhập, chờ GuiRun nhận
+    pub joined: Option<net::Conn>,
+    /// đang chơi trên server (nút thoát ghi "Disconnect")
+    pub online: bool,
 }
 
 impl Gui {
@@ -332,6 +336,8 @@ impl Gui {
             shift: false,
             conn: None,
             conn_t: 0.0,
+            joined: None,
+            online: false,
         }
     }
 
@@ -557,15 +563,16 @@ impl Gui {
                 let done = self.conn.as_ref().and_then(|c| c.lock().unwrap().take());
                 if let Some(r) = done {
                     self.conn = None;
-                    self.stack.pop();
                     match r {
                         net::Login::Disconnected(m) => self.screen = Screen::Disc("Disconnected".into(), m),
                         net::Login::NeedsAuth => {
                             self.screen = Screen::Disc("Failed to log in".into(), "This server is in online mode and needs Mojang session authentication (encryption), which is not supported in this build yet.".into())
                         }
                         net::Login::Failed(e) => self.screen = Screen::Disc("Failed to connect to the server".into(), e),
-                        net::Login::Success { name } => {
-                            self.screen = Screen::Disc("Connected".into(), format!("The server accepted the login as {name}. Joining the world (chunks and entities) is not implemented in this build yet."))
+                        net::Login::Success { name, conn } => {
+                            self.joined = Some(conn);
+                            self.load_msg = format!("Logged in as {name}");
+                            self.screen = Screen::Loading;
                         }
                     }
                     return None;
@@ -652,7 +659,7 @@ impl Gui {
                     self.open(Screen::Options);
                 }
                 let _ = button(d, p, [x + hw + 8.0, top + 72.0, hw, 20.0], "Open to LAN", false);
-                if button(d, p, [x, top + 96.0, bw, 20.0], "Save and Quit to Title", true) {
+                if button(d, p, [x, top + 96.0, bw, 20.0], if self.online { "Disconnect" } else { "Save and Quit to Title" }, true) {
                     ev = Some(Ev::QuitToTitle);
                 }
                 ev

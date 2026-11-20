@@ -39,14 +39,14 @@ out vec4 o;
 vec3 cube(vec3 d){
   vec3 a = abs(d); vec2 uv; vec4 c;
   if (a.y>=a.x && a.y>=a.z) { float s=1.0/a.y;
-    if (d.y>0.0) { uv=vec2((d.x*s+1.0)/2.0,(d.z*s+1.0)/2.0); c=texture(t4,uv); }
-    else { uv=vec2((d.x*s+1.0)/2.0,(1.0-d.z*s)/2.0); c=texture(t5,uv); }
+    if (d.y>0.0) { uv=vec2((d.x*s+1.0)/2.0,(d.z*s+1.0)/2.0); c=textureLod(t4,uv,0.0); }
+    else { uv=vec2((d.x*s+1.0)/2.0,(1.0-d.z*s)/2.0); c=textureLod(t5,uv,0.0); }
   } else if (a.z>=a.x) { float s=1.0/a.z;
-    if (d.z>0.0) { uv=vec2((d.x*s+1.0)/2.0,(1.0-d.y*s)/2.0); c=texture(t0,uv); }
-    else { uv=vec2((1.0-d.x*s)/2.0,(1.0-d.y*s)/2.0); c=texture(t2,uv); }
+    if (d.z>0.0) { uv=vec2((d.x*s+1.0)/2.0,(1.0-d.y*s)/2.0); c=textureLod(t0,uv,0.0); }
+    else { uv=vec2((1.0-d.x*s)/2.0,(1.0-d.y*s)/2.0); c=textureLod(t2,uv,0.0); }
   } else { float s=1.0/a.x;
-    if (d.x>0.0) { uv=vec2((1.0-d.z*s)/2.0,(1.0-d.y*s)/2.0); c=texture(t1,uv); }
-    else { uv=vec2((1.0+d.z*s)/2.0,(1.0-d.y*s)/2.0); c=texture(t3,uv); }
+    if (d.x>0.0) { uv=vec2((1.0-d.z*s)/2.0,(1.0-d.y*s)/2.0); c=textureLod(t1,uv,0.0); }
+    else { uv=vec2((1.0+d.z*s)/2.0,(1.0-d.y*s)/2.0); c=textureLod(t3,uv,0.0); }
   }
   return c.rgb;
 }
@@ -86,6 +86,8 @@ pub struct GlCanvas {
     // panorama chờ vẽ ngay (vẽ trước mọi thứ khác trong khung)
     pano: Option<([usize; 6], f32, f32, f32, f32, f32)>,
     sizes: Vec<(f32, f32)>,
+    /// xoá khung hình trước khi vẽ (tắt khi vẽ đè lên cảnh game)
+    pub clear: bool,
 }
 
 fn upload(img: &Image, linear: bool) -> u32 {
@@ -130,6 +132,7 @@ impl GlCanvas {
             cmds: Vec::new(),
             pano: None,
             sizes: imgs.iter().map(|i| (i.w as f32, i.h as f32)).collect(),
+            clear: true,
         })
     }
 
@@ -177,6 +180,10 @@ impl GlCanvas {
             glDisable(GL_DEPTH_TEST);
             glDisable(GL_CULL_FACE);
             glDisable(GL_BLEND);
+            if self.clear {
+                glClearColor(0.1, 0.11, 0.13, 1.0);
+                glClear(GL_COLOR_BUFFER_BIT);
+            }
             if let Some((faces, yaw, pitch, fov, alpha, blur)) = self.pano {
                 self.draw_pano(&faces, yaw, pitch, fov, alpha, blur);
             }

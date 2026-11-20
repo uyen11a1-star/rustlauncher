@@ -222,6 +222,6 @@ pub fn panorama_bg(d: &mut Draw, t: f32, blur: f32) {
         d.c.panorama(&f, yaw, pitch, 85.0, 1.0, blur * d.k);
     } else {
         let (w, h) = d.size();
-        d.tiled_bg(d.a.bg, [0.0, 0.0, w, h], 0x404040ff);
+        d.fill(0.0, 0.0, w, h, 0x202428ff);
     }
 }

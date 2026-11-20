@@ -215,6 +215,9 @@ pub struct View {
     pub fov_deg: f32,
     /// tạm dừng: không nhận chạm, không cập nhật vật lý
     pub frozen: bool,
+    /// chế độ nhiều người chơi: kênh gửi vị trí
+    net: Option<std::sync::mpsc::Sender<crate::netplay::NetOut>>,
+    kicked: Option<String>,
 }
 
 /// Số lượng ở góc dưới-phải ô vật phẩm 16x16 (có bóng xám như vanilla), ẩn khi chỉ có 1.
@@ -430,6 +433,8 @@ impl View {
                 exit: false,
                 fov_deg: 70.0,
                 frozen: false,
+                net: d.net.clone(),
+                kicked: None,
             })
         }
     }
@@ -452,6 +457,14 @@ impl View {
         glEnableVertexAttribArray(2);
         glVertexAttribPointer(2, 4, GL_UNSIGNED_BYTE, 1, stride, 20 as *const _);
         glDrawArrays(GL_TRIANGLES, 0, 6);
+    }
+
+    pub fn take_kick(&mut self) -> Option<String> {
+        self.kicked.take()
+    }
+
+    pub fn is_net(&self) -> bool {
+        self.net.is_some()
     }
 
     pub fn set_frozen(&mut self, f: bool) {
@@ -647,6 +660,15 @@ impl View {
                         c.world.chunks.remove(&(x, z));
                     }
                 }
+                Msg::Teleport(p, yaw, pitch) => {
+                    self.player.pos = p;
+                    self.player.vel = [0.0; 3];
+                    self.prev = p;
+                    self.yaw = std::f32::consts::PI - yaw.to_radians();
+                    self.pitch = (-pitch.to_radians()).clamp(-1.5, 1.5);
+                    self.fall = 0.0;
+                }
+                Msg::Kick(m) => self.kicked = Some(m),
             }
         }
 
@@ -675,8 +697,12 @@ impl View {
                 self.prev = self.player.pos;
                 self.prev_eye = self.player.eye_height();
                 self.player.tick(&inp, self.yaw as f64, self.pitch as f64, self.col.as_ref());
+                if let Some(n) = &self.net {
+                    let p = self.player.pos;
+                    let _ = n.send(crate::netplay::NetOut::Pos { x: p[0], y: p[1], z: p[2], yaw: 180.0 - self.yaw.to_degrees(), pitch: -self.pitch.to_degrees(), ground: self.player.on_ground });
+                }
                 // rơi: sát thương = quãng rơi - 3 (làm tròn lên), nước và bay thì không
-                if self.col.is_some() && !self.player.fly {
+                if self.col.is_some() && !self.player.fly && self.net.is_none() {
                     if self.player.in_water {
                         self.fall = 0.0;
                     } else if self.player.on_ground {
@@ -697,7 +723,7 @@ impl View {
                     self.health = 20.0;
                     self.fall = 0.0;
                 }
-                if self.player.pos[1] < -100.0 {
+                if self.player.pos[1] < -100.0 && self.net.is_none() {
                     self.player.pos = self.spawn;
                     self.player.vel = [0.0; 3];
                 }

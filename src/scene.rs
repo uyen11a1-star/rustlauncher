@@ -48,6 +48,8 @@ pub struct SceneData {
     pub shapes: Vec<Shape>,
     pub col: Vec<((i32, i32), Arc<Chunk>)>,
     pub items: crate::items::Items,
+    /// kênh gửi vị trí lên server (chế độ nhiều người chơi)
+    pub net: Option<mpsc::Sender<crate::netplay::NetOut>>,
 }
 
 /// Tin từ luồng stream gửi sang luồng vẽ.
@@ -59,6 +61,9 @@ pub enum Msg {
     /// chunk mới nạp (dữ liệu khối) cho vật lý
     Col(i32, i32, Arc<Chunk>),
     ColDrop(i32, i32),
+    /// server đặt lại vị trí (x, y chân, z, yaw và pitch theo độ kiểu Minecraft)
+    Teleport([f64; 3], f32, f32),
+    Kick(String),
 }
 
 /// Đầu nhận của luồng nền nạp/dựng chunk theo vị trí người chơi. Thả đi thì luồng nền tự dừng.
@@ -133,7 +138,7 @@ pub fn build_test(jar_path: &Path, log: &dyn Fn(String)) -> Result<SceneData, St
         log(m.clone());
     }
     log(format!("Dựng {} khối, {} đỉnh, mất {} ms", shown, mesh.v.len(), t0.elapsed().as_millis()));
-    Ok(SceneData { atlas: atlas.pixels, chunks: vec![ChunkMesh::new(mesh, 0, 0)], spawn: [7.0, 1.7, 4.0], stream: None, shapes: Vec::new(), col: Vec::new(), items })
+    Ok(SceneData { atlas: atlas.pixels, chunks: vec![ChunkMesh::new(mesh, 0, 0)], spawn: [7.0, 1.7, 4.0], stream: None, shapes: Vec::new(), col: Vec::new(), items, net: None })
 }
 
 /// Độ sáng 0..1 từ ánh sáng ô (lấy mức cao hơn giữa sáng trời và sáng khối), kèm một chút sáng nền.
@@ -356,8 +361,13 @@ fn grow_states(res: &mut Resolver, keys: &[String], states: &mut Vec<State>) {
 }
 
 /// Trạng thái của luồng stream: thế giới đang nạp, id block, các chunk đã thử đọc / đã dựng mesh.
+enum Src {
+    Disk(PathBuf),
+    Net(crate::netplay::Link),
+}
+
 struct Worker {
-    dir: PathBuf,
+    src: Src,
     w: World,
     ids: HashMap<String, u16>,
     keys: Vec<String>,
@@ -375,38 +385,82 @@ impl Worker {
             let far = |x: i32, z: i32| (x - pcx).abs() > r + 3 || (z - pcz).abs() > r + 3;
             let dist = |c: &(i32, i32)| (c.0 - pcx).pow(2) + (c.1 - pcz).pow(2);
 
-            // bỏ chunk quá xa
-            let gone: Vec<(i32, i32)> = self.w.chunks.keys().copied().filter(|&(x, z)| far(x, z)).collect();
-            for k in gone {
-                self.w.chunks.remove(&k);
-                if tx.send(Msg::ColDrop(k.0, k.1)).is_err() {
-                    return;
+            let net = matches!(self.src, Src::Net(_));
+            // bỏ chunk quá xa (chế độ mạng: server tự báo hủy chunk)
+            if !net {
+                let gone: Vec<(i32, i32)> = self.w.chunks.keys().copied().filter(|&(x, z)| far(x, z)).collect();
+                for k in gone {
+                    self.w.chunks.remove(&k);
+                    if tx.send(Msg::ColDrop(k.0, k.1)).is_err() {
+                        return;
+                    }
                 }
-            }
-            self.tried.retain(|&(x, z)| !far(x, z));
-            let dropped: Vec<(i32, i32)> = self.meshed.iter().copied().filter(|&(x, z)| far(x, z)).collect();
-            for k in dropped {
-                self.meshed.remove(&k);
-                if tx.send(Msg::Drop(k.0, k.1)).is_err() {
-                    return;
+                self.tried.retain(|&(x, z)| !far(x, z));
+                let dropped: Vec<(i32, i32)> = self.meshed.iter().copied().filter(|&(x, z)| far(x, z)).collect();
+                for k in dropped {
+                    self.meshed.remove(&k);
+                    if tx.send(Msg::Drop(k.0, k.1)).is_err() {
+                        return;
+                    }
                 }
             }
 
             // nạp chunk còn thiếu (thêm một vòng đệm để dựng mesh được vòng trong), gần trước
+            let mut busy = false;
+            let mut raws: Vec<RawChunk> = Vec::new();
             let mut want: Vec<(i32, i32)> = Vec::new();
-            for dz in -(r + 1)..=(r + 1) {
-                for dx in -(r + 1)..=(r + 1) {
-                    let c = (pcx + dx, pcz + dz);
-                    if !self.tried.contains(&c) {
-                        want.push(c);
+            match &self.src {
+                Src::Disk(dir) => {
+                    for dz in -(r + 1)..=(r + 1) {
+                        for dx in -(r + 1)..=(r + 1) {
+                            let c = (pcx + dx, pcz + dz);
+                            if !self.tried.contains(&c) {
+                                want.push(c);
+                            }
+                        }
+                    }
+                    want.sort_by_key(|c| dist(c));
+                    want.truncate(6);
+                    if !want.is_empty() {
+                        busy = true;
+                        raws = world::load_raw(dir, &want, threads).0;
                     }
                 }
+                Src::Net(link) => {
+                    let mut n = 0;
+                    while n < 8 {
+                        match link.rx.try_recv() {
+                            Ok(crate::netplay::NetIn::Chunk(rc)) => {
+                                want.push((rc.cx, rc.cz));
+                                raws.push(rc);
+                                n += 1;
+                            }
+                            Ok(crate::netplay::NetIn::Unload(x, z)) => {
+                                self.w.chunks.remove(&(x, z));
+                                self.tried.remove(&(x, z));
+                                self.meshed.remove(&(x, z));
+                                if tx.send(Msg::ColDrop(x, z)).is_err() || tx.send(Msg::Drop(x, z)).is_err() {
+                                    return;
+                                }
+                            }
+                            Ok(crate::netplay::NetIn::Tp { x, y, z, yaw, pitch }) => {
+                                if tx.send(Msg::Teleport([x, y, z], yaw, pitch)).is_err() {
+                                    return;
+                                }
+                            }
+                            Ok(crate::netplay::NetIn::Kick(m)) => {
+                                let _ = tx.send(Msg::Kick(m));
+                                return;
+                            }
+                            Ok(crate::netplay::NetIn::Joined) => {}
+                            Err(mpsc::TryRecvError::Empty) => break,
+                            Err(mpsc::TryRecvError::Disconnected) => return,
+                        }
+                    }
+                    busy = n > 0;
+                }
             }
-            want.sort_by_key(|c| dist(c));
-            want.truncate(6);
-            let mut busy = !want.is_empty();
             if busy {
-                let (raws, _) = world::load_raw(&self.dir, &want, threads);
                 for c in &want {
                     self.tried.insert(*c);
                 }
@@ -586,10 +640,73 @@ pub fn build_world(jar_path: &Path, dir: &Path, radius: i32, log: &dyn Fn(String
     let pos = Arc::new(AtomicI64::new(pack(ccx, ccz)));
     let stop = Arc::new(AtomicBool::new(false));
     let (tx, rx) = mpsc::channel();
-    let worker = Worker { dir: dir.to_path_buf(), w, ids, keys, states, tried: list.iter().copied().collect(), meshed: coords.iter().copied().collect() };
+    let worker = Worker { src: Src::Disk(dir.to_path_buf()), w, ids, keys, states, tried: list.iter().copied().collect(), meshed: coords.iter().copied().collect() };
     let pixels = atlas.pixels.clone();
     let (p2, s2) = (pos.clone(), stop.clone());
     std::thread::spawn(move || worker.run(jar, atlas, radius, p2, s2, tx));
     log(format!("Tổng thời gian dựng: {} ms", t0.elapsed().as_millis()));
-    Ok(SceneData { atlas: pixels, chunks, spawn: [center[0] as f32, y, center[2] as f32], stream: Some(Streamer { rx, pos, stop }), shapes, col, items })
+    Ok(SceneData { atlas: pixels, chunks, spawn: [center[0] as f32, y, center[2] as f32], stream: Some(Streamer { rx, pos, stop }), shapes, col, items, net: None })
+}
+
+/// Dựng cảnh từ server: chờ vị trí đầu tiên, rồi stream chunk nhận qua mạng.
+pub fn build_net(jar_path: &Path, link: crate::netplay::Link, log: &dyn Fn(String)) -> Result<SceneData, String> {
+    use crate::netplay::NetIn;
+    let t0 = std::time::Instant::now();
+    let jar = Jar::open(jar_path)?;
+    let atlas = build_atlas(&jar, log)?;
+    let items = crate::items::build(&jar, &atlas, log);
+    log(format!("Tài nguyên xong sau {} ms, chờ server...", t0.elapsed().as_millis()));
+    // chờ gói đặt vị trí đầu tiên; gom chunk đến trước
+    let mut early: Vec<NetIn> = Vec::new();
+    let mut spawn: Option<[f64; 3]> = None;
+    let t1 = std::time::Instant::now();
+    while spawn.is_none() {
+        if t1.elapsed() > Duration::from_secs(45) {
+            return Err("Timed out waiting for the server to send the player position".into());
+        }
+        match link.rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(NetIn::Tp { x, y, z, yaw, pitch }) => {
+                spawn = Some([x, y, z]);
+                early.push(NetIn::Tp { x, y, z, yaw, pitch });
+            }
+            Ok(NetIn::Kick(m)) => return Err(m),
+            Ok(o) => early.push(o),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => return Err("Connection lost".into()),
+        }
+    }
+    let sp = spawn.unwrap();
+    log(format!("Server đặt vị trí {:.1} {:.1} {:.1}", sp[0], sp[1], sp[2]));
+    let (tx, rx) = mpsc::channel();
+    let (pcx, pcz) = ((sp[0].floor() as i32) >> 4, (sp[2].floor() as i32) >> 4);
+    let pos = Arc::new(AtomicI64::new(pack(pcx, pcz)));
+    let stop = Arc::new(AtomicBool::new(false));
+    let net_tx = link.tx.clone();
+    // chunk/teleport đã nhận sớm: đẩy lại cho worker xử lý như bình thường (qua kênh nội bộ không cần; worker đọc link.rx)
+    // nên đưa lại vào hàng bằng cách xử lý trực tiếp ở đây
+    let mut ids: HashMap<String, u16> = HashMap::new();
+    let mut keys: Vec<String> = vec!["minecraft:air".into()];
+    ids.insert("minecraft:air".into(), 0);
+    let mut w = World::default();
+    let mut raws = Vec::new();
+    let mut tried = HashSet::new();
+    for m in early {
+        if let NetIn::Chunk(rc) = m {
+            tried.insert((rc.cx, rc.cz));
+            raws.push(rc);
+        }
+    }
+    let added = ingest(&mut w, &mut ids, &mut keys, raws);
+    let mut states: Vec<State> = Vec::new();
+    {
+        let mut res = Resolver::new(&jar, &atlas);
+        grow_states(&mut res, &keys, &mut states);
+    }
+    let shapes: Vec<Shape> = states.iter().map(|s| s.shape()).collect();
+    let col: Vec<((i32, i32), Arc<Chunk>)> = added.iter().map(|(x, z, c)| ((*x, *z), c.clone())).collect();
+    let worker = Worker { src: Src::Net(link), w, ids, keys, states, tried, meshed: HashSet::new() };
+    let pixels = atlas.pixels.clone();
+    let (p2, s2) = (pos.clone(), stop.clone());
+    std::thread::spawn(move || worker.run(jar, atlas, 32, p2, s2, tx));
+    Ok(SceneData { atlas: pixels, chunks: Vec::new(), spawn: [sp[0] as f32, sp[1] as f32 + 1.62, sp[2] as f32], stream: Some(Streamer { rx, pos, stop }), shapes, col, items, net: Some(net_tx) })
 }
