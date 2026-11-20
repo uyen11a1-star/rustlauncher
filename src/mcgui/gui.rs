@@ -1,7 +1,12 @@
 //! Bộ máy màn hình: Title, chọn world, tạo world, nhiều người chơi, Options (+ trang con), Game Menu, tải địa hình.
 use std::collections::HashMap;
 
-use super::{canvas::*, menu::*, worlds::*};
+use std::{
+    path::PathBuf,
+    sync::{Arc, Mutex},
+};
+
+use super::{canvas::*, menu::*, net, worlds::*};
 
 #[derive(Clone, PartialEq)]
 pub enum Screen {
@@ -14,6 +19,18 @@ pub enum Screen {
     Pause,
     Msg(String, String),
     Loading,
+    EditServer,
+    Direct,
+    ConfirmDelete(usize),
+    Connecting,
+    /// lý do bị ngắt kết nối (tiêu đề, nội dung)
+    Disc(String, String),
+}
+
+pub struct Server {
+    pub name: String,
+    pub addr: String,
+    pub st: Arc<Mutex<net::Status>>,
 }
 
 pub enum Ev {
@@ -268,6 +285,17 @@ pub struct Gui {
     cdiff: usize,
     ccheat: bool,
     quit_confirm: bool,
+    pub servers: Vec<Server>,
+    pub servers_path: Option<PathBuf>,
+    pub player_name: String,
+    sel_srv: Option<usize>,
+    edit_idx: Option<usize>,
+    edit_name: String,
+    edit_addr: String,
+    focus: usize,
+    shift: bool,
+    conn: Option<Arc<Mutex<Option<net::Login>>>>,
+    conn_t: f32,
 }
 
 impl Gui {
@@ -293,7 +321,70 @@ impl Gui {
             cdiff: 2,
             ccheat: false,
             quit_confirm: false,
+            servers: Vec::new(),
+            servers_path: None,
+            player_name: "Player".into(),
+            sel_srv: None,
+            edit_idx: None,
+            edit_name: String::new(),
+            edit_addr: String::new(),
+            focus: 0,
+            shift: false,
+            conn: None,
+            conn_t: 0.0,
         }
+    }
+
+    pub fn load_servers(&mut self, path: PathBuf) {
+        if let Ok(t) = std::fs::read_to_string(&path) {
+            for l in t.lines() {
+                if let Some((n, a)) = l.split_once('\t') {
+                    self.servers.push(Server { name: n.to_string(), addr: a.to_string(), st: Arc::new(Mutex::new(net::Status::default())) });
+                }
+            }
+        }
+        self.servers_path = Some(path);
+    }
+
+    fn save_servers(&self) {
+        if let Some(p) = &self.servers_path {
+            let t: String = self.servers.iter().map(|s| format!("{}\t{}\n", s.name.replace(['\t', '\n'], " "), s.addr.replace(['\t', '\n'], " "))).collect();
+            let _ = std::fs::write(p, t);
+        }
+    }
+
+    /// ping lại mọi server ở luồng nền
+    pub fn refresh_servers(&mut self) {
+        for s in &self.servers {
+            *s.st.lock().unwrap() = net::Status::default();
+            let (st, addr) = (s.st.clone(), s.addr.clone());
+            std::thread::spawn(move || {
+                let r = net::ping(&addr);
+                *st.lock().unwrap() = r;
+            });
+        }
+    }
+
+    fn ping_one(&mut self, i: usize) {
+        let s = &self.servers[i];
+        *s.st.lock().unwrap() = net::Status::default();
+        let (st, addr) = (s.st.clone(), s.addr.clone());
+        std::thread::spawn(move || {
+            let r = net::ping(&addr);
+            *st.lock().unwrap() = r;
+        });
+    }
+
+    fn join(&mut self, addr: String) {
+        let slot: Arc<Mutex<Option<net::Login>>> = Arc::new(Mutex::new(None));
+        self.conn = Some(slot.clone());
+        self.conn_t = 0.0;
+        let name = self.player_name.clone();
+        std::thread::spawn(move || {
+            let r = net::login(&addr, &name);
+            *slot.lock().unwrap() = Some(r);
+        });
+        self.open(Screen::Connecting);
     }
 
     pub fn get(&self, k: &str) -> f32 {
@@ -338,7 +429,7 @@ impl Gui {
         if self.in_game {
             d.gradient(0.0, 0.0, w, h, 0xc0101010, 0xd0101010);
         } else {
-            panorama_bg(d, self.t);
+            panorama_bg(d, self.t, 5.0);
             d.fill(0.0, 0.0, w, h, 0x00000040);
         }
         let _ = list;
@@ -392,7 +483,10 @@ impl Gui {
                         self.open(Screen::Worlds);
                         self.set_worlds(scan("/sdcard/RustVoxel"));
                     }
-                    Some(TitleAction::Multiplayer) => self.open(Screen::Multi),
+                    Some(TitleAction::Multiplayer) => {
+                        self.open(Screen::Multi);
+                        self.refresh_servers();
+                    }
                     Some(TitleAction::Realms) => {
                         self.open(Screen::Msg("Minecraft Realms".into(), "Realms is not available in this build.".into()));
                     }
@@ -432,24 +526,67 @@ impl Gui {
                 }
                 ev.take()
             }
-            Screen::Multi => {
-                self.background(d, true);
-                self.header(d, "Play Multiplayer", 15.0);
-                self.list_area(d, 32.0, h - 64.0);
-                let msg = "Scanning for games on your local network";
-                d.text_centered(msg, cx, 32.0 + 8.0, GRAY);
-                let dots = ["O o o", "o O o", "o o O", "o O o"][((self.t * 4.0) as usize) % 4];
-                d.text_centered(dots, cx, 32.0 + 8.0 + 9.0 + 2.0, GRAY);
-                let (y1, y2) = (h - 52.0, h - 28.0);
-                let _ = button(d, p, [cx - 154.0, y1, 100.0, 20.0], "Join Server", false);
-                let _ = button(d, p, [cx - 50.0, y1, 100.0, 20.0], "Direct Connection", true);
-                if button(d, p, [cx + 54.0, y1, 100.0, 20.0], "Add Server", true) {
-                    self.open(Screen::Msg("Add Server".into(), "Multiplayer is not available in this build.".into()));
+            Screen::Multi => self.multi_screen(d, p, w, h, cx),
+            Screen::EditServer => self.edit_screen(d, p, w, h, cx, false),
+            Screen::Direct => self.edit_screen(d, p, w, h, cx, true),
+            Screen::ConfirmDelete(i) => {
+                self.background(d, false);
+                let nm = self.servers.get(i).map(|s| s.name.clone()).unwrap_or_default();
+                d.text_centered("Are you sure you want to remove this server?", cx, 70.0, WHITE);
+                d.text_centered(&format!("'{nm}' will be lost forever! (A long time!)"), cx, 84.0, GRAY);
+                let y = (h / 6.0).floor() + 96.0;
+                if button(d, p, [cx - 155.0, y, 150.0, 20.0], "Delete", true) {
+                    if i < self.servers.len() {
+                        self.servers.remove(i);
+                        self.save_servers();
+                    }
+                    self.sel_srv = None;
+                    self.back();
                 }
-                let _ = button(d, p, [cx - 154.0, y2, 70.0, 20.0], "Edit", false);
-                let _ = button(d, p, [cx - 74.0, y2, 70.0, 20.0], "Delete", false);
-                let _ = button(d, p, [cx + 4.0, y2, 70.0, 20.0], "Refresh", true);
-                if button(d, p, [cx + 84.0, y2, 70.0, 20.0], "Back", true) {
+                if button(d, p, [cx + 5.0, y, 150.0, 20.0], "Cancel", true) {
+                    self.back();
+                }
+                None
+            }
+            Screen::Connecting => {
+                self.background(d, false);
+                self.conn_t += dt;
+                d.text_centered("Connecting to the server...", cx, 70.0, WHITE);
+                let dots = ".".repeat(1 + (self.conn_t * 2.0) as usize % 3);
+                d.text_centered(&format!("Logging in{dots}"), cx, 84.0, GRAY);
+                let done = self.conn.as_ref().and_then(|c| c.lock().unwrap().take());
+                if let Some(r) = done {
+                    self.conn = None;
+                    self.stack.pop();
+                    match r {
+                        net::Login::Disconnected(m) => self.screen = Screen::Disc("Disconnected".into(), m),
+                        net::Login::NeedsAuth => {
+                            self.screen = Screen::Disc("Failed to log in".into(), "This server is in online mode and needs Mojang session authentication (encryption), which is not supported in this build yet.".into())
+                        }
+                        net::Login::Failed(e) => self.screen = Screen::Disc("Failed to connect to the server".into(), e),
+                        net::Login::Success { name } => {
+                            self.screen = Screen::Disc("Connected".into(), format!("The server accepted the login as {name}. Joining the world (chunks and entities) is not implemented in this build yet."))
+                        }
+                    }
+                    return None;
+                }
+                if button(d, p, [cx - 100.0, (h / 4.0).floor() + 132.0, 200.0, 20.0], "Cancel", true) {
+                    self.conn = None;
+                    self.back();
+                }
+                None
+            }
+            Screen::Disc(t, m) => {
+                self.background(d, false);
+                self.header(d, &t, 70.0);
+                let mut y = 90.0;
+                for para in m.split('\n') {
+                    for l in wrap(d, para, 300.0) {
+                        d.text_centered(&l, cx, y, WHITE);
+                        y += 12.0;
+                    }
+                }
+                if button(d, p, [cx - 100.0, y.max((h / 6.0).floor() + 96.0 + 24.0) + 12.0, 200.0, 20.0], "Back to Server List", true) {
                     self.back();
                 }
                 None
@@ -543,6 +680,290 @@ impl Gui {
                 }
                 None
             }
+        }
+    }
+
+    fn multi_screen(&mut self, d: &mut Draw, p: &Ptr, w: f32, h: f32, cx: f32) -> Option<Ev> {
+        self.background(d, true);
+        self.header(d, "Play Multiplayer", 15.0);
+        let (top, bottom) = (32.0, h - 64.0);
+        self.list_area(d, top, bottom);
+        let row_h = 36.0;
+        let rw = 305.0;
+        let rx = cx - rw / 2.0;
+        let total = self.servers.len() as f32 * row_h + 4.0;
+        let view = bottom - top;
+        let maxs = (total - view).max(0.0);
+        if p.down.map_or(false, |q| q.1 > top && q.1 < bottom) {
+            self.scroll = (self.scroll - p.dy).clamp(0.0, maxs);
+        }
+        self.scroll = self.scroll.clamp(0.0, maxs);
+        let mut join: Option<String> = None;
+        d.c.set_clip(Some([0.0, top * d.k, w * d.k, view * d.k]));
+        if self.servers.is_empty() {
+            d.text_centered("Scanning for games on your local network", cx, top + 8.0, GRAY);
+            let dots = ["O o o", "o O o", "o o O", "o O o"][((self.t * 4.0) as usize) % 4];
+            d.text_centered(dots, cx, top + 19.0, GRAY);
+        }
+        let t = self.t;
+        for i in 0..self.servers.len() {
+            let y = top + 4.0 + i as f32 * row_h - self.scroll;
+            if y + row_h < top || y > bottom {
+                continue;
+            }
+            if self.sel_srv == Some(i) {
+                d.fill(rx - 2.0, y - 2.0, rw + 4.0, row_h, 0xffffffff);
+                d.fill(rx - 1.0, y - 1.0, rw + 2.0, row_h - 2.0, 0x000000ff);
+            }
+            let (name, addr) = (self.servers[i].name.clone(), self.servers[i].addr.clone());
+            let mut st = self.servers[i].st.lock().unwrap();
+            // icon
+            if let Some(img) = st.icon.take() {
+                let idx = d.c.add_image(img.w, img.h, &img.rgba);
+                if idx != usize::MAX {
+                    st.icon_tex = Some(idx);
+                } else {
+                    st.icon = Some(img);
+                }
+            }
+            match st.icon_tex {
+                Some(tx) => d.blit(tx, [rx, y, 32.0, 32.0], [0.0, 0.0, 64.0, 64.0], WHITE),
+                None => {
+                    if let Some(tx) = d.a.world_icon {
+                        d.blit_logical(tx, [rx, y, 32.0, 32.0], [0.0, 0.0, 64.0, 64.0], 64.0, 64.0, WHITE);
+                    }
+                }
+            }
+            d.text(&name, rx + 35.0, y + 1.0, WHITE);
+            let mismatch = st.state == 1 && st.protocol != 0 && st.protocol != net::PROTOCOL as i64;
+            // ping / số người
+            let (ping_sprite, right_text): (String, String) = match st.state {
+                0 => (format!("server_list/pinging_{}", 1 + ((t * 5.0) as usize % 5)), String::new()),
+                1 => {
+                    let n = if st.ping_ms < 150 { 5 } else if st.ping_ms < 300 { 4 } else if st.ping_ms < 600 { 3 } else if st.ping_ms < 1000 { 2 } else { 1 };
+                    let txt = if mismatch { format!("§c{}", st.version) } else { format!("§7{}§8/§7{}", st.online, st.max) };
+                    (format!("server_list/ping_{n}"), txt)
+                }
+                _ => ("server_list/unreachable".to_string(), String::new()),
+            };
+            let spr = if mismatch { "server_list/incompatible".to_string() } else { ping_sprite };
+            if let Some(s) = d.a.sprites.get(&spr).copied() {
+                d.blit(s.tex, [rx + rw - 15.0, y, 10.0, 8.0], [0.0, 0.0, s.w, s.h], WHITE);
+            }
+            if !right_text.is_empty() {
+                let tw = d.text_width(&right_text);
+                d.text(&right_text, rx + rw - 17.0 - tw, y + 1.0, WHITE);
+            }
+            match st.state {
+                0 => {
+                    d.text("Pinging...", rx + 35.0, y + 12.0, 0x808080ff);
+                }
+                1 => {
+                    for (li, l) in st.motd.iter().enumerate() {
+                        let mut s = l.clone();
+                        while d.text_width(&s) > rw - 35.0 - 3.0 && !s.is_empty() {
+                            s.pop();
+                        }
+                        d.text(&s, rx + 35.0, y + 12.0 + li as f32 * 9.0, 0x808080ff);
+                    }
+                }
+                _ => {
+                    d.text("Can't connect to server", rx + 35.0, y + 12.0, 0xff5555ff);
+                    let mut e = st.error.clone();
+                    while d.text_width(&e) > rw - 38.0 && !e.is_empty() {
+                        e.pop();
+                    }
+                    d.text(&e, rx + 35.0, y + 21.0, 0x808080ff);
+                }
+            }
+            drop(st);
+            let _ = addr.len();
+            if let Some(tp) = p.tap {
+                if tp.0 >= rx && tp.0 < rx + rw && tp.1 >= y && tp.1 < y + row_h && tp.1 > top && tp.1 < bottom {
+                    if self.sel_srv == Some(i) && self.t - self.last_tap.1 < 0.5 && self.last_tap.0 == i {
+                        join = Some(addr);
+                    }
+                    self.sel_srv = Some(i);
+                    self.last_tap = (i, self.t);
+                }
+            }
+        }
+        d.c.set_clip(None);
+        if maxs > 0.0 {
+            let sx = cx + rw / 2.0 + 6.0;
+            let bh = ((view * view) / total).clamp(32.0, view - 8.0);
+            let by = top + (view - bh) * (self.scroll / maxs);
+            d.sprite("widget/scroller_background", sx, top, 6.0, view);
+            d.sprite("widget/scroller", sx, by, 6.0, bh);
+        }
+        let (y1, y2) = (h - 52.0, h - 28.0);
+        let have = self.sel_srv.is_some();
+        if button(d, p, [cx - 154.0, y1, 100.0, 20.0], "Join Server", have) {
+            if let Some(i) = self.sel_srv {
+                join = Some(self.servers[i].addr.clone());
+            }
+        }
+        if button(d, p, [cx - 50.0, y1, 100.0, 20.0], "Direct Connection", true) {
+            self.edit_addr.clear();
+            self.focus = 1;
+            self.open(Screen::Direct);
+        }
+        if button(d, p, [cx + 54.0, y1, 100.0, 20.0], "Add Server", true) {
+            self.edit_idx = None;
+            self.edit_name = "Minecraft Server".into();
+            self.edit_addr.clear();
+            self.focus = 1;
+            self.open(Screen::EditServer);
+        }
+        if button(d, p, [cx - 154.0, y2, 70.0, 20.0], "Edit", have) {
+            if let Some(i) = self.sel_srv {
+                self.edit_idx = Some(i);
+                self.edit_name = self.servers[i].name.clone();
+                self.edit_addr = self.servers[i].addr.clone();
+                self.focus = 0;
+                self.open(Screen::EditServer);
+            }
+        }
+        if button(d, p, [cx - 74.0, y2, 70.0, 20.0], "Delete", have) {
+            if let Some(i) = self.sel_srv {
+                self.open(Screen::ConfirmDelete(i));
+            }
+        }
+        if button(d, p, [cx + 4.0, y2, 70.0, 20.0], "Refresh", true) {
+            self.refresh_servers();
+        }
+        if button(d, p, [cx + 84.0, y2, 70.0, 20.0], "Back", true) {
+            self.back();
+        }
+        if let Some(a) = join {
+            self.join(a);
+        }
+        None
+    }
+
+    /// Màn sửa server / kết nối trực tiếp, kèm bàn phím trong game.
+    fn edit_screen(&mut self, d: &mut Draw, p: &Ptr, w: f32, h: f32, cx: f32, direct: bool) -> Option<Ev> {
+        let _ = w;
+        self.background(d, false);
+        self.header(d, if direct { "Direct Connection" } else { "Edit Server Info" }, 10.0);
+        let mut y = 24.0;
+        if !direct {
+            d.text("Server Name", cx - 100.0, y, 0xa0a0a0ff);
+            y += 11.0;
+            let r = [cx - 100.0, y, 200.0, 20.0];
+            self.field(d, p, r, 0);
+            y += 24.0;
+        }
+        d.text("Server Address", cx - 100.0, y, 0xa0a0a0ff);
+        y += 11.0;
+        let r = [cx - 100.0, y, 200.0, 20.0];
+        self.field(d, p, r, 1);
+        y += 26.0;
+        let ok = !self.edit_addr.trim().is_empty() && (direct || !self.edit_name.trim().is_empty());
+        let (lab_ok, lab_no) = if direct { ("Join Server", "Cancel") } else { ("Done", "Cancel") };
+        if button(d, p, [cx - 100.0, y, 98.0, 20.0], lab_ok, ok) {
+            if direct {
+                let a = self.edit_addr.trim().to_string();
+                self.back();
+                self.join(a);
+            } else {
+                let (n, a) = (self.edit_name.trim().to_string(), self.edit_addr.trim().to_string());
+                match self.edit_idx {
+                    Some(i) if i < self.servers.len() => {
+                        self.servers[i].name = n;
+                        self.servers[i].addr = a;
+                        self.save_servers();
+                        self.ping_one(i);
+                    }
+                    _ => {
+                        self.servers.push(Server { name: n, addr: a, st: Arc::new(Mutex::new(net::Status::default())) });
+                        self.save_servers();
+                        let i = self.servers.len() - 1;
+                        self.ping_one(i);
+                    }
+                }
+                self.back();
+            }
+            return None;
+        }
+        if button(d, p, [cx + 2.0, y, 98.0, 20.0], lab_no, true) {
+            self.back();
+            return None;
+        }
+        y += 28.0;
+        // bàn phím
+        let rows = ["1234567890", "qwertyuiop", "asdfghjkl"];
+        let kw = 19.0;
+        let mut ty = y;
+        for row in rows {
+            let x0 = cx - row.len() as f32 * kw / 2.0;
+            for (i, c) in row.chars().enumerate() {
+                let ch = if self.shift { c.to_ascii_uppercase() } else { c };
+                if button(d, p, [x0 + i as f32 * kw, ty, kw - 2.0, 18.0], &ch.to_string(), true) {
+                    self.type_char(ch, direct);
+                }
+            }
+            ty += 20.0;
+        }
+        let row = "zxcvbnm";
+        let x0 = cx - (row.len() as f32 * kw + 2.0 * 28.0) / 2.0;
+        if button(d, p, [x0, ty, 26.0, 18.0], "^", true) {
+            self.shift = !self.shift;
+        }
+        for (i, c) in row.chars().enumerate() {
+            let ch = if self.shift { c.to_ascii_uppercase() } else { c };
+            if button(d, p, [x0 + 28.0 + i as f32 * kw, ty, kw - 2.0, 18.0], &ch.to_string(), true) {
+                self.type_char(ch, direct);
+            }
+        }
+        if button(d, p, [x0 + 28.0 + row.len() as f32 * kw, ty, 26.0, 18.0], "<", true) {
+            self.buf(direct).pop();
+        }
+        ty += 20.0;
+        let specials = [(".", 1.0), (":", 1.0), ("-", 1.0), ("_", 1.0), (" ", 4.0), ("/", 1.0)];
+        let total: f32 = specials.iter().map(|s| s.1 * kw).sum();
+        let mut x = cx - total / 2.0;
+        for (s, wd) in specials {
+            let lab = if s == " " { "space" } else { s };
+            if button(d, p, [x, ty, wd * kw - 2.0, 18.0], lab, true) {
+                self.type_char(s.chars().next().unwrap(), direct);
+            }
+            x += wd * kw;
+        }
+        None
+    }
+
+    fn buf(&mut self, direct: bool) -> &mut String {
+        if direct || self.focus == 1 {
+            &mut self.edit_addr
+        } else {
+            &mut self.edit_name
+        }
+    }
+
+    fn type_char(&mut self, c: char, direct: bool) {
+        let b = self.buf(direct);
+        if b.chars().count() < 128 {
+            b.push(c);
+        }
+        self.shift = false;
+    }
+
+    fn field(&mut self, d: &mut Draw, p: &Ptr, r: [f32; 4], idx: usize) {
+        if inside(r, p.tap) {
+            self.focus = idx;
+        }
+        let on = self.focus == idx;
+        d.sprite(if on && d.has_sprite("widget/text_field_highlighted") { "widget/text_field_highlighted" } else { "widget/text_field" }, r[0], r[1], r[2], r[3]);
+        let mut s = if idx == 0 { self.edit_name.clone() } else { self.edit_addr.clone() };
+        let cur = on && (self.t * 2.0) as i32 % 2 == 0;
+        // cuộn: hiện phần cuối chuỗi
+        while d.text_width(&s) > r[2] - 12.0 && !s.is_empty() {
+            s.remove(0);
+        }
+        let ex = d.text(&s, r[0] + 4.0, r[1] + 6.0, 0xe0e0e0ff);
+        if cur {
+            d.text("_", ex, r[1] + 6.0, 0xe0e0e0ff);
         }
     }
 

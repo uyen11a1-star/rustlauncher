@@ -149,7 +149,7 @@ fn android_main(app: AndroidApp) {
         if matches!(mode, Mode::Menu) && egl.as_ref().map_or(false, |e| !e.surface.is_null()) {
             let jar = launcher.jar_slot.lock().unwrap().take();
             if let Some((path, id)) = jar {
-                match guirun::GuiRun::new(path, id, launcher.log.clone()) {
+                match guirun::GuiRun::new(path, id, launcher.log.clone(), launcher.root.clone()) {
                     Ok(r) => mode = Mode::Gui(Box::new(r)),
                     Err(e) => launcher.log.lock().unwrap().push(format!("LỖI mở giao diện game: {e}")),
                 }

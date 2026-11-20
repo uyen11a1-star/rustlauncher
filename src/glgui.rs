@@ -34,10 +34,9 @@ const PFS: &str = "#version 300 es
 precision highp float;
 in vec2 v_p;
 uniform sampler2D t0; uniform sampler2D t1; uniform sampler2D t2; uniform sampler2D t3; uniform sampler2D t4; uniform sampler2D t5;
-uniform vec3 u_f; uniform vec3 u_r; uniform vec3 u_u; uniform vec2 u_k; uniform float u_a;
+uniform vec3 u_f; uniform vec3 u_r; uniform vec3 u_u; uniform vec2 u_k; uniform float u_a; uniform vec2 u_b;
 out vec4 o;
-void main(){
-  vec3 d = u_f + u_r*(v_p.x*u_k.x) + u_u*(v_p.y*u_k.y);
+vec3 cube(vec3 d){
   vec3 a = abs(d); vec2 uv; vec4 c;
   if (a.y>=a.x && a.y>=a.z) { float s=1.0/a.y;
     if (d.y>0.0) { uv=vec2((d.x*s+1.0)/2.0,(d.z*s+1.0)/2.0); c=texture(t4,uv); }
@@ -49,7 +48,18 @@ void main(){
     if (d.x>0.0) { uv=vec2((1.0-d.z*s)/2.0,(1.0-d.y*s)/2.0); c=texture(t1,uv); }
     else { uv=vec2((1.0+d.z*s)/2.0,(1.0-d.y*s)/2.0); c=texture(t3,uv); }
   }
-  o = vec4(c.rgb, u_a);
+  return c.rgb;
+}
+void main(){
+  vec2 off[12] = vec2[12](vec2(0.5,0.0),vec2(0.25,0.433),vec2(-0.25,0.433),vec2(-0.5,0.0),vec2(-0.25,-0.433),vec2(0.25,-0.433),
+    vec2(1.0,0.0),vec2(0.5,0.866),vec2(-0.5,0.866),vec2(-1.0,0.0),vec2(-0.5,-0.866),vec2(0.5,-0.866));
+  vec3 sum = vec3(0.0); float n = 0.0;
+  for (int i = -1; i < 12; i++) {
+    vec2 p = v_p; if (i >= 0) p += off[i]*u_b;
+    vec3 d = u_f + u_r*(p.x*u_k.x) + u_u*(p.y*u_k.y);
+    sum += cube(d); n += 1.0;
+  }
+  o = vec4(sum/n, u_a);
 }";
 
 struct Cmd {
@@ -74,7 +84,7 @@ pub struct GlCanvas {
     verts: Vec<V>,
     cmds: Vec<Cmd>,
     // panorama chờ vẽ ngay (vẽ trước mọi thứ khác trong khung)
-    pano: Option<([usize; 6], f32, f32, f32, f32)>,
+    pano: Option<([usize; 6], f32, f32, f32, f32, f32)>,
     sizes: Vec<(f32, f32)>,
 }
 
@@ -167,8 +177,8 @@ impl GlCanvas {
             glDisable(GL_DEPTH_TEST);
             glDisable(GL_CULL_FACE);
             glDisable(GL_BLEND);
-            if let Some((faces, yaw, pitch, fov, alpha)) = self.pano {
-                self.draw_pano(&faces, yaw, pitch, fov, alpha);
+            if let Some((faces, yaw, pitch, fov, alpha, blur)) = self.pano {
+                self.draw_pano(&faces, yaw, pitch, fov, alpha, blur);
             }
             if self.verts.is_empty() {
                 return;
@@ -216,7 +226,7 @@ impl GlCanvas {
         }
     }
 
-    unsafe fn draw_pano(&mut self, faces: &[usize; 6], yaw: f32, pitch: f32, fov: f32, alpha: f32) {
+    unsafe fn draw_pano(&mut self, faces: &[usize; 6], yaw: f32, pitch: f32, fov: f32, alpha: f32, blur: f32) {
         let (y, p) = (yaw.to_radians(), pitch.to_radians());
         let f = [y.sin() * p.cos(), -p.sin(), y.cos() * p.cos()];
         let up = [y.sin() * p.sin(), p.cos(), y.cos() * p.sin()];
@@ -230,6 +240,7 @@ impl GlCanvas {
         glUniform3f(glGetUniformLocation(self.pprog, cs("u_u").as_ptr()), up[0], up[1], up[2]);
         glUniform2f(glGetUniformLocation(self.pprog, cs("u_k").as_ptr()), t * asp, t);
         glUniform1f(glGetUniformLocation(self.pprog, cs("u_a").as_ptr()), alpha);
+        glUniform2f(glGetUniformLocation(self.pprog, cs("u_b").as_ptr()), blur * 2.0 / self.w as f32, blur * 2.0 / self.h as f32);
         for (i, fi) in faces.iter().enumerate() {
             glActiveTexture(GL_TEXTURE0 + i as u32);
             glBindTexture(GL_TEXTURE_2D, self.texs[*fi]);
@@ -266,7 +277,13 @@ impl Canvas for GlCanvas {
     fn set_clip(&mut self, r: Option<[f32; 4]>) {
         self.clip = r;
     }
-    fn panorama(&mut self, faces: &[usize; 6], yaw: f32, pitch: f32, fov: f32, alpha: f32) {
-        self.pano = Some((*faces, yaw, pitch, fov, alpha));
+    fn panorama(&mut self, faces: &[usize; 6], yaw: f32, pitch: f32, fov: f32, alpha: f32, blur: f32) {
+        self.pano = Some((*faces, yaw, pitch, fov, alpha, blur));
+    }
+    fn add_image(&mut self, w: usize, h: usize, rgba: &[u8]) -> usize {
+        let t = upload(&Image { w, h, rgba: rgba.to_vec() }, false);
+        self.texs.push(t);
+        self.sizes.push((w as f32, h as f32));
+        self.texs.len() - 1
     }
 }

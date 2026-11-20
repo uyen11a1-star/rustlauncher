@@ -72,6 +72,7 @@ pub struct GuiRun {
     log: Arc<Mutex<Vec<String>>>,
     version: String,
     tz: i64,
+    root: PathBuf,
 }
 
 #[cfg(target_os = "android")]
@@ -109,7 +110,7 @@ fn tz_minutes() -> i64 {
 
 impl GuiRun {
     /// Cần context GL hiện hành. Mở jar, vẽ được màn Mojang ngay, nạp phần còn lại ở luồng nền.
-    pub fn new(jar_path: PathBuf, version: String, log: Arc<Mutex<Vec<String>>>) -> Result<GuiRun, String> {
+    pub fn new(jar_path: PathBuf, version: String, log: Arc<Mutex<Vec<String>>>, root: PathBuf) -> Result<GuiRun, String> {
         let jar = Arc::new(Jar::open(&jar_path)?);
         let assets = GuiAssets::mini(&*jar, &version);
         if assets.mojang.is_none() {
@@ -146,6 +147,7 @@ impl GuiRun {
             log,
             version,
             tz: tz_minutes(),
+            root,
         })
     }
 
@@ -190,6 +192,10 @@ impl GuiRun {
                         self.canvas = c;
                         let mut gui = Gui::new(&a.splashes, &self.version, now.elapsed().as_nanos() as u64 ^ self.tz as u64 ^ std::process::id() as u64);
                         gui.tz_min = self.tz;
+                        if let Some(acc) = crate::account::Accounts::load(&self.root).current() {
+                            gui.player_name = acc.name.clone();
+                        }
+                        gui.load_servers(self.root.join("servers.txt"));
                         self.gui = Some(gui);
                         self.assets = a;
                         self.loaded = true;

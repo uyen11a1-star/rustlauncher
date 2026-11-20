@@ -143,7 +143,7 @@ impl Title {
         self.t += dt;
         self.fade = (self.fade + dt).min(2.0);
         let (w, h) = d.size();
-        panorama_bg(d, self.t);
+        panorama_bg(d, self.t, 0.0);
         // logo
         let ui_a = (self.fade / 1.0).clamp(0.0, 1.0);
         let wa = with_alpha(WHITE, ui_a);
@@ -214,12 +214,12 @@ impl Title {
 }
 
 /// Nền panorama xoay chậm (như vanilla: 0.1°/tick, cúi 25° dao động nhẹ).
-pub fn panorama_bg(d: &mut Draw, t: f32) {
+pub fn panorama_bg(d: &mut Draw, t: f32, blur: f32) {
     if let Some(f) = d.a.pano {
         let spin = t * 20.0;
         let yaw = spin * 0.1;
         let pitch = (spin * 0.001).sin() * 5.0 + 25.0;
-        d.c.panorama(&f, yaw, pitch, 85.0, 1.0);
+        d.c.panorama(&f, yaw, pitch, 85.0, 1.0, blur * d.k);
     } else {
         let (w, h) = d.size();
         d.tiled_bg(d.a.bg, [0.0, 0.0, w, h], 0x404040ff);

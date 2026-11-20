@@ -29,7 +29,12 @@ pub trait Canvas {
     fn set_xf(&mut self, xf: Xf);
     fn set_clip(&mut self, r: Option<[f32; 4]>);
     /// panorama 6 mặt, camera xoay yaw/pitch (độ), góc nhìn dọc fov (độ), độ mờ alpha
-    fn panorama(&mut self, faces: &[usize; 6], yaw: f32, pitch: f32, fov: f32, alpha: f32);
+    /// `blur`: bán kính làm mờ (điểm ảnh thật), 0 = không mờ
+    fn panorama(&mut self, faces: &[usize; 6], yaw: f32, pitch: f32, fov: f32, alpha: f32, blur: f32);
+    /// thêm một ảnh động (ví dụ icon server); trả về chỉ số dùng với `quad`, hoặc usize::MAX nếu không hỗ trợ
+    fn add_image(&mut self, _w: usize, _h: usize, _rgba: &[u8]) -> usize {
+        usize::MAX
+    }
 }
 
 pub fn rgb(c: u32) -> u32 {

@@ -1,6 +1,7 @@
 //! Giải mã PNG tự viết (không xen kẽ): màu xám/RGB/bảng màu/kèm alpha, độ sâu 1-16 bit. Kết quả luôn là RGBA8.
 use crate::inflate;
 
+#[derive(Clone)]
 pub struct Image {
     pub w: usize,
     pub h: usize,
