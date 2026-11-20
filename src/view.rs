@@ -125,6 +125,7 @@ enum Role {
     Sprint,
     Exit,
     Bag,
+    Chat,
     /// ô thanh nhanh số i (khi túi đóng)
     Hot(usize),
     /// chạm trong màn hình túi đồ
@@ -218,6 +219,152 @@ pub struct View {
     /// chế độ nhiều người chơi: kênh gửi vị trí
     net: Option<std::sync::mpsc::Sender<crate::netplay::NetOut>>,
     kicked: Option<String>,
+    net_state: Option<crate::netplay::SharedState>,
+    /// các dòng chat đã nhận (đã đổi mã §) kèm lúc nhận
+    chat_log: Vec<(String, Instant)>,
+    chat_open: bool,
+    chat_text: String,
+    chat_tap: Option<(f32, f32)>,
+    kb: crate::keyboard::Keyboard,
+    sent_sel: usize,
+    others: HashMap<i32, Other>,
+    /// tên người chơi trên màn hình: (x, y, tên)
+    tags: Vec<(f32, f32, String)>,
+}
+
+/// Người chơi khác, vị trí hiển thị được làm mượt.
+struct Other {
+    pos: [f32; 3],
+    tgt: [f64; 3],
+    yaw: f32,
+    pitch: f32,
+    head: f32,
+    name: String,
+}
+
+fn lerp_ang(a: f32, b: f32, t: f32) -> f32 {
+    let mut d = (b - a) % 360.0;
+    if d > 180.0 {
+        d -= 360.0;
+    } else if d < -180.0 {
+        d += 360.0;
+    }
+    a + d * t
+}
+
+fn rect_chat(g: &Gfx) -> [f32; 4] {
+    let s = g.scale;
+    [g.w as f32 - 92.0 * s, 132.0 * s, 80.0 * s, 40.0 * s]
+}
+
+/// Màu mã § của Minecraft.
+fn mc_color(c: char) -> Option<u32> {
+    Some(match c {
+        '0' => 0x000000,
+        '1' => 0x0000aa,
+        '2' => 0x00aa00,
+        '3' => 0x00aaaa,
+        '4' => 0xaa0000,
+        '5' => 0xaa00aa,
+        '6' => 0xffaa00,
+        '7' => 0xaaaaaa,
+        '8' => 0x555555,
+        '9' => 0x5555ff,
+        'a' => 0x55ff55,
+        'b' => 0x55ffff,
+        'c' => 0xff5555,
+        'd' => 0xff55ff,
+        'e' => 0xffff55,
+        'f' => 0xffffff,
+        _ => return None,
+    })
+}
+
+/// Cắt một dòng có mã § thành các dòng vừa `maxw` pixel, giữ màu khi xuống dòng.
+fn wrap_legacy(g: &mut Gfx, text: &str, size: f32, maxw: f32) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut cur = String::new();
+    let mut plain = String::new();
+    let mut col = String::new();
+    let mut it = text.chars().peekable();
+    let mut word = String::new();
+    let mut wplain = String::new();
+    let mut flush = |g: &mut Gfx, word: &mut String, wplain: &mut String, cur: &mut String, plain: &mut String, lines: &mut Vec<String>, col: &str| {
+        if word.is_empty() {
+            return;
+        }
+        let try_w = g.text_width(&format!("{plain}{wplain}"), size);
+        if try_w > maxw && !plain.is_empty() {
+            lines.push(std::mem::take(cur));
+            plain.clear();
+            cur.push_str(col);
+        }
+        cur.push_str(word);
+        plain.push_str(wplain);
+        word.clear();
+        wplain.clear();
+    };
+    while let Some(c) = it.next() {
+        if c == '§' {
+            if let Some(n) = it.next() {
+                word.push('§');
+                word.push(n);
+                if n == 'r' {
+                    col.clear();
+                } else if mc_color(n).is_some() {
+                    col = format!("§{n}");
+                }
+            }
+        } else if c == ' ' {
+            word.push(c);
+            wplain.push(c);
+            let cl = col.clone();
+            flush(g, &mut word, &mut wplain, &mut cur, &mut plain, &mut lines, &cl);
+        } else {
+            word.push(c);
+            wplain.push(c);
+        }
+    }
+    let cl = col.clone();
+    flush(g, &mut word, &mut wplain, &mut cur, &mut plain, &mut lines, &cl);
+    if !cur.is_empty() || lines.is_empty() {
+        lines.push(cur);
+    }
+    lines
+}
+
+/// Vẽ chuỗi có mã § (màu) với bóng đổ; `a` là độ đậm 0..255.
+fn draw_legacy(g: &mut Gfx, x: f32, y: f32, size: f32, text: &str, a: u32) {
+    let mut col = 0xffffffu32;
+    let mut pen = x;
+    let mut seg = String::new();
+    let mut it = text.chars();
+    let mut emit = |g: &mut Gfx, seg: &mut String, col: u32, pen: &mut f32| {
+        if seg.is_empty() {
+            return;
+        }
+        let sh = ((col >> 2) & 0x3f3f3f) << 8 | a;
+        g.text(*pen + size / 9.0, y + size / 9.0, size, sh, seg);
+        *pen += g.text(*pen, y, size, col << 8 | a, seg);
+        seg.clear();
+    };
+    while let Some(c) = it.next() {
+        if c == '§' {
+            emit(g, &mut seg, col, &mut pen);
+            match it.next() {
+                Some('r') => col = 0xffffff,
+                Some(n) => {
+                    if let Some(c) = mc_color(n) {
+                        col = c;
+                    }
+                }
+                None => {}
+            }
+        } else {
+            seg.push(c);
+        }
+    }
+    emit(g, &mut seg, col, &mut pen);
 }
 
 /// Số lượng ở góc dưới-phải ô vật phẩm 16x16 (có bóng xám như vanilla), ẩn khi chỉ có 1.
@@ -435,6 +582,15 @@ impl View {
                 frozen: false,
                 net: d.net.clone(),
                 kicked: None,
+                net_state: d.net_state.clone(),
+                chat_log: Vec::new(),
+                chat_open: false,
+                chat_text: String::new(),
+                chat_tap: None,
+                kb: crate::keyboard::Keyboard::new(),
+                sent_sel: 0,
+                others: HashMap::new(),
+                tags: Vec::new(),
             })
         }
     }
@@ -478,6 +634,13 @@ impl View {
         if self.frozen {
             return;
         }
+        if self.chat_open {
+            // màn chat: chỉ nhận chạm cho nút/bàn phím (xử lý lúc vẽ)
+            if phase == Phase::Up {
+                self.chat_tap = Some((x, y));
+            }
+            return;
+        }
         match phase {
             Phase::Down => {
                 let hot = if self.inv_open { None } else { (0..9).find(|&i| inside(hot_slot_rect(g, i), x, y)) };
@@ -485,6 +648,8 @@ impl View {
                     Role::Exit
                 } else if inside(rect_bag(g), x, y) {
                     Role::Bag
+                } else if self.net.is_some() && !self.inv_open && inside(rect_chat(g), x, y) {
+                    Role::Chat
                 } else if self.inv_open {
                     Role::Ui
                 } else if let Some(i) = hot {
@@ -507,7 +672,7 @@ impl View {
                     self.ui_pt = (x, y);
                     // chạm vào ô khi tay đang trống: nhấc luôn lên để kéo thả
                     self.ui_down = (0..SLOTS).find(|&i| inside(inv_slot_rect(g, i), x, y)).map(|i| {
-                        let pick = self.inv.cursor.is_none() && self.inv.slots[i].is_some();
+                        let pick = self.net.is_none() && self.inv.cursor.is_none() && self.inv.slots[i].is_some();
                         if pick {
                             self.inv.click(i);
                         }
@@ -547,17 +712,25 @@ impl View {
                                 self.inv.stash();
                             }
                         }
+                        Role::Chat if inside(rect_chat(g), x, y) => {
+                            self.chat_open = true;
+                            self.chat_tap = None;
+                            self.kb.reset();
+                            self.touches.clear();
+                        }
                         Role::Hot(i) if inside(hot_slot_rect(g, i), x, y) => self.inv.sel = i,
                         Role::Look if t.moved < 14.0 * g.scale && t.t0.elapsed().as_secs_f32() < 0.3 && self.swing.is_none() => self.swing = Some(0.0),
                         Role::Ui => {
                             let up = (0..SLOTS).find(|&i| inside(inv_slot_rect(g, i), x, y));
+                            // nhiều người chơi: túi chỉ để xem (server giữ dữ liệu thật)
+                            let up = if self.net.is_some() { None } else { up };
                             match (self.ui_down.take(), up) {
                                 // đang cầm vật: thả vào ô dưới ngón tay
                                 (Some((_, false)), Some(u)) => self.inv.click(u),
                                 // kéo từ ô này sang ô khác: thả
                                 (Some((d, true)), Some(u)) if d != u => self.inv.click(u),
                                 // thả ra ngoài khung túi khi đang cầm: vứt bỏ
-                                (_, None) if self.inv.cursor.is_some() => {
+                                (_, None) if self.net.is_none() && self.inv.cursor.is_some() => {
                                     if !inside(inv_panel(g), x, y) {
                                         self.inv.cursor = None;
                                     }
@@ -580,12 +753,163 @@ impl View {
         }
     }
 
+    /// Lượt cuối (2D): tin nhắn, nút chat, và màn chat có bàn phím.
+    fn chat_pass(&mut self, g: &mut Gfx) {
+        if self.net.is_none() || self.inv_open {
+            return;
+        }
+        let s = g.scale;
+        let (w, h) = (g.w as f32, g.h as f32);
+        let size = 13.0 * s;
+        let lh = size * 1.25;
+        g.begin();
+        if !self.chat_open {
+            // tên người chơi gần đó
+            let ts = 12.0 * s;
+            for (x, y, name) in &self.tags {
+                let tw = g.text_width(name, ts);
+                g.rect(x - tw / 2.0 - 4.0 * s, y - ts * 1.3, tw + 8.0 * s, ts * 1.4, 0x00000080);
+                g.text(x - tw / 2.0, y - ts * 1.25, ts, 0xffffffff, name);
+            }
+            // tin gần đây ở góc trên-trái, mờ dần sau 9 giây
+            let maxw = w * 0.5;
+            let mut shown: Vec<(String, u32)> = Vec::new();
+            for (l, t) in self.chat_log.iter().rev().take(8) {
+                let age = t.elapsed().as_secs_f32();
+                if age > 10.0 {
+                    break;
+                }
+                let a = if age < 8.0 { 255 } else { (255.0 * (10.0 - age) / 2.0) as u32 };
+                for ln in wrap_legacy(g, l, size, maxw).into_iter().rev() {
+                    shown.push((ln, a));
+                }
+            }
+            shown.reverse();
+            let n = shown.len().min(10);
+            let y0 = 108.0 * s;
+            for (j, (ln, a)) in shown.iter().skip(shown.len() - n).enumerate() {
+                let y = y0 + j as f32 * lh;
+                g.rect(10.0 * s, y - 1.0, maxw + 4.0 * s, lh, 0x00000000 | (a * 100 / 255));
+                draw_legacy(g, 12.0 * s, y, size, ln, *a);
+            }
+            let r = rect_chat(g);
+            g.rect(r[0], r[1], r[2], r[3], 0x00000090);
+            let tw = g.text_width("Chat", 14.0 * s);
+            g.text(r[0] + (r[2] - tw) / 2.0, r[1] + (r[3] - 18.0 * s) / 2.0, 14.0 * s, 0xffffffff, "Chat");
+            g.end(None);
+            return;
+        }
+        // màn chat: nền tối, lịch sử, ô nhập, bàn phím chiếm nửa dưới
+        let tap = self.chat_tap.take();
+        g.rect(0.0, 0.0, w, h, 0x000000a0);
+        let kb_h = h * 0.52;
+        let kb_area = crate::ui::Rect::new(0.0, h - kb_h, w, kb_h);
+        let bar_h = 34.0 * s;
+        let bar_y = h - kb_h - bar_h - 6.0 * s;
+        let maxw = w - 24.0 * s;
+        let mut lines: Vec<String> = Vec::new();
+        for (l, _) in self.chat_log.iter().rev().take(30) {
+            for ln in wrap_legacy(g, l, size, maxw).into_iter().rev() {
+                lines.push(ln);
+            }
+            if lines.len() > 40 {
+                break;
+            }
+        }
+        let rows = (((bar_y - 12.0 * s) / lh) as usize).min(lines.len());
+        for j in 0..rows {
+            let y = bar_y - 8.0 * s - (j + 1) as f32 * lh;
+            draw_legacy(g, 12.0 * s, y, size, &lines[j], 255);
+        }
+        g.rect(8.0 * s, bar_y, w - 16.0 * s, bar_h, 0x000000d0);
+        g.rect(8.0 * s, bar_y, w - 16.0 * s, 2.0 * s, 0xffffffa0);
+        let shown_text = format!("{}_", self.chat_text);
+        let mut t = shown_text.as_str();
+        while g.text_width(t, size) > w - 40.0 * s && !t.is_empty() {
+            t = &t[t.chars().next().map_or(0, |c| c.len_utf8())..];
+        }
+        g.text(16.0 * s, bar_y + (bar_h - size * 1.2) / 2.0, size, 0xffffffff, t);
+        let mut send = false;
+        let mut close = false;
+        match self.kb.draw(g, kb_area, tap) {
+            Some(crate::keyboard::Kb::Ch(c)) => {
+                if self.chat_text.chars().count() < 256 {
+                    self.chat_text.push(c);
+                }
+            }
+            Some(crate::keyboard::Kb::Back) => {
+                self.chat_text.pop();
+            }
+            Some(crate::keyboard::Kb::Done) => send = true,
+            Some(crate::keyboard::Kb::Cancel) => close = true,
+            _ => {}
+        }
+        if send {
+            let t = self.chat_text.trim().to_string();
+            if !t.is_empty() {
+                if let Some(n) = &self.net {
+                    let _ = n.send(crate::netplay::NetOut::Chat(t));
+                }
+            }
+            self.chat_text.clear();
+            close = true;
+        }
+        if close {
+            self.chat_open = false;
+            self.chat_tap = None;
+        }
+        g.end(None);
+    }
+
     /// Vẽ một khung hình. Trả về true khi người dùng bấm Thoát.
     pub fn frame(&mut self, g: &mut Gfx) -> bool {
         let now = Instant::now();
         let dt = if self.frozen { 0.0 } else { (now - self.last).as_secs_f32().min(0.1) };
         self.last = now;
         let s = g.scale;
+        if let Some(st) = &self.net_state {
+            let (new, raw) = {
+                let mut g = st.lock().unwrap();
+                if g.inv_dirty {
+                    g.inv_dirty = false;
+                    for i in 0..SLOTS {
+                        self.inv.slots[i] = g.inv.get(i).copied().flatten().map(|(id, n)| crate::inv::Stack { item: id as u16, n });
+                    }
+                }
+                if let Some(h) = g.held.take() {
+                    self.inv.sel = h as usize;
+                    self.sent_sel = h as usize;
+                }
+                let raw: Vec<(i32, crate::netplay::Pl, String)> = g.players.iter().map(|(e, p)| (*e, p.clone(), g.names.get(&p.uuid).cloned().unwrap_or_default())).collect();
+                (std::mem::take(&mut g.chat), raw)
+            };
+            let k = (dt * 10.0).min(1.0);
+            self.others.retain(|e, _| raw.iter().any(|r| r.0 == *e));
+            for (e, p, name) in raw {
+                let o = self.others.entry(e).or_insert_with(|| Other { pos: [p.pos[0] as f32, p.pos[1] as f32, p.pos[2] as f32], tgt: p.pos, yaw: p.yaw, pitch: p.pitch, head: p.head, name: String::new() });
+                o.tgt = p.pos;
+                for j in 0..3 {
+                    o.pos[j] += (p.pos[j] as f32 - o.pos[j]) * k;
+                }
+                o.yaw = lerp_ang(o.yaw, p.yaw, k);
+                o.head = lerp_ang(o.head, p.head, k);
+                o.pitch += (p.pitch - o.pitch) * k;
+                o.name = name;
+            }
+            if self.inv.sel != self.sent_sel {
+                self.sent_sel = self.inv.sel;
+                if let Some(n) = &self.net {
+                    let _ = n.send(crate::netplay::NetOut::Held(self.inv.sel as u8));
+                }
+            }
+            for l in new {
+                self.chat_log.push((l, now));
+            }
+            let n = self.chat_log.len();
+            if n > 100 {
+                self.chat_log.drain(..n - 100);
+            }
+        }
 
         // tay / khối cầm: hạ xuống rồi nâng lên khi đổi vật; vung khi chạm
         let want = self.inv.held();
@@ -816,6 +1140,43 @@ impl View {
             }
             self.drawn_chunks = vis.len();
             self.drawn_verts = vis.iter().map(|c| c.nverts).sum();
+            // người chơi khác: thân Steve đứng yên, đầu quay theo hướng nhìn
+            self.tags.clear();
+            if !self.others.is_empty() {
+                glDisable(GL_CULL_FACE);
+                glBindTexture(GL_TEXTURE_2D, self.skin_tex);
+                bind(&self.body_gpu);
+                let hn = self.head_n;
+                let sc = 0.9375 / 16.0;
+                for o in self.others.values() {
+                    let base = math::chain(&[
+                        math::translate(o.pos[0], o.pos[1], o.pos[2]),
+                        math::rot_y((180.0 - o.yaw).to_radians()),
+                        math::scale(-sc, -sc, sc),
+                        math::translate(0.0, -24.0, 0.0),
+                    ]);
+                    let mb = math::mul(&mvp, &base);
+                    let mh = math::chain(&[mvp, base, math::rot_y((o.head - o.yaw).to_radians()), math::rot_x(o.pitch.to_radians())]);
+                    glUniformMatrix4fv(self.u_mvp, 1, 0, mh.as_ptr());
+                    glDrawElements(GL_TRIANGLES, hn, GL_UNSIGNED_INT, 0 as *const _);
+                    glUniformMatrix4fv(self.u_mvp, 1, 0, mb.as_ptr());
+                    glDrawElements(GL_TRIANGLES, self.body_gpu.count - hn, GL_UNSIGNED_INT, (hn as usize * 4) as *const _);
+                    if !o.name.is_empty() {
+                        let (x, y, z) = (o.pos[0], o.pos[1] + 2.1, o.pos[2]);
+                        let cw = mvp[3] * x + mvp[7] * y + mvp[11] * z + mvp[15];
+                        if cw > 0.1 && cw < 64.0 {
+                            let cx = (mvp[0] * x + mvp[4] * y + mvp[8] * z + mvp[12]) / cw;
+                            let cy = (mvp[1] * x + mvp[5] * y + mvp[9] * z + mvp[13]) / cw;
+                            if cx.abs() < 1.2 && cy.abs() < 1.2 {
+                                self.tags.push(((cx * 0.5 + 0.5) * g.w as f32, (0.5 - cy * 0.5) * g.h as f32, o.name.clone()));
+                            }
+                        }
+                    }
+                }
+                glBindTexture(GL_TEXTURE_2D, self.tex);
+                glEnable(GL_CULL_FACE);
+                glUniformMatrix4fv(self.u_mvp, 1, 0, mvp.as_ptr());
+            }
 
             // tay Steve / khối cầm: vẽ sau cùng, xoá độ sâu để không bị khối thế giới che
             if !self.inv_open {
@@ -914,7 +1275,7 @@ impl View {
                     let p = inv_panel(g);
                     self.quad(t, [p[0], p[1], p[2], p[3]], [0.0, 0.0, 176.0, 166.0], tw, th);
                 }
-            } else {
+            } else if !self.chat_open {
                 if let Some((t, tw, th, src)) = self.hot_tex {
                     let (bx, by) = hot_origin(g);
                     self.quad(t, [bx, by, 182.0 * k, 22.0 * k], src, tw, th);
@@ -986,7 +1347,7 @@ impl View {
                 attrs(self.items_gpu.vbo, self.items_gpu.ebo);
                 let draw = |item: u16, cx: f32, cy: f32, sz: f32, zoff: f32| {
                     if let Some(it) = self.items.get(item as usize) {
-                        let m = items::gui_matrix(w, h, cx, cy, sz, zoff);
+                        let m = if it.flat { items::flat_matrix(w, h, cx, cy, sz, zoff) } else { items::gui_matrix(w, h, cx, cy, sz, zoff) };
                         glUniformMatrix4fv(self.u_mvp, 1, 0, m.as_ptr());
                         glDrawElements(GL_TRIANGLES, it.gui.1, GL_UNSIGNED_INT, (it.gui.0 as usize * 4) as *const _);
                     }
@@ -1047,6 +1408,7 @@ impl View {
             }
         }
         g.end(None);
+        self.chat_pass(g);
         std::mem::take(&mut self.exit)
     }
 }

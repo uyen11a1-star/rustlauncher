@@ -60,6 +60,7 @@ impl Keyboard {
             plain('@'),
             plain('_'),
             plain('-'),
+            ("CÁCH".to_string(), 2.0, Kb::Ch(' ')),
             ("HỦY".to_string(), 1.8, Kb::Cancel),
             ("XONG".to_string(), 2.4, Kb::Done),
         ]);

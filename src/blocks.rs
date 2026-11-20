@@ -65,7 +65,7 @@ fn split_key(key: &str) -> (String, Vec<(String, String)>) {
     }
 }
 
-fn tint_for(name: &str) -> [u8; 3] {
+pub fn tint_for(name: &str) -> [u8; 3] {
     if name.contains("birch_leaves") {
         [128, 167, 85]
     } else if name.contains("spruce_leaves") {

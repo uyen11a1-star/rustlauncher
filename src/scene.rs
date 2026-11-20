@@ -50,6 +50,8 @@ pub struct SceneData {
     pub items: crate::items::Items,
     /// kênh gửi vị trí lên server (chế độ nhiều người chơi)
     pub net: Option<mpsc::Sender<crate::netplay::NetOut>>,
+    /// trạng thái từ server (chat, người chơi...)
+    pub net_state: Option<crate::netplay::SharedState>,
 }
 
 /// Tin từ luồng stream gửi sang luồng vẽ.
@@ -138,7 +140,7 @@ pub fn build_test(jar_path: &Path, log: &dyn Fn(String)) -> Result<SceneData, St
         log(m.clone());
     }
     log(format!("Dựng {} khối, {} đỉnh, mất {} ms", shown, mesh.v.len(), t0.elapsed().as_millis()));
-    Ok(SceneData { atlas: atlas.pixels, chunks: vec![ChunkMesh::new(mesh, 0, 0)], spawn: [7.0, 1.7, 4.0], stream: None, shapes: Vec::new(), col: Vec::new(), items, net: None })
+    Ok(SceneData { atlas: atlas.pixels, chunks: vec![ChunkMesh::new(mesh, 0, 0)], spawn: [7.0, 1.7, 4.0], stream: None, shapes: Vec::new(), col: Vec::new(), items, net: None, net_state: None })
 }
 
 /// Độ sáng 0..1 từ ánh sáng ô (lấy mức cao hơn giữa sáng trời và sáng khối), kèm một chút sáng nền.
@@ -645,7 +647,7 @@ pub fn build_world(jar_path: &Path, dir: &Path, radius: i32, log: &dyn Fn(String
     let (p2, s2) = (pos.clone(), stop.clone());
     std::thread::spawn(move || worker.run(jar, atlas, radius, p2, s2, tx));
     log(format!("Tổng thời gian dựng: {} ms", t0.elapsed().as_millis()));
-    Ok(SceneData { atlas: pixels, chunks, spawn: [center[0] as f32, y, center[2] as f32], stream: Some(Streamer { rx, pos, stop }), shapes, col, items, net: None })
+    Ok(SceneData { atlas: pixels, chunks, spawn: [center[0] as f32, y, center[2] as f32], stream: Some(Streamer { rx, pos, stop }), shapes, col, items, net: None, net_state: None })
 }
 
 /// Dựng cảnh từ server: chờ vị trí đầu tiên, rồi stream chunk nhận qua mạng.
@@ -654,7 +656,7 @@ pub fn build_net(jar_path: &Path, link: crate::netplay::Link, log: &dyn Fn(Strin
     let t0 = std::time::Instant::now();
     let jar = Jar::open(jar_path)?;
     let atlas = build_atlas(&jar, log)?;
-    let items = crate::items::build(&jar, &atlas, log);
+    let items = crate::items::build_net(&jar, &atlas, log);
     log(format!("Tài nguyên xong sau {} ms, chờ server...", t0.elapsed().as_millis()));
     // chờ gói đặt vị trí đầu tiên; gom chunk đến trước
     let mut early: Vec<NetIn> = Vec::new();
@@ -682,6 +684,13 @@ pub fn build_net(jar_path: &Path, link: crate::netplay::Link, log: &dyn Fn(Strin
     let pos = Arc::new(AtomicI64::new(pack(pcx, pcz)));
     let stop = Arc::new(AtomicBool::new(false));
     let net_tx = link.tx.clone();
+    let net_state = link.state.clone();
+    if let Ok(b) = jar.read("assets/minecraft/lang/en_us.json") {
+        if let Some(crate::json::Value::Obj(m)) = String::from_utf8(b).ok().and_then(|t| crate::json::parse(&t).ok()) {
+            let l: HashMap<String, String> = m.iter().filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string()))).collect();
+            let _ = crate::chat::LANG.set(l);
+        }
+    }
     // chunk/teleport đã nhận sớm: đẩy lại cho worker xử lý như bình thường (qua kênh nội bộ không cần; worker đọc link.rx)
     // nên đưa lại vào hàng bằng cách xử lý trực tiếp ở đây
     let mut ids: HashMap<String, u16> = HashMap::new();
@@ -708,5 +717,5 @@ pub fn build_net(jar_path: &Path, link: crate::netplay::Link, log: &dyn Fn(Strin
     let pixels = atlas.pixels.clone();
     let (p2, s2) = (pos.clone(), stop.clone());
     std::thread::spawn(move || worker.run(jar, atlas, 32, p2, s2, tx));
-    Ok(SceneData { atlas: pixels, chunks: Vec::new(), spawn: [sp[0] as f32, sp[1] as f32 + 1.62, sp[2] as f32], stream: Some(Streamer { rx, pos, stop }), shapes, col, items, net: Some(net_tx) })
+    Ok(SceneData { atlas: pixels, chunks: Vec::new(), spawn: [sp[0] as f32, sp[1] as f32 + 1.62, sp[2] as f32], stream: Some(Streamer { rx, pos, stop }), shapes, col, items, net: Some(net_tx), net_state: Some(net_state) })
 }

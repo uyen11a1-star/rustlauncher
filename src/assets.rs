@@ -55,12 +55,14 @@ pub struct Atlas {
 
 pub fn build_atlas(jar: &Jar, log: &dyn Fn(String)) -> Result<Atlas, String> {
     let prefix = "assets/minecraft/textures/block/";
-    let mut names: Vec<&String> = jar
-        .entries
-        .keys()
-        .filter(|n| n.starts_with(prefix) && n.ends_with(".png") && !n[prefix.len()..].contains('/'))
-        .collect();
+    let iprefix = "assets/minecraft/textures/item/";
+    let top = |p: &str, n: &String| n.starts_with(p) && n.ends_with(".png") && !n[p.len()..].contains('/');
+    let mut names: Vec<&String> = jar.entries.keys().filter(|n| top(prefix, n)).collect();
     names.sort();
+    // texture vật phẩm xếp sau texture khối (khóa "item/xxx") để không đổi vị trí của khối
+    let mut inames: Vec<&String> = jar.entries.keys().filter(|n| top(iprefix, n)).collect();
+    inames.sort();
+    names.extend(inames);
     let mut pixels = vec![0u8; ATLAS * ATLAS * 4];
     let mut tiles = HashMap::new();
     let mut opaque = HashSet::new();
@@ -90,8 +92,8 @@ pub fn build_atlas(jar: &Jar, log: &dyn Fn(String)) -> Result<Atlas, String> {
         }) {
             opaque.insert((tx, ty));
         }
-        let stem = &n[prefix.len()..n.len() - 4];
-        tiles.insert(stem.to_string(), (tx, ty));
+        let stem = if n.starts_with(iprefix) { format!("item/{}", &n[iprefix.len()..n.len() - 4]) } else { n[prefix.len()..n.len() - 4].to_string() };
+        tiles.insert(stem, (tx, ty));
         slot += 1;
     }
     log(format!("Atlas: {} texture, bỏ qua {} file.", tiles.len(), bad));

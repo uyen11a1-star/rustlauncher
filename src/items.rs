@@ -2,7 +2,7 @@
 use std::{collections::HashMap, f32::consts::PI};
 
 use crate::{
-    assets::{Atlas, BFace, Jar, Mesh, V},
+    assets::{bake, load_model, Atlas, BFace, Jar, Mesh, V},
     craft::Recipe,
     blocks::Resolver,
     json::{self, Value},
@@ -22,6 +22,8 @@ pub struct Item {
     /// (chỉ số đầu, số chỉ số) trong `Items::i`: bản vẽ icon GUI / bản cầm tay
     pub gui: (i32, i32),
     pub hand: (i32, i32),
+    /// hình phẳng (vật phẩm kiểu sprite): vẽ không xoay 3D
+    pub flat: bool,
 }
 
 pub struct Skin {
@@ -335,13 +337,169 @@ fn load_recipes(jar: &Jar, keys: &[String]) -> Vec<Recipe> {
     out
 }
 
+/// Tìm tên model đầu tiên trong định nghĩa items/<tên>.json (có thể lồng select/condition/composite...).
+fn find_model(v: &Value) -> Option<String> {
+    if let Some(m) = v.get("model") {
+        match m {
+            Value::Str(s) => return Some(s.clone()),
+            Value::Obj(_) => {
+                if let Some(r) = find_model(m) {
+                    return Some(r);
+                }
+            }
+            _ => {}
+        }
+    }
+    if let Some(Value::Str(s)) = v.get("base") {
+        return Some(s.clone());
+    }
+    for k in ["fallback", "on_false", "on_true"] {
+        if let Some(r) = v.get(k).and_then(find_model) {
+            return Some(r);
+        }
+    }
+    for k in ["cases", "entries", "models"] {
+        if let Some(a) = v.get(k).and_then(|a| a.as_arr()) {
+            for e in a {
+                if let Some(r) = find_model(e) {
+                    return Some(r);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn wear_slot(name: &str) -> i8 {
+    if name.ends_with("_helmet") || name == "carved_pumpkin" {
+        0
+    } else if name.ends_with("_chestplate") {
+        1
+    } else if name.ends_with("_leggings") {
+        2
+    } else if name.ends_with("_boots") {
+        3
+    } else {
+        -1
+    }
+}
+
+/// Danh sách vật phẩm theo ĐÚNG số id mạng của server (netitems.txt): khối có icon 3D, còn lại là sprite phẳng.
+fn build_net_list(jar: &Jar, atlas: &Atlas, m: &mut Mesh, lang: &Option<Value>) -> (Vec<Item>, Vec<i8>) {
+    let a_f = crate::assets::ATLAS as f32;
+    let tile = crate::assets::TILE as f32;
+    let mut list = Vec::new();
+    let mut wear = Vec::new();
+    let mut flat_n = 0;
+    let mut cube_n = 0;
+    for name in include_str!("netitems.txt").lines() {
+        let disp = lang
+            .as_ref()
+            .and_then(|l| l.get(&format!("item.minecraft.{name}")).or_else(|| l.get(&format!("block.minecraft.{name}"))))
+            .and_then(|n| n.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| pretty(name));
+        wear.push(wear_slot(name));
+        let mut item = Item { name: disp, gui: (0, 0), hand: (0, 0), flat: false };
+        if name == "air" {
+            list.push(item);
+            continue;
+        }
+        let mname = jar
+            .read(&format!("assets/minecraft/items/{name}.json"))
+            .ok()
+            .and_then(|b| String::from_utf8(b).ok())
+            .and_then(|t| json::parse(&t).ok())
+            .and_then(|v| find_model(&v))
+            .map(|s| s.trim_start_matches("minecraft:").to_string())
+            .unwrap_or_else(|| format!("item/{name}"));
+        let model = load_model(jar, &mname, 0).ok().or_else(|| load_model(jar, &format!("block/{name}"), 0).ok());
+        if let Some(md) = model.as_ref().filter(|md| !md.elements.is_empty()) {
+            let faces = bake(md, atlas, 0, 0);
+            if !faces.is_empty() {
+                let tint = crate::blocks::tint_for(name);
+                let col = |f: &BFace| if f.tint { tint } else { [255u8; 3] };
+                let a = m.i.len() as i32;
+                for f in &faces {
+                    let mut g = f.clone();
+                    g.shade = if (f.shade - 0.6).abs() < 0.01 { 0.8 } else if (f.shade - 0.8).abs() < 0.01 { 0.6 } else { f.shade };
+                    m.push_face(&g, [0.0; 3], col(f));
+                }
+                let b = m.i.len() as i32;
+                for f in &faces {
+                    m.push_face(f, [0.0; 3], col(f));
+                }
+                let c = m.i.len() as i32;
+                item.gui = (a, b - a);
+                item.hand = (b, c - b);
+                cube_n += 1;
+                list.push(item);
+                continue;
+            }
+        }
+        // sprite phẳng: các lớp layer0, layer1... của model
+        let mut layers: Vec<(usize, usize)> = Vec::new();
+        if let Some(md) = &model {
+            for k in 0..4 {
+                if let Some(t) = md.textures.get(&format!("layer{k}")) {
+                    let t = t.trim_start_matches("minecraft:");
+                    if let Some(&p) = atlas.tiles.get(t) {
+                        layers.push(p);
+                    }
+                }
+            }
+        }
+        if layers.is_empty() {
+            if let Some(&p) = atlas.tiles.get(&format!("item/{name}")).or_else(|| atlas.tiles.get(name)) {
+                layers.push(p);
+            }
+        }
+        if !layers.is_empty() {
+            let a = m.i.len() as i32;
+            for (li, (tx, ty)) in layers.iter().enumerate() {
+                let (u0, v0) = (*tx as f32 * tile / a_f, *ty as f32 * tile / a_f);
+                let (u1, v1) = (u0 + tile / a_f, v0 + tile / a_f);
+                let z = 0.5 + li as f32 * 0.002;
+                let base = m.v.len() as u32;
+                for (p, uv) in [([0.0, 0.0], [u0, v1]), ([1.0, 0.0], [u1, v1]), ([1.0, 1.0], [u1, v0]), ([0.0, 1.0], [u0, v0])] {
+                    m.v.push(V { p: [p[0], p[1], z], uv, c: [255; 4] });
+                }
+                m.i.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+            }
+            let b = m.i.len() as i32;
+            item.gui = (a, b - a);
+            item.hand = (a, b - a);
+            item.flat = true;
+            flat_n += 1;
+        }
+        list.push(item);
+    }
+    let _ = (flat_n, cube_n);
+    (list, wear)
+}
+
 pub fn build(jar: &Jar, atlas: &Atlas, log: &dyn Fn(String)) -> Items {
+    build_any(jar, atlas, log, false)
+}
+
+/// Bản cho nhiều người chơi: danh sách theo id vật phẩm mạng, không công thức chế tạo.
+pub fn build_net(jar: &Jar, atlas: &Atlas, log: &dyn Fn(String)) -> Items {
+    build_any(jar, atlas, log, true)
+}
+
+fn build_any(jar: &Jar, atlas: &Atlas, log: &dyn Fn(String), net: bool) -> Items {
     let mut res = Resolver::new(jar, atlas);
     let lang = jar.read("assets/minecraft/lang/en_us.json").ok().and_then(|b| String::from_utf8(b).ok()).and_then(|s| json::parse(&s).ok());
     let mut m = Mesh::default();
     let mut list = Vec::new();
     let mut keys: Vec<String> = Vec::new();
-    for key in KEYS.iter().copied() {
+    let mut net_wear: Vec<i8> = Vec::new();
+    if net {
+        let (l, w) = build_net_list(jar, atlas, &mut m, &lang);
+        list = l;
+        net_wear = w;
+    }
+    for key in KEYS.iter().copied().filter(|_| !net) {
         let st = res.state(&format!("minecraft:{key}"));
         if st.faces.is_empty() {
             continue;
@@ -360,7 +518,7 @@ pub fn build(jar: &Jar, atlas: &Atlas, log: &dyn Fn(String)) -> Items {
         }
         let c = m.i.len() as i32;
         let name = lang.as_ref().and_then(|l| l.get(&format!("block.minecraft.{key}"))).and_then(|n| n.as_str()).map(|s| s.to_string()).unwrap_or_else(|| pretty(key));
-        list.push(Item { name, gui: (a, b - a), hand: (b, c - b) });
+        list.push(Item { name, gui: (a, b - a), hand: (b, c - b), flat: false });
         keys.push(key.to_string());
     }
     let skin = load_skin(jar);
@@ -373,8 +531,8 @@ pub fn build(jar: &Jar, atlas: &Atlas, log: &dyn Fn(String)) -> Items {
         let r = [0.0, 0.0, t.w as f32, t.h as f32];
         (t, r)
     }).or_else(|| load_tex(jar, &["assets/minecraft/textures/gui/widgets.png"]).map(|t| (t, [0.0, 22.0, 24.0, 24.0])));
-    let recipes = load_recipes(jar, &keys);
-    let wear: Vec<i8> = keys.iter().map(|k| if k == "carved_pumpkin" { 0 } else { -1 }).collect();
+    let recipes = if net { Vec::new() } else { load_recipes(jar, &keys) };
+    let wear: Vec<i8> = if net { net_wear } else { keys.iter().map(|k| if k == "carved_pumpkin" { 0 } else { -1 }).collect() };
     let (hud, hud_tex) = match load_hud(jar).or_else(|| load_hud_old(jar)) {
         Some((h, t)) => (Some(h), t),
         None => (None, Vec::new()),
@@ -442,6 +600,11 @@ pub fn gui_matrix(w: f32, h: f32, cx: f32, cy: f32, sz: f32, zoff: f32) -> Mat4 
         math::scale(0.625, 0.625, 0.625),
         math::translate(-0.5, -0.5, -0.5),
     ])
+}
+
+/// Icon phẳng (sprite) trong GUI: hình vuông đơn vị 0..1 đặt tại (cx, cy), `sz` pixel mỗi cạnh, không xoay.
+pub fn flat_matrix(w: f32, h: f32, cx: f32, cy: f32, sz: f32, zoff: f32) -> Mat4 {
+    math::chain(&[ortho(w, h), math::translate(cx, cy, zoff), math::scale(sz, -sz, sz), math::translate(-0.5, -0.5, -0.5)])
 }
 
 /// Phép chiếu trực giao theo pixel màn hình (gốc trên-trái), z dương = gần người xem.

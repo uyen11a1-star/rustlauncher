@@ -10,7 +10,7 @@ use std::{
 };
 
 use crate::{
-    mcgui::net::{put_varint, rd_str, rd_varint, recv, send, Conn},
+    mcgui::net::{put_str, put_varint, rd_str, rd_varint, recv, send, Conn},
     netdata,
     world::{RawChunk, RawSection},
 };
@@ -27,11 +27,177 @@ pub enum NetIn {
 
 pub enum NetOut {
     Pos { x: f64, y: f64, z: f64, yaw: f32, pitch: f32, ground: bool },
+    /// tin nhắn; bắt đầu bằng '/' là lệnh
+    Chat(String),
+    /// chọn ô thanh nhanh 0..8
+    Held(u8),
 }
+
+/// Người chơi khác thấy được trong thế giới.
+#[derive(Clone)]
+pub struct Pl {
+    pub uuid: [u8; 16],
+    pub pos: [f64; 3],
+    pub yaw: f32,
+    pub pitch: f32,
+    pub head: f32,
+}
+
+/// Trạng thái nhận từ server, luồng đọc ghi vào, luồng vẽ lấy ra.
+#[derive(Default)]
+pub struct NetState {
+    /// dòng chat mới chưa hiện (đã đổi sang mã §)
+    pub chat: Vec<String>,
+    /// uuid -> tên người chơi (từ player_info)
+    pub names: std::collections::HashMap<[u8; 16], String>,
+    /// túi đồ theo bố cục của ta (46 ô); (id vật phẩm mạng, số lượng)
+    pub inv: Vec<Option<(u32, u8)>>,
+    pub inv_dirty: bool,
+    /// server đổi ô thanh nhanh đang chọn
+    pub held: Option<u8>,
+    pub players: std::collections::HashMap<i32, Pl>,
+}
+
+/// Ô của cửa sổ 0 (túi người chơi) -> ô của ta.
+fn win0_slot(s: i32) -> Option<usize> {
+    match s {
+        0 => Some(45),
+        1..=4 => Some(40 + s as usize),
+        5..=8 => Some(36 + (s - 5) as usize),
+        9..=35 => Some(s as usize),
+        36..=44 => Some((s - 36) as usize),
+        45 => Some(40),
+        _ => None,
+    }
+}
+
+/// Ô của gói set_player_inventory -> ô của ta.
+fn inv_slot(s: i32) -> Option<usize> {
+    match s {
+        0..=35 => Some(s as usize),
+        36 => Some(39),
+        37 => Some(38),
+        38 => Some(37),
+        39 => Some(36),
+        40 => Some(40),
+        _ => None,
+    }
+}
+
+fn set_inv(st: &SharedState, slot: Option<usize>, v: Option<(u32, u8)>) {
+    let Some(i) = slot else { return };
+    let mut g = st.lock().unwrap();
+    if g.inv.len() < 46 {
+        g.inv.resize(46, None);
+    }
+    g.inv[i] = v;
+    g.inv_dirty = true;
+}
+
+/// Bỏ qua vector chuyển động nén (lpVec3).
+fn skip_lpvec(b: &[u8], i: &mut usize) -> Option<()> {
+    let b0 = *b.get(*i)?;
+    *i += 1;
+    if b0 == 0 {
+        return Some(());
+    }
+    *i += 5;
+    if b0 & 4 != 0 {
+        rd_varint(b, i)?;
+    }
+    Some(())
+}
+
+fn rd_i16(b: &[u8], i: &mut usize) -> Option<i16> {
+    let s = b.get(*i..*i + 2)?;
+    *i += 2;
+    Some(i16::from_be_bytes([s[0], s[1]]))
+}
+
+fn ang(b: &[u8], i: &mut usize) -> f32 {
+    let v = b.get(*i).copied().unwrap_or(0) as i8;
+    *i += 1;
+    v as f32 * 360.0 / 256.0
+}
+
+/// Gói thực thể liên quan người chơi.
+fn entity_packet(id: i32, b: &[u8], st: &SharedState) -> Option<()> {
+    let mut i = 0;
+    match id {
+        0x01 => {
+            let eid = rd_varint(b, &mut i)?;
+            let uuid = uuid_at(b, &mut i)?;
+            let ty = rd_varint(b, &mut i)?;
+            if ty != 151 {
+                return Some(());
+            }
+            let (x, y, z) = (rd_f64(b, &mut i)?, rd_f64(b, &mut i)?, rd_f64(b, &mut i)?);
+            skip_lpvec(b, &mut i)?;
+            let pitch = ang(b, &mut i);
+            let yaw = ang(b, &mut i);
+            let head = ang(b, &mut i);
+            st.lock().unwrap().players.insert(eid, Pl { uuid, pos: [x, y, z], yaw, pitch, head: if head == 0.0 { yaw } else { head } });
+        }
+        0x4b => {
+            let n = rd_varint(b, &mut i)?;
+            let mut g = st.lock().unwrap();
+            for _ in 0..n {
+                let e = rd_varint(b, &mut i)?;
+                g.players.remove(&e);
+            }
+        }
+        0x33 | 0x34 | 0x36 => {
+            let eid = rd_varint(b, &mut i)?;
+            let mut d = [0.0f64; 3];
+            if id != 0x36 {
+                for k in 0..3 {
+                    d[k] = rd_i16(b, &mut i)? as f64 / 4096.0;
+                }
+            }
+            let look = if id != 0x33 { Some((ang(b, &mut i), ang(b, &mut i))) } else { None };
+            let mut g = st.lock().unwrap();
+            if let Some(p) = g.players.get_mut(&eid) {
+                for k in 0..3 {
+                    p.pos[k] += d[k];
+                }
+                if let Some((y, pi)) = look {
+                    p.yaw = y;
+                    p.pitch = pi;
+                }
+            }
+        }
+        0x7b | 0x23 => {
+            let eid = rd_varint(b, &mut i)?;
+            let (x, y, z) = (rd_f64(b, &mut i)?, rd_f64(b, &mut i)?, rd_f64(b, &mut i)?);
+            i += 24;
+            let (yaw, pitch) = (rd_f32(b, &mut i)?, rd_f32(b, &mut i)?);
+            let flags = if id == 0x7b { rd_i32(b, &mut i)? as u32 } else { 0 };
+            let mut g = st.lock().unwrap();
+            if let Some(p) = g.players.get_mut(&eid) {
+                let r = |bit: u32, new: f64, old: f64| if flags & (1 << bit) != 0 { old + new } else { new };
+                p.pos = [r(0, x, p.pos[0]), r(1, y, p.pos[1]), r(2, z, p.pos[2])];
+                p.yaw = r(3, yaw as f64, p.yaw as f64) as f32;
+                p.pitch = r(4, pitch as f64, p.pitch as f64) as f32;
+            }
+        }
+        0x51 => {
+            let eid = rd_varint(b, &mut i)?;
+            let h = ang(b, &mut i);
+            if let Some(p) = st.lock().unwrap().players.get_mut(&eid) {
+                p.head = h;
+            }
+        }
+        _ => {}
+    }
+    Some(())
+}
+
+pub type SharedState = Arc<Mutex<NetState>>;
 
 pub struct Link {
     pub rx: Receiver<NetIn>,
     pub tx: Sender<NetOut>,
+    pub state: SharedState,
     guard: TcpStream,
 }
 
@@ -369,6 +535,8 @@ pub fn start(conn: Conn) -> Result<Link, String> {
     let (tx_out, rx_out) = mpsc::channel::<NetOut>();
     let cur: Arc<Mutex<[f64; 5]>> = Arc::new(Mutex::new([0.0; 5]));
     let alive = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let state: SharedState = Default::default();
+    let st2 = state.clone();
 
     // luồng ghi: gửi vị trí
     {
@@ -378,7 +546,37 @@ pub fn start(conn: Conn) -> Result<Link, String> {
                 if !alive.load(std::sync::atomic::Ordering::Relaxed) {
                     break;
                 }
-                let NetOut::Pos { x, y, z, yaw, pitch, ground } = m;
+                let (x, y, z, yaw, pitch, ground) = match m {
+                    NetOut::Pos { x, y, z, yaw, pitch, ground } => (x, y, z, yaw, pitch, ground),
+                    NetOut::Held(h) => {
+                        if wsend(&wr, 0x34, &(h as i16).to_be_bytes()).is_err() {
+                            break;
+                        }
+                        continue;
+                    }
+                    NetOut::Chat(t) => {
+                        let mut b = Vec::new();
+                        if let Some(c) = t.strip_prefix('/') {
+                            put_str(&mut b, c);
+                            if wsend(&wr, 0x06, &b).is_err() {
+                                break;
+                            }
+                        } else {
+                            put_str(&mut b, &t);
+                            let ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64);
+                            b.extend_from_slice(&ms.to_be_bytes());
+                            b.extend_from_slice(&0i64.to_be_bytes());
+                            b.push(0); // không chữ ký
+                            put_varint(&mut b, 0);
+                            b.extend_from_slice(&[0, 0, 0]);
+                            b.push(0);
+                            if wsend(&wr, 0x08, &b).is_err() {
+                                break;
+                            }
+                        }
+                        continue;
+                    }
+                };
                 *cur.lock().unwrap() = [x, y, z, yaw as f64, pitch as f64];
                 let mut b = Vec::with_capacity(34);
                 for v in [x, y, z] {
@@ -398,16 +596,16 @@ pub fn start(conn: Conn) -> Result<Link, String> {
     std::thread::spawn(move || {
         let mut s = rs;
         let comp = conn.comp;
-        let res = reader(&mut s, comp, &wr, &tx_in, &cur);
+        let res = reader(&mut s, comp, &wr, &tx_in, &cur, &st2);
         alive.store(false, std::sync::atomic::Ordering::Relaxed);
         if let Err(e) = res {
             let _ = tx_in.send(NetIn::Kick(e));
         }
     });
-    Ok(Link { rx: rx_in, tx: tx_out, guard })
+    Ok(Link { rx: rx_in, tx: tx_out, state, guard })
 }
 
-fn reader(s: &mut TcpStream, comp: bool, wr: &Shared, tx: &Sender<NetIn>, cur: &Arc<Mutex<[f64; 5]>>) -> Result<(), String> {
+fn reader(s: &mut TcpStream, comp: bool, wr: &Shared, tx: &Sender<NetIn>, cur: &Arc<Mutex<[f64; 5]>>, st: &SharedState) -> Result<(), String> {
     let mut ctx = Ctx { min_y: -64, height: 384, dims: Vec::new(), biome_bits: 6, keys: Default::default() };
     // ---- giai đoạn cấu hình ----
     wsend(wr, 0x00, &client_info())?;
@@ -502,6 +700,89 @@ fn reader(s: &mut TcpStream, comp: bool, wr: &Shared, tx: &Sender<NetIn>, cur: &
                     wsend(wr, 0x2b, &[])?;
                 }
             }
+            0x77 => {
+                let mut j = 0;
+                if let Some(t) = crate::chat::read_nbt(&b, &mut j) {
+                    let action_bar = b.get(j).copied().unwrap_or(0) != 0;
+                    if !action_bar {
+                        st.lock().unwrap().chat.push(crate::chat::to_legacy(&t));
+                    }
+                }
+            }
+            0x21 => {
+                let mut j = 0;
+                if let Some(m) = crate::chat::read_nbt(&b, &mut j) {
+                    let kind = rd_varint(&b, &mut j).unwrap_or(1).saturating_sub(1) as usize;
+                    let name = crate::chat::read_nbt(&b, &mut j).map(|t| crate::chat::to_legacy(&t)).unwrap_or_default();
+                    st.lock().unwrap().chat.push(crate::chat::typed(kind, &name, &crate::chat::to_legacy(&m)));
+                }
+            }
+            0x3f => {
+                if let Some(line) = parse_player_chat(&b, st) {
+                    st.lock().unwrap().chat.push(line);
+                }
+            }
+            0x44 => parse_player_info(&b, st),
+            0x01 | 0x4b | 0x33 | 0x34 | 0x36 | 0x7b | 0x23 | 0x51 => {
+                let _ = entity_packet(id, &b, st);
+            }
+            0x12 => {
+                let win = rd_varint(&b, &mut i).unwrap_or(-1);
+                rd_varint(&b, &mut i);
+                if win == 0 {
+                    let n = rd_varint(&b, &mut i).unwrap_or(0);
+                    let mut inv: Vec<Option<(u32, u8)>> = vec![None; 46];
+                    let mut ok = true;
+                    for k in 0..n {
+                        match crate::slot::read_slot(&b, &mut i) {
+                            Some(v) => {
+                                if let Some(o) = win0_slot(k) {
+                                    inv[o] = v;
+                                }
+                            }
+                            None => {
+                                ok = false;
+                                break;
+                            }
+                        }
+                    }
+                    let mut g = st.lock().unwrap();
+                    if ok || g.inv.len() < 46 {
+                        g.inv = inv;
+                        g.inv_dirty = true;
+                    }
+                }
+            }
+            0x14 => {
+                let win = rd_varint(&b, &mut i).unwrap_or(-1);
+                rd_varint(&b, &mut i);
+                let slot = rd_i16(&b, &mut i).unwrap_or(-1) as i32;
+                if win == 0 {
+                    if let Some(v) = crate::slot::read_slot(&b, &mut i) {
+                        set_inv(st, win0_slot(slot), v);
+                    }
+                }
+            }
+            0x6a => {
+                let slot = rd_varint(&b, &mut i).unwrap_or(-1);
+                if let Some(v) = crate::slot::read_slot(&b, &mut i) {
+                    set_inv(st, inv_slot(slot), v);
+                }
+            }
+            0x67 => {
+                let h = rd_varint(&b, &mut i).unwrap_or(0).clamp(0, 8) as u8;
+                st.lock().unwrap().held = Some(h);
+            }
+            0x43 => {
+                let n = rd_varint(&b, &mut i).unwrap_or(0);
+                let mut g = st.lock().unwrap();
+                for _ in 0..n {
+                    if let Some(u) = b.get(i..i + 16) {
+                        g.names.remove(<&[u8; 16]>::try_from(u).unwrap());
+                    }
+                    i += 16;
+                }
+            }
             0x46 => {
                 let tid = rd_varint(&b, &mut i).unwrap_or(0);
                 let (x, y, z) = (rd_f64(&b, &mut i).unwrap_or(0.0), rd_f64(&b, &mut i).unwrap_or(0.0), rd_f64(&b, &mut i).unwrap_or(0.0));
@@ -527,6 +808,108 @@ fn reader(s: &mut TcpStream, comp: bool, wr: &Shared, tx: &Sender<NetIn>, cur: &
                 let _ = tx.send(NetIn::Tp { x: nx, y: ny, z: nz, yaw: nyaw, pitch: npitch });
             }
             _ => {}
+        }
+    }
+}
+
+fn uuid_at(b: &[u8], i: &mut usize) -> Option<[u8; 16]> {
+    let u: [u8; 16] = b.get(*i..*i + 16)?.try_into().ok()?;
+    *i += 16;
+    Some(u)
+}
+
+fn parse_player_chat(b: &[u8], st: &SharedState) -> Option<String> {
+    let mut i = 0;
+    rd_varint(b, &mut i)?;
+    let uuid = uuid_at(b, &mut i)?;
+    rd_varint(b, &mut i)?;
+    if *b.get(i)? != 0 {
+        i += 1 + 256;
+    } else {
+        i += 1;
+    }
+    let plain = rd_str(b, &mut i)?;
+    i += 16;
+    for _ in 0..rd_varint(b, &mut i)? {
+        if rd_varint(b, &mut i)? == 0 {
+            i += 256;
+        }
+    }
+    let mut msg = plain;
+    if *b.get(i)? != 0 {
+        i += 1;
+        let t = crate::chat::read_nbt(b, &mut i)?;
+        msg = crate::chat::to_legacy(&t);
+    } else {
+        i += 1;
+    }
+    if rd_varint(b, &mut i)? == 2 {
+        for _ in 0..rd_varint(b, &mut i)? {
+            i += 8;
+        }
+    }
+    let kind = rd_varint(b, &mut i)?.saturating_sub(1) as usize;
+    let name = match crate::chat::read_nbt(b, &mut i) {
+        Some(t) => crate::chat::to_legacy(&t),
+        None => st.lock().unwrap().names.get(&uuid).cloned().unwrap_or_default(),
+    };
+    Some(crate::chat::typed(kind, &name, &msg))
+}
+
+fn parse_player_info(b: &[u8], st: &SharedState) {
+    let mut i = 0;
+    let Some(&act) = b.first() else { return };
+    i += 1;
+    let Some(n) = rd_varint(b, &mut i) else { return };
+    for _ in 0..n {
+        let Some(u) = uuid_at(b, &mut i) else { return };
+        if act & 1 != 0 {
+            let Some(name) = rd_str(b, &mut i) else { return };
+            let Some(np) = rd_varint(b, &mut i) else { return };
+            for _ in 0..np {
+                if rd_str(b, &mut i).is_none() || rd_str(b, &mut i).is_none() {
+                    return;
+                }
+                let Some(&has) = b.get(i) else { return };
+                i += 1;
+                if has != 0 && rd_str(b, &mut i).is_none() {
+                    return;
+                }
+            }
+            st.lock().unwrap().names.insert(u, name);
+        }
+        if act & 2 != 0 {
+            let Some(&has) = b.get(i) else { return };
+            i += 1;
+            if has != 0 {
+                i += 16 + 8;
+                for _ in 0..2 {
+                    let Some(l) = rd_varint(b, &mut i) else { return };
+                    i += l as usize;
+                }
+            }
+        }
+        if act & 4 != 0 {
+            rd_varint(b, &mut i);
+        }
+        if act & 8 != 0 {
+            i += 1;
+        }
+        if act & 16 != 0 {
+            rd_varint(b, &mut i);
+        }
+        if act & 32 != 0 {
+            let Some(&has) = b.get(i) else { return };
+            i += 1;
+            if has != 0 && crate::chat::read_nbt(b, &mut i).is_none() {
+                return;
+            }
+        }
+        if act & 64 != 0 {
+            rd_varint(b, &mut i);
+        }
+        if act & 128 != 0 {
+            i += 1;
         }
     }
 }

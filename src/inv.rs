@@ -31,10 +31,8 @@ pub struct Inv {
 impl Inv {
     /// Túi thử nghiệm: 36 vật phẩm đầu mỗi loại một ô 64 cái (thanh nhanh trước); các vật còn lại chỉ có qua chế tạo.
     pub fn new(n_items: usize, wear: Vec<i8>, recipes: Vec<Recipe>) -> Inv {
-        let mut slots = [None; SLOTS];
-        for (i, s) in slots.iter_mut().enumerate().take(n_items.min(STORE)) {
-            *s = Some(Stack { item: i as u16, n: MAX_STACK });
-        }
+        let _ = n_items;
+        let slots = [None; SLOTS];
         Inv { slots, sel: 0, cursor: None, wear, recipes }
     }
 

@@ -8,6 +8,7 @@ use android_activity::{
 
 mod assets;
 mod blocks;
+mod chat;
 mod craft;
 mod gfx;
 mod gles;
@@ -28,6 +29,7 @@ mod perm;
 mod phys;
 mod png;
 mod scene;
+mod slot;
 mod screen;
 mod view;
 mod world;
