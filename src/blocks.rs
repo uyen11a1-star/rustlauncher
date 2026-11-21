@@ -37,7 +37,7 @@ impl State {
 /// Khối không cản người (đuốc, nút, ray, biển, cỏ dây...). Hoa/cỏ đã được loại qua model "cross".
 fn no_collision(name: &str) -> bool {
     const PARTS: [&str; 15] = ["torch", "button", "pressure_plate", "sign", "banner", "rail", "lever", "redstone_wire", "tripwire", "vine", "cobweb", "kelp", "seagrass", "coral_fan", "lichen"];
-    name == "fire" || name == "soul_fire" || PARTS.iter().any(|p| name.contains(p))
+    name == "fire" || name == "soul_fire" || name == "end_gateway" || name.ends_with("_portal") || PARTS.iter().any(|p| name.contains(p))
 }
 
 pub struct Resolver<'a> {
@@ -198,7 +198,7 @@ impl<'a> Resolver<'a> {
     pub fn state(&mut self, key: &str) -> State {
         let (name, props) = split_key(key);
         let air = |_: ()| State { air: true, fluid: 0, occl: 0, tint: [255; 3], faces: Vec::new(), boxes: Vec::new(), climb: false };
-        if matches!(name.as_str(), "air" | "cave_air" | "void_air" | "light" | "barrier" | "structure_void" | "bubble_column") {
+        if matches!(name.as_str(), "air" | "cave_air" | "void_air" | "light" | "structure_void" | "bubble_column") {
             return air(());
         }
         let tint = tint_for(&name);
@@ -248,6 +248,9 @@ impl<'a> Resolver<'a> {
                 boxes.push([0.0625, 0.0, 0.0625, 0.9375, 0.875, 0.9375]);
             } else if name.ends_with("_bed") {
                 boxes.push([0.0, 0.0, 0.0, 1.0, 0.5625, 1.0]);
+            } else {
+                // khối vô hình/không có model (barrier, đầu, chuông...): server vẫn coi là đặc; không có hộp thì ta đi xuyên và bị kéo lại
+                boxes.push([0.0, 0.0, 0.0, 1.0, 1.0, 1.0]);
             }
         }
         if name.ends_with("_fence") || name.ends_with("_wall") || name.ends_with("fence_gate") {
