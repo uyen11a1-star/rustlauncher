@@ -754,7 +754,6 @@ pub fn start(conn: Conn) -> Result<Link, String> {
                         continue;
                     }
                 };
-                *cur.lock().unwrap() = [x, y, z, yaw as f64, pitch as f64];
                 let prev;
                 {
                     use std::sync::atomic::Ordering::Relaxed;
