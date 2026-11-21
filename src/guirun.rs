@@ -225,6 +225,16 @@ impl GuiRun {
                         }
                         gui.load_servers(self.root.join("servers.txt"));
                         self.gui = Some(gui);
+                        if let Some(p) = a.pano {
+                            for (k, &i) in p.iter().enumerate() {
+                                let im = &a.imgs[i];
+                                let px = |x: usize, y: usize| {
+                                    let o = (y.min(im.h - 1) * im.w + x.min(im.w - 1)) * 4;
+                                    format!("{},{},{}", im.rgba[o], im.rgba[o + 1], im.rgba[o + 2])
+                                };
+                                self.log.lock().unwrap().push(format!("pano{k}: {}x{} giữa={} 1/4={} 3/4={}", im.w, im.h, px(im.w / 2, im.h / 2), px(im.w / 4, im.h / 4), px(im.w * 3 / 4, im.h * 3 / 4)));
+                            }
+                        }
                         self.log.lock().unwrap().push(format!("Giao diện: {} ảnh, {} sprite, panorama {}", a.imgs.len(), a.sprites.len(), if a.pano.is_some() { "có" } else { "KHÔNG nạp được" }));
                         self.assets = a;
                         self.loaded = true;
