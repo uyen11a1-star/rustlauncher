@@ -28,7 +28,7 @@ pub enum NetIn {
 }
 
 pub enum NetOut {
-    Pos { x: f64, y: f64, z: f64, yaw: f32, pitch: f32, ground: bool },
+    Pos { x: f64, y: f64, z: f64, yaw: f32, pitch: f32, ground: bool, hcol: bool },
     /// tin nhắn; bắt đầu bằng '/' là lệnh
     Chat(String),
     /// chọn ô thanh nhanh 0..8
@@ -40,6 +40,8 @@ pub enum NetOut {
     /// dùng vật phẩm cầm trên tay (không nhắm khối)
     Use { yaw: f32, pitch: f32 },
     Swing,
+    /// phím di chuyển hiện tại (bit: tiến 1, lùi 2, trái 4, phải 8, nhảy 16, ngồi 32, chạy 64) như player_input của bản gốc
+    Input(u8),
     /// bấm ô `slot` của cửa sổ vật chứa `win` (click trái thường)
     Click { win: i32, state: i32, slot: i16, button: i8, mode: i32 },
     /// đóng cửa sổ vật chứa
@@ -49,6 +51,7 @@ pub enum NetOut {
 pub use crate::winnet::{click_packet, NetWin};
 
 /// Server vừa dịch chuyển ta: bỏ các gói vị trí cũ (gửi trước khi luồng vẽ kịp nhận vị trí mới), kẻo server dịch chuyển lại mãi.
+static EID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
 static TP_WAIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static TP_DROPPED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
@@ -607,12 +610,31 @@ pub fn start(conn: Conn) -> Result<Link, String> {
     {
         let (wr, cur, alive) = (wr.clone(), cur.clone(), alive.clone());
         std::thread::spawn(move || {
+            let (mut last_in, mut since_pos, mut last_ground) = (0u8, 0u32, false);
             while let Ok(m) = rx_out.recv() {
                 if !alive.load(std::sync::atomic::Ordering::Relaxed) {
                     break;
                 }
-                let (x, y, z, yaw, pitch, ground) = match m {
-                    NetOut::Pos { x, y, z, yaw, pitch, ground } => (x, y, z, yaw, pitch, ground),
+                let (x, y, z, yaw, pitch, ground, hcol) = match m {
+                    NetOut::Pos { x, y, z, yaw, pitch, ground, hcol } => (x, y, z, yaw, pitch, ground, hcol),
+                    NetOut::Input(bits) => {
+                        if bits != last_in {
+                            if (bits & 64 != 0) != (last_in & 64 != 0) {
+                                let mut b = Vec::new();
+                                put_varint(&mut b, EID.load(std::sync::atomic::Ordering::Relaxed) as u32);
+                                put_varint(&mut b, if bits & 64 != 0 { 1 } else { 2 });
+                                put_varint(&mut b, 0);
+                                if wsend_play(&wr, 0x29, &b).is_err() {
+                                    break;
+                                }
+                            }
+                            last_in = bits;
+                            if wsend_play(&wr, 0x2a, &[bits]).is_err() {
+                                break;
+                            }
+                        }
+                        continue;
+                    }
                     NetOut::Dig { status, pos, face } => {
                         let mut b = Vec::new();
                         put_varint(&mut b, status as u32);
@@ -701,6 +723,7 @@ pub fn start(conn: Conn) -> Result<Link, String> {
                     }
                 };
                 *cur.lock().unwrap() = [x, y, z, yaw as f64, pitch as f64];
+                let prev;
                 {
                     use std::sync::atomic::Ordering::Relaxed;
                     let mut c = cur.lock().unwrap();
@@ -711,16 +734,39 @@ pub fn start(conn: Conn) -> Result<Link, String> {
                         }
                         TP_WAIT.store(false, Relaxed);
                     }
+                    prev = *c;
                     *c = [x, y, z, yaw as f64, pitch as f64];
                 }
+                // chọn loại gói như bản gốc: đổi vị trí -> position(+look), chỉ xoay -> look, chỉ đổi đứng đất -> flying;
+                // vị trí được gửi lại ít nhất mỗi 20 tick
+                since_pos += 1;
+                let d2 = (x - prev[0]).powi(2) + (y - prev[1]).powi(2) + (z - prev[2]).powi(2);
+                let pos_ch = d2 > 4.0e-8 || since_pos >= 20;
+                let rot_ch = (yaw as f64 - prev[3]) != 0.0 || (pitch as f64 - prev[4]) != 0.0;
+                let flags = (ground as u8) | ((hcol as u8) << 1);
                 let mut b = Vec::with_capacity(34);
-                for v in [x, y, z] {
-                    b.extend_from_slice(&v.to_be_bytes());
-                }
-                b.extend_from_slice(&yaw.to_be_bytes());
-                b.extend_from_slice(&pitch.to_be_bytes());
-                b.push(ground as u8);
-                if wsend_play(&wr, 0x1e, &b).is_err() {
+                let id = if pos_ch {
+                    since_pos = 0;
+                    for v in [x, y, z] {
+                        b.extend_from_slice(&v.to_be_bytes());
+                    }
+                    if rot_ch {
+                        b.extend_from_slice(&yaw.to_be_bytes());
+                        b.extend_from_slice(&pitch.to_be_bytes());
+                    }
+                    if rot_ch { 0x1e } else { 0x1d }
+                } else if rot_ch {
+                    b.extend_from_slice(&yaw.to_be_bytes());
+                    b.extend_from_slice(&pitch.to_be_bytes());
+                    0x1f
+                } else if ground != last_ground {
+                    0x20
+                } else {
+                    continue;
+                };
+                last_ground = ground;
+                b.push(flags);
+                if wsend_play(&wr, id, &b).is_err() {
                     break;
                 }
             }
@@ -809,7 +855,7 @@ fn reader(s: &mut TcpStream, comp: bool, wr: &Shared, tx: &Sender<NetIn>, cur: &
         let mut i = 0;
         match id {
             0x30 => {
-                let _eid = rd_i32(&b, &mut i);
+                EID.store(rd_i32(&b, &mut i).unwrap_or(0), std::sync::atomic::Ordering::Relaxed);
                 i += 1;
                 for _ in 0..rd_varint(&b, &mut i).unwrap_or(0) {
                     rd_str(&b, &mut i);

@@ -177,7 +177,7 @@ pub struct Player {
     pub sneaking: bool,
     pub sprinting: bool,
     pub in_water: bool,
-    hcol: bool,
+    pub hcol: bool,
     jump_delay: u32,
 }
 

@@ -1325,8 +1325,12 @@ impl View {
                 self.prev_eye = self.player.eye_height();
                 self.player.tick(&inp, self.yaw as f64, self.pitch as f64, self.col.as_ref());
                 if let Some(n) = &self.net {
+                    let b = (inp.fwd > 0.1) as u8 | (((inp.fwd < -0.1) as u8) << 1) | (((inp.strafe < -0.1) as u8) << 2) | (((inp.strafe > 0.1) as u8) << 3) | ((inp.jump as u8) << 4) | ((self.player.sneaking as u8) << 5) | ((self.player.sprinting as u8) << 6);
+                    let _ = n.send(crate::netplay::NetOut::Input(b));
+                }
+                if let Some(n) = &self.net {
                     let p = self.player.pos;
-                    let _ = n.send(crate::netplay::NetOut::Pos { x: p[0], y: p[1], z: p[2], yaw: 180.0 - self.yaw.to_degrees(), pitch: -self.pitch.to_degrees(), ground: self.player.on_ground });
+                    let _ = n.send(crate::netplay::NetOut::Pos { x: p[0], y: p[1], z: p[2], yaw: 180.0 - self.yaw.to_degrees(), pitch: -self.pitch.to_degrees(), ground: self.player.on_ground, hcol: self.player.hcol });
                 }
                 // rơi: sát thương = quãng rơi - 3 (làm tròn lên), nước và bay thì không
                 if self.col.is_some() && !self.player.fly && self.net.is_none() {
