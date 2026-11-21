@@ -16,6 +16,8 @@ use crate::{
 };
 
 pub enum NetIn {
+    /// khối đổi: x, y, z, id block state mạng
+    Block(i32, i32, i32, u32),
     Chunk(RawChunk),
     Unload(i32, i32),
     /// server đặt lại vị trí người chơi (tuyệt đối, đã áp cờ tương đối)
@@ -31,6 +33,41 @@ pub enum NetOut {
     Chat(String),
     /// chọn ô thanh nhanh 0..8
     Held(u8),
+    /// đào: status 0 bắt đầu, 1 hủy, 2 xong; face 0..5
+    Dig { status: i32, pos: [i32; 3], face: u8 },
+    /// đặt khối / tương tác lên khối
+    Place { pos: [i32; 3], face: u8, cur: [f32; 3] },
+    /// dùng vật phẩm cầm trên tay (không nhắm khối)
+    Use { yaw: f32, pitch: f32 },
+    Swing,
+}
+
+static SEQ: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+fn next_seq() -> i32 {
+    SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
+}
+
+fn pack_pos(p: [i32; 3]) -> [u8; 8] {
+    let v = (((p[0] as i64) & 0x3FFFFFF) << 38) | (((p[2] as i64) & 0x3FFFFFF) << 12) | ((p[1] as i64) & 0xFFF);
+    v.to_be_bytes()
+}
+
+fn unpack_pos(v: i64) -> [i32; 3] {
+    [(v >> 38) as i32, (v << 52 >> 52) as i32, (v << 26 >> 38) as i32]
+}
+
+fn rd_varlong(b: &[u8], i: &mut usize) -> Option<i64> {
+    let mut v: u64 = 0;
+    for sh in 0..10 {
+        let x = *b.get(*i)?;
+        *i += 1;
+        v |= ((x & 0x7f) as u64) << (7 * sh);
+        if x & 0x80 == 0 {
+            return Some(v as i64);
+        }
+    }
+    None
 }
 
 /// Người chơi khác thấy được trong thế giới.
@@ -548,6 +585,50 @@ pub fn start(conn: Conn) -> Result<Link, String> {
                 }
                 let (x, y, z, yaw, pitch, ground) = match m {
                     NetOut::Pos { x, y, z, yaw, pitch, ground } => (x, y, z, yaw, pitch, ground),
+                    NetOut::Dig { status, pos, face } => {
+                        let mut b = Vec::new();
+                        put_varint(&mut b, status as u32);
+                        b.extend_from_slice(&pack_pos(pos));
+                        b.push(face);
+                        put_varint(&mut b, next_seq() as u32);
+                        if wsend(&wr, 0x28, &b).is_err() {
+                            break;
+                        }
+                        continue;
+                    }
+                    NetOut::Place { pos, face, cur } => {
+                        let mut b = Vec::new();
+                        put_varint(&mut b, 0);
+                        b.extend_from_slice(&pack_pos(pos));
+                        put_varint(&mut b, face as u32);
+                        for c in cur {
+                            b.extend_from_slice(&c.to_be_bytes());
+                        }
+                        b.push(0);
+                        b.push(0);
+                        put_varint(&mut b, next_seq() as u32);
+                        if wsend(&wr, 0x3f, &b).is_err() {
+                            break;
+                        }
+                        continue;
+                    }
+                    NetOut::Use { yaw, pitch } => {
+                        let mut b = Vec::new();
+                        put_varint(&mut b, 0);
+                        put_varint(&mut b, next_seq() as u32);
+                        b.extend_from_slice(&yaw.to_be_bytes());
+                        b.extend_from_slice(&pitch.to_be_bytes());
+                        if wsend(&wr, 0x40, &b).is_err() {
+                            break;
+                        }
+                        continue;
+                    }
+                    NetOut::Swing => {
+                        if wsend(&wr, 0x3c, &[0]).is_err() {
+                            break;
+                        }
+                        continue;
+                    }
                     NetOut::Held(h) => {
                         if wsend(&wr, 0x34, &(h as i16).to_be_bytes()).is_err() {
                             break;
@@ -720,6 +801,28 @@ fn reader(s: &mut TcpStream, comp: bool, wr: &Shared, tx: &Sender<NetIn>, cur: &
             0x3f => {
                 if let Some(line) = parse_player_chat(&b, st) {
                     st.lock().unwrap().chat.push(line);
+                }
+            }
+            0x08 => {
+                if let Some(raw) = b.get(0..8) {
+                    let p = unpack_pos(i64::from_be_bytes(raw.try_into().unwrap()));
+                    i = 8;
+                    if let Some(s) = rd_varint(&b, &mut i) {
+                        let _ = tx.send(NetIn::Block(p[0], p[1], p[2], s as u32));
+                    }
+                }
+            }
+            0x52 => {
+                if let Some(raw) = b.get(0..8) {
+                    let v = i64::from_be_bytes(raw.try_into().unwrap());
+                    let (sx, sz, sy) = ((v >> 42) as i32, (v << 22 >> 42) as i32, (v << 44 >> 44) as i32);
+                    i = 8;
+                    let n = rd_varint(&b, &mut i).unwrap_or(0);
+                    for _ in 0..n {
+                        let Some(r) = rd_varlong(&b, &mut i) else { break };
+                        let (lx, lz, ly) = (((r >> 8) & 15) as i32, ((r >> 4) & 15) as i32, (r & 15) as i32);
+                        let _ = tx.send(NetIn::Block(sx * 16 + lx, sy * 16 + ly, sz * 16 + lz, (r >> 12) as u32));
+                    }
                 }
             }
             0x44 => parse_player_info(&b, st),

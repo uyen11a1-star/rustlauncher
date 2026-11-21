@@ -38,7 +38,15 @@ impl ChunkMesh {
     }
 }
 
+/// "minecraft:oak_stairs[facing=east]" -> "oak_stairs"
+pub fn base_name(k: &str) -> String {
+    let k = k.strip_prefix("minecraft:").unwrap_or(k);
+    k.split('[').next().unwrap_or(k).to_string()
+}
+
 pub struct SceneData {
+    /// tên block theo id toàn cục lúc vào game
+    pub names: Vec<String>,
     pub atlas: Vec<u8>,
     pub chunks: Vec<ChunkMesh>,
     /// vị trí mắt lúc vào game
@@ -60,6 +68,8 @@ pub enum Msg {
     Drop(i32, i32),
     /// hình dạng va chạm của các block state mới (nối tiếp vào danh sách)
     Shapes(Vec<Shape>),
+    /// tên block (không thuộc tính) của các id mới, cùng thứ tự với Shapes
+    Names(Vec<String>),
     /// chunk mới nạp (dữ liệu khối) cho vật lý
     Col(i32, i32, Arc<Chunk>),
     ColDrop(i32, i32),
@@ -140,7 +150,7 @@ pub fn build_test(jar_path: &Path, log: &dyn Fn(String)) -> Result<SceneData, St
         log(m.clone());
     }
     log(format!("Dựng {} khối, {} đỉnh, mất {} ms", shown, mesh.v.len(), t0.elapsed().as_millis()));
-    Ok(SceneData { atlas: atlas.pixels, chunks: vec![ChunkMesh::new(mesh, 0, 0)], spawn: [7.0, 1.7, 4.0], stream: None, shapes: Vec::new(), col: Vec::new(), items, net: None, net_state: None })
+    Ok(SceneData { atlas: atlas.pixels, chunks: vec![ChunkMesh::new(mesh, 0, 0)], spawn: [7.0, 1.7, 4.0], stream: None, shapes: Vec::new(), col: Vec::new(), items, net: None, net_state: None, names: Vec::new() })
 }
 
 /// Độ sáng 0..1 từ ánh sáng ô (lấy mức cao hơn giữa sáng trời và sáng khối), kèm một chút sáng nền.
@@ -411,6 +421,7 @@ impl Worker {
             let mut busy = false;
             let mut raws: Vec<RawChunk> = Vec::new();
             let mut want: Vec<(i32, i32)> = Vec::new();
+            let mut edits: Vec<(i32, i32, i32, u32)> = Vec::new();
             match &self.src {
                 Src::Disk(dir) => {
                     for dz in -(r + 1)..=(r + 1) {
@@ -455,11 +466,61 @@ impl Worker {
                                 return;
                             }
                             Ok(crate::netplay::NetIn::Joined) => {}
+                            Ok(crate::netplay::NetIn::Block(x, y, z, s)) => {
+                                edits.push((x, y, z, s));
+                                n += 1;
+                            }
                             Err(mpsc::TryRecvError::Empty) => break,
                             Err(mpsc::TryRecvError::Disconnected) => return,
                         }
                     }
                     busy = n > 0;
+                }
+            }
+            if !edits.is_empty() {
+                for (x, y, z, sid) in edits {
+                    let key = crate::netdata::state_key(sid);
+                    let id = match self.ids.get(&key) {
+                        Some(&i) => i,
+                        None => {
+                            let i = self.keys.len() as u16;
+                            self.ids.insert(key.clone(), i);
+                            self.keys.push(key);
+                            i
+                        }
+                    };
+                    let before = self.states.len();
+                    grow_states(&mut res, &self.keys, &mut self.states);
+                    if self.states.len() > before {
+                        let sh: Vec<Shape> = self.states[before..].iter().map(|s| s.shape()).collect();
+                        let nm: Vec<String> = self.keys[before..].iter().map(|k| base_name(k)).collect();
+                        let _ = tx.send(Msg::Names(nm));
+                        let nm: Vec<String> = self.keys[before..].iter().map(|k| base_name(k)).collect();
+                    let _ = tx.send(Msg::Names(nm));
+                    if tx.send(Msg::Shapes(sh)).is_err() {
+                            return;
+                        }
+                    }
+                    if let Some(ch) = world::set_block(&mut self.w, x, y, z, id) {
+                        let (cx, cz) = (x >> 4, z >> 4);
+                        if tx.send(Msg::Col(cx, cz, ch)).is_err() {
+                            return;
+                        }
+                        self.meshed.remove(&(cx, cz));
+                        if x & 15 == 0 {
+                            self.meshed.remove(&(cx - 1, cz));
+                        }
+                        if x & 15 == 15 {
+                            self.meshed.remove(&(cx + 1, cz));
+                        }
+                        if z & 15 == 0 {
+                            self.meshed.remove(&(cx, cz - 1));
+                        }
+                        if z & 15 == 15 {
+                            self.meshed.remove(&(cx, cz + 1));
+                        }
+                        busy = true;
+                    }
                 }
             }
             if busy {
@@ -471,6 +532,8 @@ impl Worker {
                 grow_states(&mut res, &self.keys, &mut self.states);
                 if self.states.len() > before {
                     let sh: Vec<Shape> = self.states[before..].iter().map(|s| s.shape()).collect();
+                    let nm: Vec<String> = self.keys[before..].iter().map(|k| base_name(k)).collect();
+                    let _ = tx.send(Msg::Names(nm));
                     if tx.send(Msg::Shapes(sh)).is_err() {
                         return;
                     }
@@ -647,7 +710,7 @@ pub fn build_world(jar_path: &Path, dir: &Path, radius: i32, log: &dyn Fn(String
     let (p2, s2) = (pos.clone(), stop.clone());
     std::thread::spawn(move || worker.run(jar, atlas, radius, p2, s2, tx));
     log(format!("Tổng thời gian dựng: {} ms", t0.elapsed().as_millis()));
-    Ok(SceneData { atlas: pixels, chunks, spawn: [center[0] as f32, y, center[2] as f32], stream: Some(Streamer { rx, pos, stop }), shapes, col, items, net: None, net_state: None })
+    Ok(SceneData { atlas: pixels, chunks, spawn: [center[0] as f32, y, center[2] as f32], stream: Some(Streamer { rx, pos, stop }), shapes, col, items, net: None, net_state: None, names: Vec::new() })
 }
 
 /// Dựng cảnh từ server: chờ vị trí đầu tiên, rồi stream chunk nhận qua mạng.
@@ -712,10 +775,11 @@ pub fn build_net(jar_path: &Path, link: crate::netplay::Link, log: &dyn Fn(Strin
         grow_states(&mut res, &keys, &mut states);
     }
     let shapes: Vec<Shape> = states.iter().map(|s| s.shape()).collect();
+    let names: Vec<String> = keys.iter().map(|k| base_name(k)).collect();
     let col: Vec<((i32, i32), Arc<Chunk>)> = added.iter().map(|(x, z, c)| ((*x, *z), c.clone())).collect();
     let worker = Worker { src: Src::Net(link), w, ids, keys, states, tried, meshed: HashSet::new() };
     let pixels = atlas.pixels.clone();
     let (p2, s2) = (pos.clone(), stop.clone());
     std::thread::spawn(move || worker.run(jar, atlas, 32, p2, s2, tx));
-    Ok(SceneData { atlas: pixels, chunks: Vec::new(), spawn: [sp[0] as f32, sp[1] as f32 + 1.62, sp[2] as f32], stream: Some(Streamer { rx, pos, stop }), shapes, col, items, net: Some(net_tx), net_state: Some(net_state) })
+    Ok(SceneData { atlas: pixels, chunks: Vec::new(), spawn: [sp[0] as f32, sp[1] as f32 + 1.62, sp[2] as f32], stream: Some(Streamer { rx, pos, stop }), shapes, col, items, net: Some(net_tx), net_state: Some(net_state), names })
 }

@@ -302,3 +302,33 @@ pub fn load_raw(dir: &Path, list: &[(i32, i32)], threads: usize) -> (Vec<RawChun
     });
     (out.into_inner().unwrap(), stats.into_inner().unwrap())
 }
+
+/// Đặt một khối: tạo bản chunk mới (chunk là Arc bất biến), trả về chunk mới để gửi đi.
+pub fn set_block(w: &mut World, x: i32, y: i32, z: i32, id: u16) -> Option<Arc<Chunk>> {
+    let c = w.chunks.get(&(x >> 4, z >> 4))?;
+    let si = (y >> 4) - SEC0;
+    if si < 0 || si >= NSEC as i32 {
+        return None;
+    }
+    let mut secs: Vec<Option<Sec>> = c
+        .secs
+        .iter()
+        .map(|s| match s {
+            None => None,
+            Some(Sec::Uniform(v)) => Some(Sec::Uniform(*v)),
+            Some(Sec::Full(a)) => Some(Sec::Full(a.clone())),
+        })
+        .collect();
+    let lt = c.lt.clone();
+    let i = si as usize;
+    let mut arr = match secs[i].take() {
+        None => Box::new([0u16; 4096]),
+        Some(Sec::Uniform(v)) => Box::new([v; 4096]),
+        Some(Sec::Full(a)) => a,
+    };
+    arr[(((y & 15) << 8) | ((z & 15) << 4) | (x & 15)) as usize] = id;
+    secs[i] = Some(Sec::Full(arr));
+    let nc = Arc::new(Chunk { secs, lt });
+    w.chunks.insert((x >> 4, z >> 4), nc.clone());
+    Some(nc)
+}

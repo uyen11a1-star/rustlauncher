@@ -2,7 +2,7 @@
 use std::{ffi::c_void, path::PathBuf, time::Duration};
 
 use android_activity::{
-    input::{InputEvent, MotionAction},
+    input::{InputEvent, KeyAction, KeyMapChar, Keycode, MotionAction},
     AndroidApp, InputStatus, MainEvent, PollEvent,
 };
 
@@ -61,6 +61,7 @@ fn android_main(app: AndroidApp) {
     let mut gfx: Option<gfx::Gfx> = None;
     let mut quit = false;
     let mut mode = Mode::Menu;
+    let mut soft_on = false;
 
     while !quit {
         let (mut init, mut term) = (false, false);
@@ -108,8 +109,30 @@ fn android_main(app: AndroidApp) {
 
         // thu mọi sự kiện cảm ứng, xử lý sau theo chế độ hiện tại
         let mut events: Vec<(i32, view::Phase, f32, f32)> = Vec::new();
+        let mut keys: Vec<view::KeyIn> = Vec::new();
+        let text_on = matches!(&mode, Mode::Gui(r) if r.wants_text());
         if let Ok(mut it) = app.input_events_iter() {
             while it.next(|ev| {
+                if let InputEvent::KeyEvent(k) = ev {
+                    if !text_on {
+                        return InputStatus::Unhandled;
+                    }
+                    if matches!(k.action(), KeyAction::Down | KeyAction::Multiple) {
+                        match k.key_code() {
+                            Keycode::Del => keys.push(view::KeyIn::Back),
+                            Keycode::Enter | Keycode::NumpadEnter => keys.push(view::KeyIn::Enter),
+                            Keycode::Back | Keycode::Escape => keys.push(view::KeyIn::Esc),
+                            code => {
+                                if let Ok(map) = app.device_key_character_map(k.device_id()) {
+                                    if let Ok(KeyMapChar::Unicode(c)) = map.get(code, k.meta_state()) {
+                                        keys.push(view::KeyIn::Char(c));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    return InputStatus::Handled;
+                }
                 if let InputEvent::MotionEvent(m) = ev {
                     let n = m.pointer_count();
                     match m.action() {
@@ -192,6 +215,18 @@ fn android_main(app: AndroidApp) {
                         }
                     }
                     Mode::Gui(r) => {
+                        for k in keys.drain(..) {
+                            r.key_input(k);
+                        }
+                        let want = r.wants_text();
+                        if want != soft_on {
+                            soft_on = want;
+                            if want {
+                                app.show_soft_input(true);
+                            } else {
+                                app.hide_soft_input(false);
+                            }
+                        }
                         if matches!(r.frame(g, w, h, &events), guirun::Out::Exit) {
                             mode = Mode::Menu;
                         }

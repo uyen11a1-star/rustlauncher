@@ -195,6 +195,17 @@ impl GuiRun {
         });
     }
 
+    /// Chat đang mở: cần bật bàn phím hệ thống.
+    pub fn wants_text(&self) -> bool {
+        self.view.as_ref().map_or(false, |v| v.wants_text())
+    }
+
+    pub fn key_input(&mut self, k: view::KeyIn) {
+        if let Some(v) = self.view.as_mut() {
+            v.key_input(k);
+        }
+    }
+
     pub fn frame(&mut self, g: &mut Gfx, w: i32, h: i32, events: &[(i32, Phase, f32, f32)]) -> Out {
         let now = Instant::now();
         let dt = (now - self.last).as_secs_f32().min(0.1);

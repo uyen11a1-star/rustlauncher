@@ -126,6 +126,8 @@ enum Role {
     Exit,
     Bag,
     Chat,
+    Attack,
+    Place,
     /// ô thanh nhanh số i (khi túi đóng)
     Hot(usize),
     /// chạm trong màn hình túi đồ
@@ -226,7 +228,12 @@ pub struct View {
     chat_text: String,
     chat_tap: Option<(f32, f32)>,
     kb: crate::keyboard::Keyboard,
+    keys_in: Vec<KeyIn>,
     sent_sel: usize,
+    key_names: Vec<String>,
+    attack_held: bool,
+    dig: Option<Dig>,
+    place_req: bool,
     others: HashMap<i32, Other>,
     /// tên người chơi trên màn hình: (x, y, tên)
     tags: Vec<(f32, f32, String)>,
@@ -250,6 +257,55 @@ fn lerp_ang(a: f32, b: f32, t: f32) -> f32 {
         d += 360.0;
     }
     a + d * t
+}
+
+/// Phím từ bàn phím hệ thống.
+#[derive(Clone, Copy)]
+pub enum KeyIn {
+    Char(char),
+    Back,
+    Enter,
+    Esc,
+}
+
+/// Nút Đánh/Đặt nằm ngay bên trái cụm Nhảy/Lén (tay phải), không đè lên nút nào khác.
+fn rect_attack(g: &Gfx) -> [f32; 4] {
+    let s = g.scale;
+    [g.w as f32 - 184.0 * s, g.h as f32 - 200.0 * s, 88.0 * s, 76.0 * s]
+}
+fn rect_place(g: &Gfx) -> [f32; 4] {
+    let s = g.scale;
+    [g.w as f32 - 184.0 * s, g.h as f32 - 116.0 * s, 88.0 * s, 48.0 * s]
+}
+
+/// Độ cứng khối (tên -> (độ cứng, cần dụng cụ)), từ hardness.txt.
+fn hardness(name: &str) -> (f32, bool) {
+    static T: std::sync::OnceLock<HashMap<&'static str, (f32, bool)>> = std::sync::OnceLock::new();
+    let t = T.get_or_init(|| {
+        include_str!("hardness.txt")
+            .lines()
+            .filter_map(|l| {
+                let mut p = l.split(' ');
+                Some((p.next()?, (p.next()?.parse().ok()?, p.next()? == "1")))
+            })
+            .collect()
+    });
+    t.get(name).copied().unwrap_or((1.0, false))
+}
+
+struct Aim {
+    pos: [i32; 3],
+    face: u8,
+    cur: [f32; 3],
+}
+
+/// Đang giữ nút Đánh vào khối nào.
+struct Dig {
+    pos: [i32; 3],
+    t0: Instant,
+    /// thời gian đào ước lượng (giây)
+    need: f32,
+    finished: Option<Instant>,
 }
 
 fn rect_chat(g: &Gfx) -> [f32; 4] {
@@ -588,7 +644,12 @@ impl View {
                 chat_text: String::new(),
                 chat_tap: None,
                 kb: crate::keyboard::Keyboard::new(),
+                keys_in: Vec::new(),
                 sent_sel: 0,
+                key_names: d.names.clone(),
+                attack_held: false,
+                dig: None,
+                place_req: false,
                 others: HashMap::new(),
                 tags: Vec::new(),
             })
@@ -654,6 +715,10 @@ impl View {
                     Role::Ui
                 } else if let Some(i) = hot {
                     Role::Hot(i)
+                } else if self.net.is_some() && inside(rect_attack(g), x, y) {
+                    Role::Attack
+                } else if self.net.is_some() && inside(rect_place(g), x, y) {
+                    Role::Place
                 } else if inside(rect_jump(g), x, y) {
                     Role::Jump
                 } else if inside(rect_sneak(g), x, y) {
@@ -712,6 +777,7 @@ impl View {
                                 self.inv.stash();
                             }
                         }
+                        Role::Place if inside(rect_place(g), x, y) => self.place_req = true,
                         Role::Chat if inside(rect_chat(g), x, y) => {
                             self.chat_open = true;
                             self.chat_tap = None;
@@ -753,6 +819,137 @@ impl View {
         }
     }
 
+    /// Chat đang mở -> cần bàn phím hệ thống.
+    pub fn wants_text(&self) -> bool {
+        self.chat_open
+    }
+
+    pub fn key_input(&mut self, k: KeyIn) {
+        if self.chat_open {
+            self.keys_in.push(k);
+        }
+    }
+
+    /// Tia ngắm từ mắt theo hướng nhìn, tới 5 khối; trả về khối trúng, mặt và điểm trúng.
+    fn aim(&self) -> Option<Aim> {
+        let col = self.col.as_ref()?;
+        let (sy, cy, sp, cp) = (self.yaw.sin(), self.yaw.cos(), self.pitch.sin(), self.pitch.cos());
+        let d = [-sy * cp, sp, -cy * cp];
+        let o = self.pos;
+        let mut cell = [o[0].floor() as i32, o[1].floor() as i32, o[2].floor() as i32];
+        let mut step = [0i32; 3];
+        let mut tmax = [f32::MAX; 3];
+        let mut tdel = [f32::MAX; 3];
+        for k in 0..3 {
+            if d[k] > 1e-6 {
+                step[k] = 1;
+                tdel[k] = 1.0 / d[k];
+                tmax[k] = (cell[k] as f32 + 1.0 - o[k]) / d[k];
+            } else if d[k] < -1e-6 {
+                step[k] = -1;
+                tdel[k] = -1.0 / d[k];
+                tmax[k] = (o[k] - cell[k] as f32) / -d[k];
+            }
+        }
+        let mut t = 0.0;
+        let mut face = 0u8;
+        while t <= 5.0 {
+            let id = col.world.get(cell[0], cell[1], cell[2]);
+            if id != 0 && id != crate::world::UNKNOWN {
+                if let Some(sh) = col.shapes.get(id as usize) {
+                    if sh.fluid == 0 && !sh.boxes.is_empty() {
+                        let p = [o[0] + d[0] * t, o[1] + d[1] * t, o[2] + d[2] * t];
+                        let cur = [(p[0] - cell[0] as f32).clamp(0.0, 1.0), (p[1] - cell[1] as f32).clamp(0.0, 1.0), (p[2] - cell[2] as f32).clamp(0.0, 1.0)];
+                        return Some(Aim { pos: cell, face, cur });
+                    }
+                }
+            }
+            let k = if tmax[0] < tmax[1] && tmax[0] < tmax[2] { 0 } else if tmax[1] < tmax[2] { 1 } else { 2 };
+            if step[k] == 0 {
+                return None;
+            }
+            t = tmax[k];
+            tmax[k] += tdel[k];
+            cell[k] += step[k];
+            // mặt của khối mới bị tia đi vào (hướng 0 xuống,1 lên,2 bắc -z,3 nam +z,4 tây -x,5 đông +x)
+            face = match (k, step[k]) {
+                (0, 1) => 4,
+                (0, _) => 5,
+                (1, 1) => 0,
+                (1, _) => 1,
+                (2, 1) => 2,
+                _ => 3,
+            };
+        }
+        None
+    }
+
+    /// Đánh (giữ để đào) và Đặt gửi lên server.
+    fn net_actions(&mut self, now: Instant) {
+        let Some(tx) = self.net.clone() else { return };
+        let aim = self.aim();
+        if self.place_req {
+            self.place_req = false;
+            let _ = tx.send(crate::netplay::NetOut::Swing);
+            match &aim {
+                Some(a) => {
+                    let _ = tx.send(crate::netplay::NetOut::Place { pos: a.pos, face: a.face, cur: a.cur });
+                }
+                None => {
+                    let _ = tx.send(crate::netplay::NetOut::Use { yaw: 180.0 - self.yaw.to_degrees(), pitch: -self.pitch.to_degrees() });
+                }
+            }
+        }
+        if !self.attack_held {
+            if let Some(d) = self.dig.take() {
+                let _ = tx.send(crate::netplay::NetOut::Dig { status: 1, pos: d.pos, face: 1 });
+            }
+            return;
+        }
+        let Some(a) = aim else {
+            if let Some(d) = self.dig.take() {
+                let _ = tx.send(crate::netplay::NetOut::Dig { status: 1, pos: d.pos, face: 1 });
+            }
+            return;
+        };
+        // đổi sang khối khác thì hủy cái cũ
+        if self.dig.as_ref().map_or(false, |d| d.pos != a.pos) {
+            let d = self.dig.take().unwrap();
+            let _ = tx.send(crate::netplay::NetOut::Dig { status: 1, pos: d.pos, face: 1 });
+        }
+        let id = self.col.as_ref().map_or(0, |c| c.world.get(a.pos[0], a.pos[1], a.pos[2]));
+        if self.dig.is_none() {
+            let key = self.state_name(id);
+            let (h, tool) = hardness(&key);
+            let need = if h < 0.0 { 1e9 } else { h * if tool { 5.0 } else { 1.5 } + 0.05 };
+            let _ = tx.send(crate::netplay::NetOut::Swing);
+            let _ = tx.send(crate::netplay::NetOut::Dig { status: 0, pos: a.pos, face: a.face });
+            self.dig = Some(Dig { pos: a.pos, t0: now, need, finished: None });
+            return;
+        }
+        let d = self.dig.as_mut().unwrap();
+        if d.finished.is_none() && now.duration_since(d.t0).as_secs_f32() >= d.need {
+            let _ = tx.send(crate::netplay::NetOut::Dig { status: 2, pos: d.pos, face: a.face });
+            d.finished = Some(now);
+        } else if let Some(f) = d.finished {
+            // khối vẫn còn sau 0.4 giây: bắt đầu đào lại
+            if now.duration_since(f).as_secs_f32() > 0.4 {
+                let _ = tx.send(crate::netplay::NetOut::Dig { status: 0, pos: d.pos, face: a.face });
+                d.t0 = now;
+                d.finished = None;
+            }
+        }
+        if (now.duration_since(d.t0).as_secs_f32() * 4.0) as i32 % 3 == 0 && d.finished.is_none() {
+            // vung tay đều khi đang đào
+            let _ = tx.send(crate::netplay::NetOut::Swing);
+        }
+    }
+
+    /// Tên block (không thuộc tính) của id toàn cục, để tra độ cứng.
+    fn state_name(&self, id: u16) -> String {
+        self.key_names.get(id as usize).cloned().unwrap_or_default()
+    }
+
     /// Lượt cuối (2D): tin nhắn, nút chat, và màn chat có bàn phím.
     fn chat_pass(&mut self, g: &mut Gfx) {
         if self.net.is_none() || self.inv_open {
@@ -764,6 +961,10 @@ impl View {
         let lh = size * 1.25;
         g.begin();
         if !self.chat_open {
+            // chấm ngắm giữa màn hình
+            let (cx, cy, t) = (w / 2.0, h / 2.0, 2.0 * s);
+            g.rect(cx - 8.0 * s, cy - t / 2.0, 16.0 * s, t, 0xffffffc0);
+            g.rect(cx - t / 2.0, cy - 8.0 * s, t, 16.0 * s, 0xffffffc0);
             // tên người chơi gần đó
             let ts = 12.0 * s;
             for (x, y, name) in &self.tags {
@@ -799,13 +1000,27 @@ impl View {
             g.end(None);
             return;
         }
-        // màn chat: nền tối, lịch sử, ô nhập, bàn phím chiếm nửa dưới
+        // màn chat dùng bàn phím của hệ thống (hiện ở nửa dưới): ô nhập và lịch sử nằm phía trên
         let tap = self.chat_tap.take();
-        g.rect(0.0, 0.0, w, h, 0x000000a0);
-        let kb_h = h * 0.52;
-        let kb_area = crate::ui::Rect::new(0.0, h - kb_h, w, kb_h);
-        let bar_h = 34.0 * s;
-        let bar_y = h - kb_h - bar_h - 6.0 * s;
+        g.rect(0.0, 0.0, w, h * 0.5, 0x000000a0);
+        let bar_h = 36.0 * s;
+        let bar_y = 8.0 * s;
+        let btn_w = 84.0 * s;
+        g.rect(8.0 * s, bar_y, w - 16.0 * s - 2.0 * (btn_w + 6.0 * s), bar_h, 0x000000d0);
+        g.rect(8.0 * s, bar_y, w - 16.0 * s - 2.0 * (btn_w + 6.0 * s), 2.0 * s, 0xffffffa0);
+        let shown_text = format!("{}_", self.chat_text);
+        let mut t = shown_text.as_str();
+        let room = w - 16.0 * s - 2.0 * (btn_w + 6.0 * s) - 16.0 * s;
+        while g.text_width(t, size) > room && !t.is_empty() {
+            t = &t[t.chars().next().map_or(0, |c| c.len_utf8())..];
+        }
+        g.text(16.0 * s, bar_y + (bar_h - size * 1.2) / 2.0, size, 0xffffffff, t);
+        let rs = [w - 2.0 * btn_w - 14.0 * s, w - btn_w - 8.0 * s];
+        for (k, label) in ["Gửi", "Đóng"].iter().enumerate() {
+            g.rect(rs[k], bar_y, btn_w, bar_h, if k == 0 { 0x2e8b57d0 } else { 0x404040d0 });
+            let tw = g.text_width(label, 14.0 * s);
+            g.text(rs[k] + (btn_w - tw) / 2.0, bar_y + (bar_h - 18.0 * s) / 2.0, 14.0 * s, 0xffffffff, label);
+        }
         let maxw = w - 24.0 * s;
         let mut lines: Vec<String> = Vec::new();
         for (l, _) in self.chat_log.iter().rev().take(30) {
@@ -816,33 +1031,35 @@ impl View {
                 break;
             }
         }
-        let rows = (((bar_y - 12.0 * s) / lh) as usize).min(lines.len());
+        let rows = (((h * 0.5 - bar_y - bar_h - 8.0 * s) / lh) as usize).min(lines.len());
         for j in 0..rows {
-            let y = bar_y - 8.0 * s - (j + 1) as f32 * lh;
+            let y = bar_y + bar_h + 8.0 * s + (rows - 1 - j) as f32 * lh;
             draw_legacy(g, 12.0 * s, y, size, &lines[j], 255);
         }
-        g.rect(8.0 * s, bar_y, w - 16.0 * s, bar_h, 0x000000d0);
-        g.rect(8.0 * s, bar_y, w - 16.0 * s, 2.0 * s, 0xffffffa0);
-        let shown_text = format!("{}_", self.chat_text);
-        let mut t = shown_text.as_str();
-        while g.text_width(t, size) > w - 40.0 * s && !t.is_empty() {
-            t = &t[t.chars().next().map_or(0, |c| c.len_utf8())..];
-        }
-        g.text(16.0 * s, bar_y + (bar_h - size * 1.2) / 2.0, size, 0xffffffff, t);
         let mut send = false;
         let mut close = false;
-        match self.kb.draw(g, kb_area, tap) {
-            Some(crate::keyboard::Kb::Ch(c)) => {
-                if self.chat_text.chars().count() < 256 {
-                    self.chat_text.push(c);
+        if let Some((x, y)) = tap {
+            if y >= bar_y && y < bar_y + bar_h {
+                if x >= rs[0] && x < rs[0] + btn_w {
+                    send = true;
+                } else if x >= rs[1] && x < rs[1] + btn_w {
+                    close = true;
                 }
             }
-            Some(crate::keyboard::Kb::Back) => {
-                self.chat_text.pop();
+        }
+        for k in std::mem::take(&mut self.keys_in) {
+            match k {
+                KeyIn::Char(c) => {
+                    if self.chat_text.chars().count() < 256 && !c.is_control() {
+                        self.chat_text.push(c);
+                    }
+                }
+                KeyIn::Back => {
+                    self.chat_text.pop();
+                }
+                KeyIn::Enter => send = true,
+                KeyIn::Esc => close = true,
             }
-            Some(crate::keyboard::Kb::Done) => send = true,
-            Some(crate::keyboard::Kb::Cancel) => close = true,
-            _ => {}
         }
         if send {
             let t = self.chat_text.trim().to_string();
@@ -969,6 +1186,7 @@ impl View {
                         unsafe { free(&old) };
                     }
                 }
+                Msg::Names(n) => self.key_names.extend(n),
                 Msg::Shapes(sh) => {
                     if let Some(c) = self.col.as_mut() {
                         c.shapes.extend(sh);
@@ -998,6 +1216,7 @@ impl View {
 
         // đầu vào: cần trái = (dịch chuyển ngón tay so với lúc chạm) / 70dp; kéo lên = tiến
         let (mut sx, mut sy) = (0.0f32, 0.0f32);
+        let mut attack = false;
         self.jump_held = false;
         for t in &self.touches {
             match t.role {
@@ -1006,9 +1225,12 @@ impl View {
                     sy = ((t.y - t.sy) / (70.0 * s)).clamp(-1.0, 1.0);
                 }
                 Role::Jump => self.jump_held = true,
+                Role::Attack => attack = true,
                 _ => {}
             }
         }
+        self.attack_held = attack;
+        self.net_actions(now);
         let inp = Input { fwd: (-sy) as f64, strafe: sx as f64, jump: self.jump_held, sneak: self.sneak_on, sprint: self.sprint_on };
 
         // vật lý theo tick cố định 20/giây, camera nội suy giữa hai tick
@@ -1248,6 +1470,10 @@ impl View {
             buttons.push((rect_sneak(g), if self.player.fly { "Xuống" } else { "Lén" }, if self.sneak_on { on } else { off }));
             buttons.push((rect_fly(g), fly_label, if self.player.fly { on } else { off }));
             buttons.push((rect_sprint(g), "Chạy", if self.sprint_on { on } else { off }));
+            if self.net.is_some() {
+                buttons.push((rect_attack(g), "Đánh", if self.attack_held { 0xb03030c0 } else { off }));
+                buttons.push((rect_place(g), "Đặt", off));
+            }
         }
         for (r, label, col) in buttons {
             g.rect(r[0], r[1], r[2], r[3], col);
