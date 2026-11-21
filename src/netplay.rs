@@ -42,6 +42,8 @@ pub enum NetOut {
     Swing,
     /// phím di chuyển hiện tại (bit: tiến 1, lùi 2, trái 4, phải 8, nhảy 16, ngồi 32, chạy 64) như player_input của bản gốc
     Input(u8),
+    /// cuối mỗi tick của client (gói tick_end như bản gốc)
+    TickEnd,
     /// bấm ô `slot` của cửa sổ vật chứa `win` (click trái thường)
     Click { win: i32, state: i32, slot: i16, button: i8, mode: i32 },
     /// đóng cửa sổ vật chứa
@@ -108,6 +110,9 @@ pub struct NetState {
     pub players: std::collections::HashMap<i32, Pl>,
     /// số thứ tự hành động mới nhất server đã xác nhận (acknowledge_player_digging)
     pub ack: i32,
+    /// số lần server dịch chuyển ta và độ lệch gần nhất so với vị trí ta đã báo (để dò lỗi)
+    pub tp_n: u32,
+    pub tp_dbg: String,
     /// cửa sổ vật chứa đang mở (None = không có)
     pub win: Option<NetWin>,
     /// luồng đọc đặt true khi `win` đổi (mở, đóng, nội dung); luồng vẽ đọc rồi xóa
@@ -617,6 +622,12 @@ pub fn start(conn: Conn) -> Result<Link, String> {
                 }
                 let (x, y, z, yaw, pitch, ground, hcol) = match m {
                     NetOut::Pos { x, y, z, yaw, pitch, ground, hcol } => (x, y, z, yaw, pitch, ground, hcol),
+                    NetOut::TickEnd => {
+                        if wsend_play(&wr, 0x0c, &[]).is_err() {
+                            break;
+                        }
+                        continue;
+                    }
                     NetOut::Input(bits) => {
                         if bits != last_in {
                             if (bits & 64 != 0) != (last_in & 64 != 0) {
@@ -1068,6 +1079,19 @@ fn reader(s: &mut TcpStream, comp: bool, wr: &Shared, tx: &Sender<NetIn>, cur: &
                     i += 16;
                 }
             }
+            0x47 => {
+                let yaw = rd_f32(&b, &mut i).unwrap_or(0.0);
+                let ry = b.get(i).copied().unwrap_or(0) != 0;
+                i += 1;
+                let pitch = rd_f32(&b, &mut i).unwrap_or(0.0);
+                let rp = b.get(i).copied().unwrap_or(0) != 0;
+                let mut c = cur.lock().unwrap();
+                let nyaw = if ry { c[3] as f32 + yaw } else { yaw };
+                let npitch = if rp { c[4] as f32 + pitch } else { pitch };
+                c[3] = nyaw as f64;
+                c[4] = npitch as f64;
+                let _ = tx.send(NetIn::Tp { x: c[0], y: c[1], z: c[2], yaw: nyaw, pitch: npitch });
+            }
             0x46 => {
                 let tid = rd_varint(&b, &mut i).unwrap_or(0);
                 let (x, y, z) = (rd_f64(&b, &mut i).unwrap_or(0.0), rd_f64(&b, &mut i).unwrap_or(0.0), rd_f64(&b, &mut i).unwrap_or(0.0));
@@ -1078,6 +1102,11 @@ fn reader(s: &mut TcpStream, comp: bool, wr: &Shared, tx: &Sender<NetIn>, cur: &
                 let rel = |bit: u32, new: f64, old: f64| if flags & (1 << bit) != 0 { old + new } else { new };
                 let (nx, ny, nz) = (rel(0, x, c[0]), rel(1, y, c[1]), rel(2, z, c[2]));
                 let (nyaw, npitch) = (rel(3, yaw as f64, c[3]) as f32, rel(4, pitch as f64, c[4]) as f32);
+                {
+                    let mut g = st.lock().unwrap();
+                    g.tp_n += 1;
+                    g.tp_dbg = format!("tp#{} lệch {:+.2} {:+.2} {:+.2} cờ {:#x}", g.tp_n, nx - c[0], ny - c[1], nz - c[2], flags);
+                }
                 let mut ack = Vec::new();
                 put_varint(&mut ack, tid as u32);
                 wsend(wr, 0x00, &ack)?;

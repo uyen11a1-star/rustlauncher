@@ -1042,6 +1042,9 @@ impl View {
             let ld = self.col.as_ref().map_or(0, |c| c.world.chunks.len());
             let here = self.col.as_ref().map_or(true, |c| c.loaded(px, pz));
             let dbg = format!("{} | gửi {} | xn {} | chunk {} {} | y {:.1}", self.aim_dbg, self.sent, ack, ld, if here { "ok" } else { "CHƯA NẠP" }, self.player.pos[1]);
+            let tpd = self.net_state.as_ref().map_or(String::new(), |st| st.lock().unwrap().tp_dbg.clone());
+            let tw2 = g.text_width(&tpd, 11.0 * s);
+            g.text(w / 2.0 - tw2 / 2.0, h / 2.0 + 28.0 * s, 11.0 * s, 0xffff80e0, &tpd);
             let tw = g.text_width(&dbg, 11.0 * s);
             g.text(w / 2.0 - tw / 2.0, h / 2.0 + 14.0 * s, 11.0 * s, 0xffffffd0, &dbg);
             // chấm ngắm giữa màn hình
@@ -1327,6 +1330,7 @@ impl View {
                 if let Some(n) = &self.net {
                     let b = (inp.fwd > 0.1) as u8 | (((inp.fwd < -0.1) as u8) << 1) | (((inp.strafe < -0.1) as u8) << 2) | (((inp.strafe > 0.1) as u8) << 3) | ((inp.jump as u8) << 4) | ((self.player.sneaking as u8) << 5) | ((self.player.sprinting as u8) << 6);
                     let _ = n.send(crate::netplay::NetOut::Input(b));
+                    let _ = n.send(crate::netplay::NetOut::TickEnd);
                 }
                 if let Some(n) = &self.net {
                     let p = self.player.pos;
