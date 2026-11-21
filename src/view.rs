@@ -1042,7 +1042,30 @@ impl View {
             let ld = self.col.as_ref().map_or(0, |c| c.world.chunks.len());
             let here = self.col.as_ref().map_or(true, |c| c.loaded(px, pz));
             let dbg = format!("{} | gửi {} | xn {} | chunk {} {} | y {:.1}", self.aim_dbg, self.sent, ack, ld, if here { "ok" } else { "CHƯA NẠP" }, self.player.pos[1]);
-            let tpd = self.net_state.as_ref().map_or(String::new(), |st| st.lock().unwrap().tp_dbg.clone());
+            let (tpn, tpd) = self.net_state.as_ref().map_or((0, String::new()), |st| {
+                let g = st.lock().unwrap();
+                (g.tp_n, g.tp_dbg.clone())
+            });
+            static LAST_TP: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if tpn != LAST_TP.swap(tpn, std::sync::atomic::Ordering::Relaxed) {
+                if let Some(c) = &self.col {
+                    let p = self.player.pos;
+                    let (bx, by, bz) = (p[0].floor() as i32, p[1].floor() as i32, p[2].floor() as i32);
+                    let mut near = String::new();
+                    for dy in -1..=2 {
+                        for dz in -1..=1 {
+                            for dx in -1..=1 {
+                                let id = c.world.get(bx + dx, by + dy, bz + dz);
+                                if id != 0 {
+                                    near.push_str(&format!("[{dx},{dy},{dz}]{}{} ", self.state_name(id), c.shapes.get(id as usize).map_or(String::new(), |s| format!("/{}hop", s.boxes.len()))));
+                                }
+                            }
+                        }
+                    }
+                    crate::netplay::trace(format!("CTX view pos=({:.3},{:.3},{:.3}) vel=({:.3},{:.3},{:.3}) dat={} khối quanh: {}", p[0], p[1], p[2], self.player.vel[0], self.player.vel[1], self.player.vel[2], self.player.on_ground, near));
+                    crate::netplay::trace_flush();
+                }
+            }
             let tw2 = g.text_width(&tpd, 11.0 * s);
             g.text(w / 2.0 - tw2 / 2.0, h / 2.0 + 28.0 * s, 11.0 * s, 0xffff80e0, &tpd);
             let tw = g.text_width(&dbg, 11.0 * s);

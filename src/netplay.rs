@@ -53,6 +53,26 @@ pub enum NetOut {
 pub use crate::winnet::{click_packet, NetWin};
 
 /// Server vừa dịch chuyển ta: bỏ các gói vị trí cũ (gửi trước khi luồng vẽ kịp nhận vị trí mới), kẻo server dịch chuyển lại mãi.
+static T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+static LOG: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// Ghi một dòng vào nhật ký dò lỗi mạng (giữ 300 dòng gần nhất).
+pub fn trace(line: String) {
+    let ms = T0.get_or_init(std::time::Instant::now).elapsed().as_millis();
+    let mut g = LOG.lock().unwrap();
+    g.push(format!("{ms:>7} {line}"));
+    if g.len() > 400 {
+        let n = g.len() - 300;
+        g.drain(..n);
+    }
+}
+
+/// Ghi nhật ký ra tệp Download/rustlauncher-trace.txt để gửi đi.
+pub fn trace_flush() {
+    let g = LOG.lock().unwrap();
+    let _ = std::fs::write("/storage/emulated/0/Download/rustlauncher-trace.txt", g.join("\n"));
+}
+
 static EID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
 static TP_WAIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static TP_DROPPED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -640,6 +660,7 @@ pub fn start(conn: Conn) -> Result<Link, String> {
                                 }
                             }
                             last_in = bits;
+                            trace(format!("PHIM bits={bits:#09b} (1 tien 2 lui 4 trai 8 phai 16 nhay 32 ngoi 64 chay)"));
                             if wsend_play(&wr, 0x2a, &[bits]).is_err() {
                                 break;
                             }
@@ -777,6 +798,7 @@ pub fn start(conn: Conn) -> Result<Link, String> {
                 };
                 last_ground = ground;
                 b.push(flags);
+                trace(format!("GUI {id:#x} {x:.3} {y:.3} {z:.3} yaw {yaw:.1} pitch {pitch:.1} g{} h{}", ground as u8, hcol as u8));
                 if wsend_play(&wr, id, &b).is_err() {
                     break;
                 }
@@ -1102,6 +1124,8 @@ fn reader(s: &mut TcpStream, comp: bool, wr: &Shared, tx: &Sender<NetIn>, cur: &
                 let rel = |bit: u32, new: f64, old: f64| if flags & (1 << bit) != 0 { old + new } else { new };
                 let (nx, ny, nz) = (rel(0, x, c[0]), rel(1, y, c[1]), rel(2, z, c[2]));
                 let (nyaw, npitch) = (rel(3, yaw as f64, c[3]) as f32, rel(4, pitch as f64, c[4]) as f32);
+                trace(format!("NHAN gói vị trí 0x46: id={tid} server=({nx:.3},{ny:.3},{nz:.3}) yaw {nyaw:.1} pitch {npitch:.1} cờ={flags:#x} | ta báo cuối=({:.3},{:.3},{:.3})", c[0], c[1], c[2]));
+                trace_flush();
                 {
                     let mut g = st.lock().unwrap();
                     g.tp_n += 1;
