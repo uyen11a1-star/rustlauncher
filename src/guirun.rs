@@ -130,10 +130,8 @@ impl GuiRun {
         let prog = Arc::new((AtomicUsize::new(0), AtomicUsize::new(1)));
         {
             let (jar, slot, prog, ver) = (jar.clone(), slot.clone(), prog.clone(), version.clone());
-            let pano_dir = crate::mc::pano_dir(&root, &version);
             std::thread::spawn(move || {
-                let src = crate::mcgui::pano::Layered { jar: &*jar, dir: pano_dir };
-                let a = GuiAssets::load(&src, &ver, &|d, t| {
+                let a = GuiAssets::load(&*jar, &ver, &|d, t| {
                     prog.0.store(d, Relaxed);
                     prog.1.store(t.max(1), Relaxed);
                 });
@@ -245,7 +243,6 @@ impl GuiRun {
                                 self.log.lock().unwrap().push(format!("pano{k}: {}x{} giữa={} 1/4={} 3/4={}", im.w, im.h, px(im.w / 2, im.h / 2), px(im.w / 4, im.h / 4), px(im.w * 3 / 4, im.h * 3 / 4)));
                             }
                         }
-                        self.log.lock().unwrap().push(format!("Panorama: {}", a.pano_note));
                         self.log.lock().unwrap().push(format!("Giao diện: {} ảnh, {} sprite, panorama {}", a.imgs.len(), a.sprites.len(), if a.pano.is_some() { "có" } else { "KHÔNG nạp được" }));
                         self.assets = a;
                         self.loaded = true;

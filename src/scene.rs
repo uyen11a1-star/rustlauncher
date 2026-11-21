@@ -441,7 +441,7 @@ impl Worker {
                 }
                 Src::Net(link) => {
                     let mut n = 0;
-                    while n < 8 {
+                    while n < 24 {
                         match link.rx.try_recv() {
                             Ok(crate::netplay::NetIn::Chunk(rc)) => {
                                 want.push((rc.cx, rc.cz));

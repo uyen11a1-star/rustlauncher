@@ -161,11 +161,6 @@ pub struct View {
     u_fogc: i32,
     u_tint: i32,
     inv_tex: Option<(u32, f32, f32)>,
-    chest_tex: Option<(u32, f32, f32)>,
-    /// cửa sổ vật chứa server đang mở (rương, menu chọn chế độ chơi)
-    win: Option<crate::netplay::NetWin>,
-    /// vị trí ngón tay trên cửa sổ vật chứa (để hiện tên vật)
-    win_pt: Option<(f32, f32)>,
     hot_tex: Option<(u32, f32, f32, [f32; 4])>,
     sel_tex: Option<(u32, f32, f32, [f32; 4])>,
     body_gpu: Gpu,
@@ -571,7 +566,6 @@ impl View {
                 glTexParameteri(GL_TEXTURE_2D, p, v);
             }
             let inv_tex = d.items.inv.as_ref().map(|t| (make_tex(&t.rgba, t.w, t.h), t.w as f32, t.h as f32));
-            let chest_tex = d.items.chest.as_ref().map(|t| (make_tex(&t.rgba, t.w, t.h), t.w as f32, t.h as f32));
             let hot_tex = d.items.hot.as_ref().map(|(t, r)| (make_tex(&t.rgba, t.w, t.h), t.w as f32, t.h as f32, *r));
             let sel_tex = d.items.sel.as_ref().map(|(t, r)| (make_tex(&t.rgba, t.w, t.h), t.w as f32, t.h as f32, *r));
             let body_gpu = upload_raw(&d.items.body_v, &d.items.body_i);
@@ -586,9 +580,6 @@ impl View {
             Ok(View {
                 u_tint,
                 inv_tex,
-                chest_tex,
-                win: None,
-                win_pt: None,
                 hot_tex,
                 sel_tex,
                 body_gpu,
@@ -690,51 +681,6 @@ impl View {
         glDrawArrays(GL_TRIANGLES, 0, 6);
     }
 
-    /// Bố cục cửa sổ vật chứa đang mở.
-    fn win_layout(&self, g: &Gfx) -> Option<crate::winui::Layout> {
-        let w = self.win.as_ref()?;
-        let nc = crate::winui::container_slots(w.slots.len());
-        Some(crate::winui::layout(g.w as f32, g.h as f32, crate::winui::rows_for(w.kind, nc), nc))
-    }
-
-    /// Đóng cửa sổ vật chứa và báo server.
-    fn win_close(&mut self) {
-        self.touches.clear();
-        if let Some(w) = self.win.take() {
-            if let Some(tx) = &self.net {
-                let _ = tx.send(crate::netplay::NetOut::CloseWin(w.id));
-            }
-        }
-        if let Some(st) = &self.net_state {
-            let mut g = st.lock().unwrap();
-            g.win = None;
-            g.win_dirty = false;
-        }
-    }
-
-    /// Nhả ngón trong cửa sổ vật chứa: bấm ô vật chứa, nút Đóng, hoặc chạm ra ngoài khung để đóng.
-    fn win_tap(&mut self, g: &Gfx, x: f32, y: f32) {
-        if inside(rect_exit(g), x, y) {
-            self.exit = true;
-            return;
-        }
-        let Some(l) = self.win_layout(g) else { return };
-        if inside(rect_bag(g), x, y) || !inside(l.panel, x, y) {
-            self.win_close();
-            return;
-        }
-        let Some(w) = &self.win else { return };
-        let nc = crate::winui::container_slots(w.slots.len());
-        if let Some(i) = crate::winui::hit(&l, x, y) {
-            // chỉ ô vật chứa có vật mới gửi click (túi người chơi chỉ để xem)
-            if i < nc && w.slots.get(i).map_or(false, |s| s.is_some()) {
-                if let Some(tx) = &self.net {
-                    let _ = tx.send(crate::netplay::NetOut::Click { win: w.id, state: w.state_id, slot: i as i16, button: 0, mode: 0 });
-                }
-            }
-        }
-    }
-
     pub fn take_kick(&mut self) -> Option<String> {
         self.kicked.take()
     }
@@ -752,16 +698,6 @@ impl View {
 
     pub fn touch(&mut self, id: i32, phase: Phase, x: f32, y: f32, g: &Gfx) {
         if self.frozen {
-            return;
-        }
-        if self.win.is_some() {
-            match phase {
-                Phase::Up => {
-                    self.win_pt = None;
-                    self.win_tap(g, x, y);
-                }
-                _ => self.win_pt = Some((x, y)),
-            }
             return;
         }
         if self.chat_open {
@@ -1027,7 +963,7 @@ impl View {
 
     /// Lượt cuối (2D): tin nhắn, nút chat, và màn chat có bàn phím.
     fn chat_pass(&mut self, g: &mut Gfx) {
-        if self.net.is_none() || self.inv_open || self.win.is_some() {
+        if self.net.is_none() || self.inv_open {
             return;
         }
         let s = g.scale;
@@ -1038,7 +974,10 @@ impl View {
         if !self.chat_open {
             // dòng dò lỗi dưới chấm ngắm: khối đang ngắm, số lần gửi, số xác nhận của server
             let ack = self.net_state.as_ref().map_or(0, |st| st.lock().unwrap().ack);
-            let dbg = format!("{} | gửi {} | server xác nhận {}", self.aim_dbg, self.sent, ack);
+            let (px, pz) = (self.player.pos[0].floor() as i32, self.player.pos[2].floor() as i32);
+            let ld = self.col.as_ref().map_or(0, |c| c.world.chunks.len());
+            let here = self.col.as_ref().map_or(true, |c| c.loaded(px, pz));
+            let dbg = format!("{} | gửi {} | xn {} | chunk {} {} | y {:.1}", self.aim_dbg, self.sent, ack, ld, if here { "ok" } else { "CHƯA NẠP" }, self.player.pos[1]);
             let tw = g.text_width(&dbg, 11.0 * s);
             g.text(w / 2.0 - tw / 2.0, h / 2.0 + 14.0 * s, 11.0 * s, 0xffffffd0, &dbg);
             // chấm ngắm giữa màn hình
@@ -1156,20 +1095,6 @@ impl View {
                     for i in 0..SLOTS {
                         self.inv.slots[i] = g.inv.get(i).copied().flatten().map(|(id, n)| crate::inv::Stack { item: id as u16, n });
                     }
-                }
-                if g.win_dirty {
-                    g.win_dirty = false;
-                    let nw = g.win.clone();
-                    if self.win.is_none() && nw.is_some() {
-                        // server vừa mở cửa sổ: bỏ mọi thao tác đang giữ
-                        self.touches.clear();
-                        self.inv_open = false;
-                        self.chat_open = false;
-                        self.ui_down = None;
-                        self.attack_held = false;
-                        self.win_pt = None;
-                    }
-                    self.win = nw;
                 }
                 if let Some(h) = g.held.take() {
                     self.inv.sel = h as usize;
@@ -1479,7 +1404,7 @@ impl View {
             }
 
             // tay Steve / khối cầm: vẽ sau cùng, xoá độ sâu để không bị khối thế giới che
-            if !self.inv_open && self.win.is_none() {
+            if !self.inv_open {
                 glClear(GL_DEPTH_BUFFER_BIT);
                 glDisable(GL_CULL_FACE);
                 glUniform2f(self.u_fog, 1.0e6, 2.0e6);
@@ -1518,23 +1443,15 @@ impl View {
         }
         let (w, h) = (g.w as f32, g.h as f32);
         let k = gs(g);
-        let slots: Vec<(usize, [f32; 4])> = if self.win.is_some() { Vec::new() } else if self.inv_open { (0..SLOTS).map(|i| (i, inv_item_rect(g, i))).collect() } else { (0..9).map(|i| (i, hot_item_rect(g, i))).collect() };
+        let slots: Vec<(usize, [f32; 4])> = if self.inv_open { (0..SLOTS).map(|i| (i, inv_item_rect(g, i))).collect() } else { (0..9).map(|i| (i, hot_item_rect(g, i))).collect() };
 
         // lượt 1 (2D): nền tối, chữ HUD, dấu ngắm, nút
         g.begin();
         if self.hurt_t > 0.0 {
             g.rect(0.0, 0.0, w, h, 0xc0000000 | ((self.hurt_t / 0.4 * 110.0) as u32).min(255));
         }
-        if self.inv_open || self.win.is_some() {
+        if self.inv_open {
             g.rect(0.0, 0.0, w, h, 0x101010c8);
-            if self.chest_tex.is_none() {
-                if let Some(l) = self.win_layout(g) {
-                    g.rect(l.panel[0], l.panel[1], l.panel[2], l.panel[3], 0xc6c6c6ff);
-                    for r in &l.slots {
-                        g.rect(r[0] - l.k, r[1] - l.k, 18.0 * l.k, 18.0 * l.k, 0x8b8b8bff);
-                    }
-                }
-            }
         } else {
             g.text(12.0 * s, 84.0 * s, 13.0 * s, 0xffffffff, &format!("FPS {}  x{:.0} y{:.0} z{:.0}  chunk {}/{}  đỉnh {}k  {}", self.fps, self.pos[0], self.pos[1], self.pos[2], self.drawn_chunks, self.gpu.len(), self.drawn_verts / 1000, if self.player.fly { "bay" } else if self.player.on_ground { "đất" } else { "không" }));
             // dấu ngắm 15x15 đơn vị GUI giữa màn hình
@@ -1549,10 +1466,9 @@ impl View {
         let on = 0x2e8b57c0u32;
         let off = 0x00000090u32;
         let fly_label = if self.player.fly { "Bay: bật" } else { "Bay: tắt" };
-        let modal = self.inv_open || self.win.is_some();
-        let bag_label = if modal { "Đóng" } else { "Túi đồ" };
-        let mut buttons: Vec<([f32; 4], &str, u32)> = vec![(rect_exit(g), "II", 0x404040d0u32), (rect_bag(g), bag_label, if modal { on } else { off })];
-        if !modal {
+        let bag_label = if self.inv_open { "Đóng" } else { "Túi đồ" };
+        let mut buttons: Vec<([f32; 4], &str, u32)> = vec![(rect_exit(g), "II", 0x404040d0u32), (rect_bag(g), bag_label, if self.inv_open { on } else { off })];
+        if !self.inv_open {
             buttons.push((rect_jump(g), if self.player.fly { "Lên" } else { "Nhảy" }, if self.jump_held { on } else { off }));
             buttons.push((rect_sneak(g), if self.player.fly { "Xuống" } else { "Lén" }, if self.sneak_on { on } else { off }));
             buttons.push((rect_fly(g), fly_label, if self.player.fly { on } else { off }));
@@ -1583,12 +1499,7 @@ impl View {
             glUniform1i(self.u_tex, 0);
             let om = items::ortho(w, h);
             glUniformMatrix4fv(self.u_mvp, 1, 0, om.as_ptr());
-            if self.win.is_some() {
-                if let (Some((t, tw, th)), Some(l)) = (self.chest_tex, self.win_layout(g)) {
-                    self.quad(t, l.top_dst, l.top_src, tw, th);
-                    self.quad(t, l.bot_dst, l.bot_src, tw, th);
-                }
-            } else if self.inv_open {
+            if self.inv_open {
                 if let Some((t, tw, th)) = self.inv_tex {
                     let p = inv_panel(g);
                     self.quad(t, [p[0], p[1], p[2], p[3]], [0.0, 0.0, 176.0, 166.0], tw, th);
@@ -1681,13 +1592,6 @@ impl View {
                         draw(c.item, self.ui_pt.0, self.ui_pt.1 - 14.0 * k, 16.0 * k, 16.0 * k * 3.0);
                     }
                 }
-                if let (Some(wn), Some(l)) = (&self.win, self.win_layout(g)) {
-                    for (i, r) in l.slots.iter().enumerate() {
-                        if let Some(Some((id, _, _))) = wn.slots.get(i) {
-                            draw(*id as u16, r[0] + r[2] / 2.0, r[1] + r[3] / 2.0, 16.0 * k, 0.0);
-                        }
-                    }
-                }
             }
             glDisable(GL_DEPTH_TEST);
         }
@@ -1702,7 +1606,7 @@ impl View {
                     g.rect(r[0], r[1], r[2], r[3], 0x80ffffff);
                 }
             }
-        } else if self.win.is_none() {
+        } else {
             if self.sel_tex.is_none() {
                 let r = hot_slot_rect(g, self.inv.sel);
                 let t = 2.0 * k;
@@ -1730,39 +1634,6 @@ impl View {
             if let Some(c) = self.inv.cursor {
                 let sz = 16.0 * k;
                 draw_count(g, [self.ui_pt.0 - sz / 2.0, self.ui_pt.1 - 14.0 * k - sz / 2.0, sz, sz], c.n);
-            }
-        }
-        if let (Some(wn), Some(l)) = (&self.win, self.win_layout(g)) {
-            let ts = 9.0 * l.k;
-            let title = crate::winui::strip_codes(&wn.title);
-            if !title.is_empty() {
-                g.text(l.title_at.0, l.title_at.1, ts, 0x404040ff, &title);
-            }
-            g.text(l.label_at.0, l.label_at.1, ts, 0x404040ff, "Túi đồ");
-            for (i, r) in l.slots.iter().enumerate() {
-                if let Some(Some((_, n, _))) = wn.slots.get(i) {
-                    draw_count(g, *r, *n);
-                }
-            }
-            // ngón tay đang chạm: tô sáng ô và hiện tên vật (nhả ngón để bấm)
-            if let Some((px, py)) = self.win_pt {
-                if let Some(i) = crate::winui::hit(&l, px, py) {
-                    let r = l.slots[i];
-                    g.rect(r[0], r[1], r[2], r[3], 0x80ffffff);
-                    if let Some(Some((id, _, nm))) = wn.slots.get(i) {
-                        let name = nm.clone().or_else(|| self.items.get(*id as usize).map(|it| it.name.clone())).unwrap_or_default();
-                        if !name.is_empty() {
-                            let size = 9.0 * l.k;
-                            let tw = g.text_width(&crate::winui::strip_codes(&name), size);
-                            let (bw, bh) = (tw + 8.0 * l.k, size * 1.25 + 6.0 * l.k);
-                            let tx = (px + 12.0 * l.k).min(w - bw).max(0.0);
-                            let ty = (py - 12.0 * l.k - bh).max(0.0);
-                            g.rect(tx - l.k, ty - l.k, bw + 2.0 * l.k, bh + 2.0 * l.k, 0x2a0066ff);
-                            g.rect(tx, ty, bw, bh, 0x100010f0);
-                            draw_legacy(g, tx + 4.0 * l.k, ty + 3.0 * l.k, size, &name, 255);
-                        }
-                    }
-                }
             }
         }
         g.end(None);
