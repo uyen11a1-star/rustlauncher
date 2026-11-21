@@ -48,6 +48,10 @@ pub enum NetOut {
 
 pub use crate::winnet::{click_packet, NetWin};
 
+/// Server vừa dịch chuyển ta: bỏ các gói vị trí cũ (gửi trước khi luồng vẽ kịp nhận vị trí mới), kẻo server dịch chuyển lại mãi.
+static TP_WAIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static TP_DROPPED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
 static SEQ: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
 
 fn next_seq() -> i32 {
@@ -697,6 +701,18 @@ pub fn start(conn: Conn) -> Result<Link, String> {
                     }
                 };
                 *cur.lock().unwrap() = [x, y, z, yaw as f64, pitch as f64];
+                {
+                    use std::sync::atomic::Ordering::Relaxed;
+                    let mut c = cur.lock().unwrap();
+                    if TP_WAIT.load(Relaxed) {
+                        let far = (x - c[0]).abs() + (y - c[1]).abs() + (z - c[2]).abs() > 1.0;
+                        if far && TP_DROPPED.fetch_add(1, Relaxed) < 40 {
+                            continue;
+                        }
+                        TP_WAIT.store(false, Relaxed);
+                    }
+                    *c = [x, y, z, yaw as f64, pitch as f64];
+                }
                 let mut b = Vec::with_capacity(34);
                 for v in [x, y, z] {
                     b.extend_from_slice(&v.to_be_bytes());
@@ -1012,7 +1028,12 @@ fn reader(s: &mut TcpStream, comp: bool, wr: &Shared, tx: &Sender<NetIn>, cur: &
                 p.extend_from_slice(&npitch.to_be_bytes());
                 p.push(0);
                 wsend(wr, 0x1e, &p)?;
-                *cur.lock().unwrap() = [nx, ny, nz, nyaw as f64, npitch as f64];
+                {
+                    let mut c = cur.lock().unwrap();
+                    TP_DROPPED.store(0, std::sync::atomic::Ordering::Relaxed);
+                    TP_WAIT.store(true, std::sync::atomic::Ordering::Relaxed);
+                    *c = [nx, ny, nz, nyaw as f64, npitch as f64];
+                }
                 let _ = tx.send(NetIn::Tp { x: nx, y: ny, z: nz, yaw: nyaw, pitch: npitch });
             }
             _ => {}
