@@ -34,7 +34,7 @@ const PFS: &str = "#version 300 es
 precision highp float;
 in vec2 v_p;
 uniform sampler2D t0; uniform sampler2D t1; uniform sampler2D t2; uniform sampler2D t3; uniform sampler2D t4; uniform sampler2D t5;
-uniform vec3 u_f; uniform vec3 u_r; uniform vec3 u_u; uniform vec2 u_k; uniform float u_a; uniform vec2 u_b;
+uniform vec3 u_f; uniform vec3 u_r; uniform vec3 u_u; uniform vec2 u_k; uniform float u_a; uniform vec2 u_b; uniform int u_n;
 out vec4 o;
 vec3 cube(vec3 d){
   vec3 a = abs(d); vec2 uv; vec4 c;
@@ -54,8 +54,9 @@ void main(){
   vec2 off[12] = vec2[12](vec2(0.5,0.0),vec2(0.25,0.433),vec2(-0.25,0.433),vec2(-0.5,0.0),vec2(-0.25,-0.433),vec2(0.25,-0.433),
     vec2(1.0,0.0),vec2(0.5,0.866),vec2(-0.5,0.866),vec2(-1.0,0.0),vec2(-0.5,-0.866),vec2(0.5,-0.866));
   vec3 sum = vec3(0.0); float n = 0.0;
-  for (int i = -1; i < 12; i++) {
-    vec2 p = v_p; if (i >= 0) p += off[i]*u_b;
+  for (int i = 0; i < 13; i++) {
+    if (i >= u_n) break;
+    vec2 p = v_p; if (i > 0) p += off[i-1]*u_b;
     vec3 d = u_f + u_r*(p.x*u_k.x) + u_u*(p.y*u_k.y);
     sum += cube(d); n += 1.0;
   }
@@ -85,6 +86,9 @@ pub struct GlCanvas {
     cmds: Vec<Cmd>,
     // panorama chờ vẽ ngay (vẽ trước mọi thứ khác trong khung)
     pano: Option<([usize; 6], f32, f32, f32, f32, f32)>,
+    /// chẩn đoán panorama (ghi vào nhật ký một lần)
+    pub diag: Option<String>,
+    frames: u32,
     sizes: Vec<(f32, f32)>,
     /// xoá khung hình trước khi vẽ (tắt khi vẽ đè lên cảnh game)
     pub clear: bool,
@@ -131,6 +135,8 @@ impl GlCanvas {
             verts: Vec::new(),
             cmds: Vec::new(),
             pano: None,
+            diag: None,
+            frames: 0,
             sizes: imgs.iter().map(|i| (i.w as f32, i.h as f32)).collect(),
             clear: true,
         })
@@ -186,6 +192,13 @@ impl GlCanvas {
             }
             if let Some((faces, yaw, pitch, fov, alpha, blur)) = self.pano {
                 self.draw_pano(&faces, yaw, pitch, fov, alpha, blur);
+                self.frames += 1;
+                if self.frames == 40 {
+                    let mut px = [0u8; 4];
+                    glReadPixels(self.w / 2, self.h / 2, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px.as_mut_ptr() as *mut _);
+                    let e = glGetError();
+                    self.diag = Some(format!("Panorama: điểm giữa màn hình = {},{},{},{} (glError {:#x}), {}x{}", px[0], px[1], px[2], px[3], e, self.w, self.h));
+                }
             }
             if self.verts.is_empty() {
                 return;
@@ -247,6 +260,7 @@ impl GlCanvas {
         glUniform3f(glGetUniformLocation(self.pprog, cs("u_u").as_ptr()), up[0], up[1], up[2]);
         glUniform2f(glGetUniformLocation(self.pprog, cs("u_k").as_ptr()), t * asp, t);
         glUniform1f(glGetUniformLocation(self.pprog, cs("u_a").as_ptr()), alpha);
+        glUniform1i(glGetUniformLocation(self.pprog, cs("u_n").as_ptr()), if blur > 0.01 { 13 } else { 1 });
         glUniform2f(glGetUniformLocation(self.pprog, cs("u_b").as_ptr()), blur * 2.0 / self.w as f32, blur * 2.0 / self.h as f32);
         for (i, fi) in faces.iter().enumerate() {
             glActiveTexture(GL_TEXTURE0 + i as u32);

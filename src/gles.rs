@@ -72,6 +72,7 @@ extern "C" {
     pub fn glDrawArrays(mode: u32, first: i32, count: i32);
     pub fn glDrawElements(mode: u32, count: i32, ty: u32, offset: *const c_void);
     pub fn glGetError() -> u32;
+    pub fn glReadPixels(x: i32, y: i32, w: i32, h: i32, format: u32, ty: u32, data: *mut c_void);
     pub fn glUniformMatrix4fv(loc: i32, count: i32, transpose: u8, v: *const f32);
     pub fn glDepthFunc(f: u32);
     pub fn glDeleteBuffers(n: i32, b: *const u32);

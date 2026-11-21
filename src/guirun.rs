@@ -356,6 +356,9 @@ impl GuiRun {
             // chưa nạp xong GUI: nền đỏ + logo do Boot vẽ (nền gồm trong Boot::draw)
         }
         self.canvas.end();
+        if let Some(d) = self.canvas.diag.take() {
+            self.log.lock().unwrap().push(d);
+        }
 
         // kết nối server đã đăng nhập xong -> bắt đầu phiên chơi
         if let Some(c) = self.gui.as_mut().and_then(|g| g.joined.take()) {
