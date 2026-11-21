@@ -760,6 +760,14 @@ fn reader(s: &mut TcpStream, comp: bool, wr: &Shared, tx: &Sender<NetIn>, cur: &
             0x04 => wsend(wr, 0x04, &body)?,
             0x05 => wsend(wr, 0x05, &body)?,
             0x0e => wsend(wr, 0x07, &[0])?,
+            0x09 if body.len() >= 16 => {
+                // server đẩy resource pack: báo đã nhận, tải xong và nạp xong (không thật sự tải) để khỏi bị giữ chân
+                for st in [3u8, 4, 0] {
+                    let mut r = body[..16].to_vec();
+                    put_varint(&mut r, st as u32);
+                    wsend(wr, 0x06, &r)?;
+                }
+            }
             0x07 => {
                 let reg = rd_str(&body, &mut i).unwrap_or_default();
                 let n = rd_varint(&body, &mut i).unwrap_or(0);
@@ -862,6 +870,13 @@ fn reader(s: &mut TcpStream, comp: bool, wr: &Shared, tx: &Sender<NetIn>, cur: &
                 return Err(format!("Disconnected: server yêu cầu chuyển sang {host}:{port} (chưa hỗ trợ transfer)"));
             }
             0x2b => wsend(wr, 0x1b, &b)?,
+            0x4f if b.len() >= 16 => {
+                for st in [3u8, 4, 0] {
+                    let mut r = b[..16].to_vec();
+                    put_varint(&mut r, st as u32);
+                    wsend_play(wr, 0x30, &r)?;
+                }
+            }
             0x3b => wsend(wr, 0x2c, &b)?,
             0x20 => return Err(format!("Disconnected: {}", nbt_text(&b))),
             0x2c => match parse_chunk(&mut ctx, &b) {
