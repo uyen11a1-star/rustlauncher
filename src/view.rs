@@ -821,7 +821,8 @@ impl View {
 
     /// Chat đang mở -> cần bàn phím hệ thống.
     pub fn wants_text(&self) -> bool {
-        self.chat_open
+        // bàn phím hệ thống bị đơ nên tạm tắt; dùng bàn phím tự vẽ
+        false
     }
 
     pub fn key_input(&mut self, k: KeyIn) {
@@ -1000,27 +1001,13 @@ impl View {
             g.end(None);
             return;
         }
-        // màn chat dùng bàn phím của hệ thống (hiện ở nửa dưới): ô nhập và lịch sử nằm phía trên
+        // màn chat: nền tối, lịch sử, ô nhập, bàn phím chiếm nửa dưới
         let tap = self.chat_tap.take();
-        g.rect(0.0, 0.0, w, h * 0.5, 0x000000a0);
-        let bar_h = 36.0 * s;
-        let bar_y = 8.0 * s;
-        let btn_w = 84.0 * s;
-        g.rect(8.0 * s, bar_y, w - 16.0 * s - 2.0 * (btn_w + 6.0 * s), bar_h, 0x000000d0);
-        g.rect(8.0 * s, bar_y, w - 16.0 * s - 2.0 * (btn_w + 6.0 * s), 2.0 * s, 0xffffffa0);
-        let shown_text = format!("{}_", self.chat_text);
-        let mut t = shown_text.as_str();
-        let room = w - 16.0 * s - 2.0 * (btn_w + 6.0 * s) - 16.0 * s;
-        while g.text_width(t, size) > room && !t.is_empty() {
-            t = &t[t.chars().next().map_or(0, |c| c.len_utf8())..];
-        }
-        g.text(16.0 * s, bar_y + (bar_h - size * 1.2) / 2.0, size, 0xffffffff, t);
-        let rs = [w - 2.0 * btn_w - 14.0 * s, w - btn_w - 8.0 * s];
-        for (k, label) in ["Gửi", "Đóng"].iter().enumerate() {
-            g.rect(rs[k], bar_y, btn_w, bar_h, if k == 0 { 0x2e8b57d0 } else { 0x404040d0 });
-            let tw = g.text_width(label, 14.0 * s);
-            g.text(rs[k] + (btn_w - tw) / 2.0, bar_y + (bar_h - 18.0 * s) / 2.0, 14.0 * s, 0xffffffff, label);
-        }
+        g.rect(0.0, 0.0, w, h, 0x000000a0);
+        let kb_h = h * 0.52;
+        let kb_area = crate::ui::Rect::new(0.0, h - kb_h, w, kb_h);
+        let bar_h = 34.0 * s;
+        let bar_y = h - kb_h - bar_h - 6.0 * s;
         let maxw = w - 24.0 * s;
         let mut lines: Vec<String> = Vec::new();
         for (l, _) in self.chat_log.iter().rev().take(30) {
@@ -1031,35 +1018,33 @@ impl View {
                 break;
             }
         }
-        let rows = (((h * 0.5 - bar_y - bar_h - 8.0 * s) / lh) as usize).min(lines.len());
+        let rows = (((bar_y - 12.0 * s) / lh) as usize).min(lines.len());
         for j in 0..rows {
-            let y = bar_y + bar_h + 8.0 * s + (rows - 1 - j) as f32 * lh;
+            let y = bar_y - 8.0 * s - (j + 1) as f32 * lh;
             draw_legacy(g, 12.0 * s, y, size, &lines[j], 255);
         }
+        g.rect(8.0 * s, bar_y, w - 16.0 * s, bar_h, 0x000000d0);
+        g.rect(8.0 * s, bar_y, w - 16.0 * s, 2.0 * s, 0xffffffa0);
+        let shown_text = format!("{}_", self.chat_text);
+        let mut t = shown_text.as_str();
+        while g.text_width(t, size) > w - 40.0 * s && !t.is_empty() {
+            t = &t[t.chars().next().map_or(0, |c| c.len_utf8())..];
+        }
+        g.text(16.0 * s, bar_y + (bar_h - size * 1.2) / 2.0, size, 0xffffffff, t);
         let mut send = false;
         let mut close = false;
-        if let Some((x, y)) = tap {
-            if y >= bar_y && y < bar_y + bar_h {
-                if x >= rs[0] && x < rs[0] + btn_w {
-                    send = true;
-                } else if x >= rs[1] && x < rs[1] + btn_w {
-                    close = true;
+        match self.kb.draw(g, kb_area, tap) {
+            Some(crate::keyboard::Kb::Ch(c)) => {
+                if self.chat_text.chars().count() < 256 {
+                    self.chat_text.push(c);
                 }
             }
-        }
-        for k in std::mem::take(&mut self.keys_in) {
-            match k {
-                KeyIn::Char(c) => {
-                    if self.chat_text.chars().count() < 256 && !c.is_control() {
-                        self.chat_text.push(c);
-                    }
-                }
-                KeyIn::Back => {
-                    self.chat_text.pop();
-                }
-                KeyIn::Enter => send = true,
-                KeyIn::Esc => close = true,
+            Some(crate::keyboard::Kb::Back) => {
+                self.chat_text.pop();
             }
+            Some(crate::keyboard::Kb::Done) => send = true,
+            Some(crate::keyboard::Kb::Cancel) => close = true,
+            _ => {}
         }
         if send {
             let t = self.chat_text.trim().to_string();
