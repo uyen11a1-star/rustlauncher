@@ -437,3 +437,16 @@ impl BiomeSource {
         out
     }
 }
+
+impl BiomeSource {
+    /// Mọi tên quần xã có trong bảng (không trùng).
+    pub fn names(&self) -> Vec<&'static str> {
+        let mut v: Vec<&'static str> = Vec::new();
+        for e in &self.entries {
+            if !v.contains(&e.biome) {
+                v.push(e.biome);
+            }
+        }
+        v
+    }
+}

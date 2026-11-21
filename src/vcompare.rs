@@ -1,10 +1,10 @@
-//! Công cụ so sánh: sinh địa hình bằng bộ máy hàm mật độ rồi đối chiếu với chunk thật của thế giới.
+//! Công cụ so sánh: sinh địa hình, quần xã và lớp bề mặt bằng bộ máy rồi đối chiếu với chunk thật của thế giới.
 use std::{collections::HashMap, path::Path};
 
 use crate::{
     assets::Jar,
     vbiome::BiomeSource,
-    vdens::Router,
+    vdens::{steep_at, Router},
     world::{self, World, UNKNOWN},
 };
 
@@ -22,6 +22,11 @@ fn class(key: &str) -> u8 {
     }
 }
 
+fn short(key: &str) -> &str {
+    let n = key.split('[').next().unwrap_or(key);
+    n.strip_prefix("minecraft:").unwrap_or(n)
+}
+
 fn pct(a: u64, b: u64) -> f64 {
     if b == 0 {
         0.0
@@ -29,6 +34,9 @@ fn pct(a: u64, b: u64) -> f64 {
         a as f64 * 100.0 / b as f64
     }
 }
+
+const MIN_Y: i32 = -64;
+const H: usize = 384;
 
 pub fn compare(jar: &Jar, seed: i64, dir: &Path, w: &World, keys: &[String], chunks: &[(i32, i32)], log: &dyn Fn(String)) {
     let t0 = std::time::Instant::now();
@@ -43,18 +51,42 @@ pub fn compare(jar: &Jar, seed: i64, dir: &Path, w: &World, keys: &[String], chu
     let cls: Vec<u8> = keys.iter().map(|k| class(k)).collect();
     let (mut tot, mut ok, mut extra, mut missing) = (0u64, 0u64, 0u64, 0u64);
     let (mut cols, mut col_ok, mut col_diff, mut col_both) = (0u64, 0u64, 0i64, 0u64);
+    let (mut s_tot, mut s_ok, mut s_feat) = (0u64, 0u64, 0u64);
+    let mut s_conf: HashMap<(String, String), u64> = HashMap::new();
     for &(cx, cz) in chunks {
         let (x0, z0) = (cx * 16, cz * 16);
         router.prepare(x0, z0);
-        for z in z0..z0 + 16 {
-            for x in x0..x0 + 16 {
+        // mật độ cả chunk: mặt nạ đặc theo cột
+        let mut solid: Vec<Vec<bool>> = Vec::with_capacity(256);
+        let mut top = [[MIN_Y; 16]; 16];
+        for lz in 0..16usize {
+            for lx in 0..16usize {
+                let (x, z) = (x0 + lx as i32, z0 + lz as i32);
+                let col: Vec<bool> = (0..H).map(|i| router.density(x, MIN_Y + i as i32, z) > 0.0).collect();
+                // độ cao mặt đất (kể cả mặt nước): khối không phải không khí cao nhất + 1
+                let mut t = MIN_Y;
+                for i in (0..H).rev() {
+                    let y = MIN_Y + i as i32;
+                    if col[i] || y <= 63 {
+                        t = y + 1;
+                        break;
+                    }
+                }
+                top[lz][lx] = t;
+                solid.push(col);
+            }
+        }
+        for lz in 0..16usize {
+            for lx in 0..16usize {
+                let (x, z) = (x0 + lx as i32, z0 + lz as i32);
+                let col = &solid[lz * 16 + lx];
                 let (mut rtop, mut ptop) = (i32::MIN, i32::MIN);
-                for y in (-64..=250).rev() {
+                for y in (MIN_Y..=250).rev() {
                     let id = w.get(x, y, z);
                     if id == UNKNOWN {
                         continue;
                     }
-                    let pred = router.density(x, y, z) > 0.0;
+                    let pred = col[(y - MIN_Y) as usize];
                     if pred && ptop == i32::MIN {
                         ptop = y;
                     }
@@ -91,6 +123,32 @@ pub fn compare(jar: &Jar, seed: i64, dir: &Path, w: &World, keys: &[String], chu
                         col_diff += (rtop as i64 - ptop as i64).abs();
                     }
                 }
+                // lớp bề mặt: so tên khối ở những ô cả hai bên đều đặc
+                let tp = |a: i32, b: i32| top[b as usize][a as usize];
+                let steep = steep_at(&tp, lx as i32, lz as i32);
+                let pred_ids = router.surface_column(x, z, col, steep);
+                for y in MIN_Y..=250 {
+                    let id = w.get(x, y, z);
+                    if id == UNKNOWN {
+                        continue;
+                    }
+                    let pid = pred_ids[(y - MIN_Y) as usize];
+                    if pid < 2 || cls.get(id as usize).copied().unwrap_or(0) != 1 {
+                        continue;
+                    }
+                    let pn = router.block_name(pid);
+                    let rn = short(&keys[id as usize]);
+                    if (pn == "stone" || pn == "deepslate") && rn != "stone" && rn != "deepslate" {
+                        s_feat += 1; // quặng, mạch đá, đất chen: do bước rải đặc điểm, không thuộc lớp bề mặt
+                        continue;
+                    }
+                    s_tot += 1;
+                    if pn == rn {
+                        s_ok += 1;
+                    } else {
+                        *s_conf.entry((pn.to_string(), rn.to_string())).or_insert(0) += 1;
+                    }
+                }
             }
         }
     }
@@ -109,6 +167,12 @@ pub fn compare(jar: &Jar, seed: i64, dir: &Path, w: &World, keys: &[String], chu
         cols,
         if col_both == 0 { 0.0 } else { col_diff as f64 / col_both as f64 }
     ));
+    log(format!("So sánh lớp bề mặt: khớp tên khối {:.1}% trên {} khối (bỏ qua {} khối do quặng/đặc điểm)", pct(s_ok, s_tot), s_tot, s_feat));
+    let mut v: Vec<_> = s_conf.into_iter().collect();
+    v.sort_by(|a, b| b.1.cmp(&a.1));
+    for ((p, r), n) in v.iter().take(8) {
+        log(format!("  lệch bề mặt: đoán {p} nhưng thật là {r} ({n} khối)"));
+    }
     compare_biomes(&router, dir, chunks, log);
 }
 

@@ -10,8 +10,9 @@ use serde_json::Value;
 
 use crate::{
     assets::Jar,
+    vbiome::BiomeSource,
     vnoise::{lerp, wrap, ImprovedNoise, Normal},
-    vrng::{Factory, Xoro},
+    vrng::{zoom_seed, Factory, Xoro},
 };
 
 const NX: usize = 5;
@@ -56,6 +57,7 @@ enum Df {
     Flat(Rc<Df>, RefCell<HashMap<(i32, i32), f64>>),
     Pass(Rc<Df>),
     Interp(usize, Rc<Df>),
+    TopSurface { density: Rc<Df>, upper: Rc<Df>, lower: i32, cell: i32 },
 }
 
 /// Bộ ba Perlin kiểu cũ (khởi tạo "legacy") dùng cho old_blended_noise.
@@ -193,6 +195,21 @@ pub struct Router {
     min_y: i32,
     final_density: Rc<Df>,
     climate: Vec<Rc<Df>>,
+    prelim: Rc<Df>,
+    rule: Rule,
+    names: Vec<String>,
+    bands: Vec<u16>,
+    surf_noise: usize,
+    sec_noise: usize,
+    band_noise: usize,
+    fac: Factory,
+    zoom: i64,
+    bsrc: BiomeSource,
+    temps: HashMap<&'static str, f32>,
+    biome_memo: RefCell<HashMap<(i32, i32, i32), &'static str>>,
+    prelim_memo: RefCell<HashMap<(i32, i32), i32>>,
+    sea: i32,
+    height: i32,
 }
 
 struct Comp<'a> {
@@ -203,6 +220,7 @@ struct Comp<'a> {
     blended: Vec<Blended>,
     interps: Vec<Rc<Df>>,
     cache: HashMap<String, Rc<Df>>,
+    surf_names: Vec<String>,
 }
 
 fn num(v: &Value, k: &str) -> Result<f64, String> {
@@ -338,6 +356,12 @@ impl<'a> Comp<'a> {
                     "spline" => Df::Spline(self.spline(v.get("spline").ok_or("spline thiếu thân")?)?),
                     "flat_cache" => Df::Flat(self.arg(v, "argument")?, RefCell::new(HashMap::new())),
                     "cache_2d" | "cache_once" | "cache_all_in_cell" | "blend_density" => Df::Pass(self.arg(v, "argument")?),
+                    "find_top_surface" => Df::TopSurface {
+                        density: self.arg(v, "density")?,
+                        upper: self.arg(v, "upper_bound")?,
+                        lower: num(v, "lower_bound")? as i32,
+                        cell: num(v, "cell_height")? as i32,
+                    },
                     "blend_alpha" => Df::C(1.0),
                     "blend_offset" => Df::C(0.0),
                     "interpolated" => {
@@ -358,7 +382,17 @@ impl Router {
     /// Dựng bộ máy từ dữ liệu thật trong jar cho một hạt giống thế giới.
     pub fn build(jar: &Jar, seed: i64) -> Result<Router, String> {
         let fac = Xoro::from_seed(seed).fork();
-        let mut c = Comp { jar, fac, noises: Vec::new(), noise_idx: HashMap::new(), blended: Vec::new(), interps: Vec::new(), cache: HashMap::new() };
+        let base = fac.clone();
+        let mut c = Comp {
+            jar,
+            fac,
+            noises: Vec::new(),
+            noise_idx: HashMap::new(),
+            blended: Vec::new(),
+            interps: Vec::new(),
+            cache: HashMap::new(),
+            surf_names: vec!["air".to_string(), "water".to_string(), "stone".to_string()],
+        };
         let settings = c.json("data/minecraft/worldgen/noise_settings/overworld.json")?;
         let min_y = settings.get("noise").and_then(|n| n.get("min_y")).and_then(|v| v.as_i64()).ok_or("thiếu noise.min_y")? as i32;
         let fd = settings.get("noise_router").and_then(|r| r.get("final_density")).ok_or("thiếu final_density")?;
@@ -368,8 +402,46 @@ impl Router {
         for k in ["temperature", "vegetation", "continents", "erosion", "depth", "ridges"] {
             climate.push(c.df(nr.get(k).ok_or_else(|| format!("router thiếu '{k}'"))?)?);
         }
+        let prelim = c.df(nr.get("preliminary_surface_level").ok_or("router thiếu preliminary_surface_level")?)?;
+        let height = settings.get("noise").and_then(|n| n.get("height")).and_then(|v| v.as_i64()).ok_or("thiếu noise.height")? as i32;
+        let sea = settings.get("sea_level").and_then(|v| v.as_i64()).ok_or("thiếu sea_level")? as i32;
+        let rule = c.rule(settings.get("surface_rule").ok_or("thiếu surface_rule")?)?;
+        let surf_noise = c.noise("minecraft:surface")?;
+        let sec_noise = c.noise("minecraft:surface_secondary")?;
+        let band_noise = c.noise("minecraft:clay_bands_offset")?;
+        let bands = c.clay_bands();
+        let bsrc = BiomeSource::new();
+        let mut temps: HashMap<&'static str, f32> = HashMap::new();
+        for name in bsrc.names() {
+            let t = c.json(&format!("data/minecraft/worldgen/biome/{name}.json")).ok().and_then(|b| b.get("temperature").and_then(|t| t.as_f64())).unwrap_or(0.5);
+            temps.insert(name, t as f32);
+        }
         let n = c.interps.len();
-        Ok(Router { noises: c.noises, blended: c.blended, interps: c.interps, grids: RefCell::new(vec![Vec::new(); n]), origin: Cell::new((0, 0)), min_y, final_density, climate })
+        Ok(Router {
+            noises: c.noises,
+            blended: c.blended,
+            interps: c.interps,
+            grids: RefCell::new(vec![Vec::new(); n]),
+            origin: Cell::new((0, 0)),
+            min_y,
+            final_density,
+            climate,
+            prelim,
+            rule,
+            names: c.surf_names,
+            bands,
+            surf_noise,
+            sec_noise,
+            band_noise,
+            fac: base,
+            zoom: zoom_seed(seed),
+            bsrc,
+            temps,
+            biome_memo: RefCell::new(HashMap::new()),
+            prelim_memo: RefCell::new(HashMap::new()),
+            sea,
+            height,
+        })
     }
 
     /// Tính sẵn lưới các góc ô (4x8x4) cho các nút `interpolated` của chunk có góc tại (x0, z0).
@@ -529,6 +601,18 @@ impl Router {
                 v
             }
             Df::Pass(a) => self.eval(a, c),
+            Df::TopSurface { density, upper, lower, cell } => {
+                let u = self.eval(upper, c);
+                let mut y = ((u / *cell as f64).floor() as i32) * *cell;
+                while y >= *lower {
+                    let cc = Ctx { x: c.x, y, z: c.z, corner: true };
+                    if self.eval(density, &cc) > 0.0 {
+                        return y as f64;
+                    }
+                    y -= *cell;
+                }
+                *lower as f64
+            }
             Df::Interp(i, inner) => {
                 if c.corner || self.grids.borrow()[*i].is_empty() {
                     return self.eval(inner, c);
@@ -549,4 +633,406 @@ impl Router {
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Luật bề mặt: lớp đất đá, cát, tuyết... phủ lên địa hình theo quần xã và độ sâu.
+
+#[derive(Clone, Copy)]
+enum Anchor {
+    Abs(i32),
+    Bottom(i32),
+    Top(i32),
+}
+
+impl Anchor {
+    fn y(self, min_y: i32, height: i32) -> i32 {
+        match self {
+            Anchor::Abs(v) => v,
+            Anchor::Bottom(v) => min_y + v,
+            Anchor::Top(v) => min_y + height - 1 - v,
+        }
+    }
+}
+
+enum Cond {
+    Biome(Vec<String>),
+    Noise { n: usize, lo: f64, hi: f64 },
+    VGrad { fac: Factory, t: Anchor, f: Anchor },
+    YAbove { a: Anchor, mult: i32, add: bool },
+    Water { offset: i32, mult: i32, add: bool },
+    Temp,
+    Steep,
+    Hole,
+    Prelim,
+    Not(Box<Cond>),
+    Depth { offset: i32, add: bool, range: i32, ceiling: bool },
+}
+
+enum Rule {
+    Block(u16),
+    Seq(Vec<Rule>),
+    If(Cond, Box<Rule>),
+    Bands,
+}
+
+struct SCtx {
+    x: i32,
+    y: i32,
+    z: i32,
+    run_depth: i32,
+    secondary: f64,
+    stone_above: i32,
+    stone_below: i32,
+    fluid_h: i32,
+    min_surface: i32,
+    steep: bool,
+}
+
+fn int(v: &Value, k: &str) -> Result<i32, String> {
+    v.get(k).and_then(|x| x.as_i64()).map(|x| x as i32).ok_or_else(|| format!("thiếu số nguyên '{k}'"))
+}
+
+impl<'a> Comp<'a> {
+    fn intern(&mut self, name: &str) -> u16 {
+        let short = name.strip_prefix("minecraft:").unwrap_or(name);
+        if let Some(i) = self.surf_names.iter().position(|n| n == short) {
+            return i as u16;
+        }
+        self.surf_names.push(short.to_string());
+        (self.surf_names.len() - 1) as u16
+    }
+
+    fn anchor(&self, v: &Value) -> Result<Anchor, String> {
+        if let Some(n) = v.get("absolute").and_then(|x| x.as_i64()) {
+            Ok(Anchor::Abs(n as i32))
+        } else if let Some(n) = v.get("above_bottom").and_then(|x| x.as_i64()) {
+            Ok(Anchor::Bottom(n as i32))
+        } else if let Some(n) = v.get("below_top").and_then(|x| x.as_i64()) {
+            Ok(Anchor::Top(n as i32))
+        } else {
+            Err("neo độ cao lạ".into())
+        }
+    }
+
+    fn cond(&mut self, v: &Value) -> Result<Cond, String> {
+        let t = v.get("type").and_then(|t| t.as_str()).ok_or("điều kiện thiếu type")?;
+        let t = t.strip_prefix("minecraft:").unwrap_or(t);
+        let flag = |k: &str| v.get(k).and_then(|x| x.as_bool()).unwrap_or(false);
+        Ok(match t {
+            "biome" => {
+                let l = v.get("biome_is").and_then(|b| b.as_array()).ok_or("biome thiếu biome_is")?;
+                Cond::Biome(l.iter().filter_map(|b| b.as_str().map(|s| s.strip_prefix("minecraft:").unwrap_or(s).to_string())).collect())
+            }
+            "noise_threshold" => {
+                let name = v.get("noise").and_then(|n| n.as_str()).ok_or("noise_threshold thiếu tên")?.to_string();
+                Cond::Noise { n: self.noise(&name)?, lo: num(v, "min_threshold")?, hi: num(v, "max_threshold")? }
+            }
+            "vertical_gradient" => {
+                let name = v.get("random_name").and_then(|n| n.as_str()).ok_or("vertical_gradient thiếu tên")?;
+                let fac = self.fac.from_hash_of(name).fork();
+                Cond::VGrad { fac, t: self.anchor(v.get("true_at_and_below").ok_or("thiếu true_at_and_below")?)?, f: self.anchor(v.get("false_at_and_above").ok_or("thiếu false_at_and_above")?)? }
+            }
+            "y_above" => Cond::YAbove { a: self.anchor(v.get("anchor").ok_or("y_above thiếu anchor")?)?, mult: int(v, "surface_depth_multiplier")?, add: flag("add_stone_depth") },
+            "water" => Cond::Water { offset: int(v, "offset")?, mult: int(v, "surface_depth_multiplier")?, add: flag("add_stone_depth") },
+            "temperature" => Cond::Temp,
+            "steep" => Cond::Steep,
+            "hole" => Cond::Hole,
+            "above_preliminary_surface" => Cond::Prelim,
+            "not" => Cond::Not(Box::new(self.cond(v.get("invert").ok_or("not thiếu invert")?)?)),
+            "stone_depth" => Cond::Depth {
+                offset: int(v, "offset")?,
+                add: flag("add_surface_depth"),
+                range: int(v, "secondary_depth_range")?,
+                ceiling: v.get("surface_type").and_then(|s| s.as_str()) == Some("ceiling"),
+            },
+            other => return Err(format!("chưa hỗ trợ điều kiện bề mặt '{other}'")),
+        })
+    }
+
+    fn rule(&mut self, v: &Value) -> Result<Rule, String> {
+        let t = v.get("type").and_then(|t| t.as_str()).ok_or("luật thiếu type")?;
+        let t = t.strip_prefix("minecraft:").unwrap_or(t);
+        Ok(match t {
+            "block" => {
+                let name = v.get("result_state").and_then(|s| s.get("Name")).and_then(|n| n.as_str()).ok_or("block thiếu Name")?.to_string();
+                Rule::Block(self.intern(&name))
+            }
+            "sequence" => {
+                let l = v.get("sequence").and_then(|s| s.as_array()).ok_or("sequence thiếu danh sách")?;
+                let mut out = Vec::new();
+                for r in l {
+                    out.push(self.rule(r)?);
+                }
+                Rule::Seq(out)
+            }
+            "condition" => {
+                let c = self.cond(v.get("if_true").ok_or("condition thiếu if_true")?)?;
+                let r = self.rule(v.get("then_run").ok_or("condition thiếu then_run")?)?;
+                Rule::If(c, Box::new(r))
+            }
+            "bandlands" => Rule::Bands,
+            other => return Err(format!("chưa hỗ trợ luật bề mặt '{other}'")),
+        })
+    }
+
+    /// Bảng 192 dải đất sét màu dùng cho vùng đất hoang (bandlands).
+    fn clay_bands(&mut self) -> Vec<u16> {
+        let mut r = self.fac.from_hash_of("minecraft:clay_bands");
+        let ter = self.intern("terracotta");
+        let ora = self.intern("orange_terracotta");
+        let yel = self.intern("yellow_terracotta");
+        let bro = self.intern("brown_terracotta");
+        let red = self.intern("red_terracotta");
+        let whi = self.intern("white_terracotta");
+        let gry = self.intern("light_gray_terracotta");
+        let n = 192usize;
+        let mut b = vec![ter; n];
+        let mut i = 0usize;
+        while i < n {
+            i += r.next_bounded(5) as usize + 1;
+            if i < n {
+                b[i] = ora;
+            }
+            i += 1;
+        }
+        let mut make = |r: &mut Xoro, b: &mut Vec<u16>, min: i32, st: u16| {
+            let cnt = r.next_between(6, 15);
+            for _ in 0..cnt {
+                let sz = (min + r.next_bounded(3)) as usize;
+                let start = r.next_bounded(n as i32) as usize;
+                let mut m = 0usize;
+                while start + m < n && m < sz {
+                    b[start + m] = st;
+                    m += 1;
+                }
+            }
+        };
+        make(&mut r, &mut b, 1, yel);
+        make(&mut r, &mut b, 2, bro);
+        make(&mut r, &mut b, 1, red);
+        let count = r.next_between(9, 15);
+        let (mut j, mut k) = (0, 0usize);
+        while j < count && k < n {
+            b[k] = whi;
+            if k > 1 && r.next_bool() {
+                b[k - 1] = gry;
+            }
+            if k + 1 < n && r.next_bool() {
+                b[k + 1] = gry;
+            }
+            k += r.next_bounded(16) as usize + 4;
+            j += 1;
+        }
+        b
+    }
+}
+
+impl Router {
+    /// Tên khối theo mã trong kết quả của `surface_column`.
+    pub fn block_name(&self, id: u16) -> &str {
+        &self.names[id as usize]
+    }
+
+    fn noise_biome(&self, qx: i32, qy: i32, qz: i32) -> &'static str {
+        if let Some(b) = self.biome_memo.borrow().get(&(qx, qy, qz)) {
+            return *b;
+        }
+        let b = self.bsrc.find(&self.climate(qx, qy, qz));
+        self.biome_memo.borrow_mut().insert((qx, qy, qz), b);
+        b
+    }
+
+    /// Quần xã tại một khối, có làm mờ biên theo hạt giống như Minecraft.
+    pub fn fuzzy_biome(&self, x: i32, y: i32, z: i32) -> &'static str {
+        let (i, j, k) = (x - 2, y - 2, z - 2);
+        let (l, m, n) = (i >> 2, j >> 2, k >> 2);
+        let (d, e, f) = ((i & 3) as f64 / 4.0, (j & 3) as f64 / 4.0, (k & 3) as f64 / 4.0);
+        let mut best = 0usize;
+        let mut g = f64::INFINITY;
+        for p in 0..8usize {
+            let (bx, by, bz) = (p & 4 == 0, p & 2 == 0, p & 1 == 0);
+            let q = if bx { l } else { l + 1 };
+            let r = if by { m } else { m + 1 };
+            let s = if bz { n } else { n + 1 };
+            let h = if bx { d } else { d - 1.0 };
+            let t = if by { e } else { e - 1.0 };
+            let u = if bz { f } else { f - 1.0 };
+            let v = self.fiddled(q, r, s, h, t, u);
+            if g > v {
+                best = p;
+                g = v;
+            }
+        }
+        let w = if best & 4 == 0 { l } else { l + 1 };
+        let xx = if best & 2 == 0 { m } else { m + 1 };
+        let yy = if best & 1 == 0 { n } else { n + 1 };
+        self.noise_biome(w, xx, yy)
+    }
+
+    fn fiddled(&self, x: i32, y: i32, z: i32, xn: f64, yn: f64, zn: f64) -> f64 {
+        let lcg = |seed: i64, salt: i64| seed.wrapping_mul(seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407)).wrapping_add(salt);
+        let fid = |l: i64| (((l >> 24) & 1023) as f64 / 1024.0 - 0.5) * 0.9;
+        let s = self.zoom;
+        let mut l = lcg(s, x as i64);
+        l = lcg(l, y as i64);
+        l = lcg(l, z as i64);
+        l = lcg(l, x as i64);
+        l = lcg(l, y as i64);
+        l = lcg(l, z as i64);
+        let a = fid(l);
+        l = lcg(l, s);
+        let b = fid(l);
+        l = lcg(l, s);
+        let c = fid(l);
+        let sq = |v: f64| v * v;
+        sq(zn + c) + sq(yn + b) + sq(xn + a)
+    }
+
+    fn prelim_at(&self, x: i32, z: i32) -> i32 {
+        if let Some(v) = self.prelim_memo.borrow().get(&(x, z)) {
+            return *v;
+        }
+        let v = self.eval(&self.prelim, &Ctx { x, y: 0, z, corner: true }).floor() as i32;
+        self.prelim_memo.borrow_mut().insert((x, z), v);
+        v
+    }
+
+    fn min_surface_level(&self, x: i32, z: i32) -> i32 {
+        let (cx, cz) = (x >> 4, z >> 4);
+        let g = |a: i32, b: i32| self.prelim_at(a * 16, b * 16) as f64;
+        let (v00, v10, v01, v11) = (g(cx, cz), g(cx + 1, cz), g(cx, cz + 1), g(cx + 1, cz + 1));
+        let fx = ((x & 15) as f32 / 16.0) as f64;
+        let fz = ((z & 15) as f32 / 16.0) as f64;
+        lerp(fz, lerp(fx, v00, v10), lerp(fx, v01, v11)).floor() as i32
+    }
+
+    fn band(&self, x: i32, y: i32, z: i32) -> u16 {
+        let off = (self.noises[self.band_noise].value(x as f64, 0.0, z as f64) * 4.0 + 0.5).floor() as i32;
+        let n = self.bands.len() as i32;
+        self.bands[((y + off + n) % n) as usize]
+    }
+
+    fn cond(&self, c: &Cond, s: &SCtx) -> bool {
+        match c {
+            Cond::Biome(l) => {
+                let b = self.fuzzy_biome(s.x, s.y, s.z);
+                l.iter().any(|n| n == b)
+            }
+            Cond::Noise { n, lo, hi } => {
+                let v = self.noises[*n].value(s.x as f64, 0.0, s.z as f64);
+                v >= *lo && v <= *hi
+            }
+            Cond::VGrad { fac, t, f } => {
+                let (t, f) = (t.y(self.min_y, self.height), f.y(self.min_y, self.height));
+                if s.y <= t {
+                    true
+                } else if s.y >= f {
+                    false
+                } else {
+                    let m = 1.0 - (s.y - t) as f64 / (f - t) as f64;
+                    (fac.at(s.x, s.y, s.z).next_f32() as f64) < m
+                }
+            }
+            Cond::YAbove { a, mult, add } => (s.y + (if *add { s.stone_above } else { 0 })) >= a.y(self.min_y, self.height) + s.run_depth * *mult,
+            Cond::Water { offset, mult, add } => s.fluid_h == i32::MIN || (s.y + (if *add { s.stone_above } else { 0 })) >= s.fluid_h + *offset + s.run_depth * *mult,
+            Cond::Temp => {
+                let b = self.fuzzy_biome(s.x, s.y, s.z);
+                self.temps.get(b).copied().unwrap_or(0.5) < 0.15
+            }
+            Cond::Steep => s.steep,
+            Cond::Hole => s.run_depth <= 0,
+            Cond::Prelim => s.y >= s.min_surface,
+            Cond::Not(c) => !self.cond(c, s),
+            Cond::Depth { offset, add, range, ceiling } => {
+                let d = if *ceiling { s.stone_below } else { s.stone_above };
+                let sec = if *range == 0 { 0 } else { ((s.secondary + 1.0) / 2.0 * *range as f64) as i32 };
+                d <= 1 + *offset + (if *add { s.run_depth } else { 0 }) + sec
+            }
+        }
+    }
+
+    fn apply(&self, r: &Rule, s: &SCtx) -> Option<u16> {
+        match r {
+            Rule::Block(id) => Some(*id),
+            Rule::Seq(v) => {
+                for x in v {
+                    if let Some(b) = self.apply(x, s) {
+                        return Some(b);
+                    }
+                }
+                None
+            }
+            Rule::If(c, t) => {
+                if self.cond(c, s) {
+                    self.apply(t, s)
+                } else {
+                    None
+                }
+            }
+            Rule::Bands => Some(self.band(s.x, s.y, s.z)),
+        }
+    }
+
+    /// Áp luật bề mặt cho một cột. `solid[i]` cho khối ở độ cao min_y + i. Trả về mã khối từng độ cao (0 không khí, 1 nước, 2 đá, còn lại tra `block_name`).
+    pub fn surface_column(&self, x: i32, z: i32, solid: &[bool], steep: bool) -> Vec<u16> {
+        let h = solid.len();
+        let min = self.min_y;
+        let mut b: Vec<u16> = (0..h).map(|i| if solid[i] { 2 } else if min + i as i32 <= self.sea { 1 } else { 0 }).collect();
+        let mut top = 0usize;
+        for i in (0..h).rev() {
+            if b[i] != 0 {
+                top = i + 1;
+                break;
+            }
+        }
+        let sn = self.noises[self.surf_noise].value(x as f64, 0.0, z as f64);
+        let mut rnd = self.fac.at(x, 0, z);
+        let run_depth = (sn * 2.75 + 3.0 + rnd.next_f64() * 0.25) as i32;
+        let secondary = self.noises[self.sec_noise].value(x as f64, 0.0, z as f64);
+        let min_surface = self.min_surface_level(x, z) + run_depth - 8;
+        let (mut above, mut fluid_h, mut bottom, mut prev_solid) = (0i32, i32::MIN, 0usize, false);
+        for i in (0..top).rev() {
+            let y = min + i as i32;
+            match b[i] {
+                0 => {
+                    above = 0;
+                    fluid_h = i32::MIN;
+                    prev_solid = false;
+                }
+                1 => {
+                    if fluid_h == i32::MIN {
+                        fluid_h = y + 1;
+                    }
+                    prev_solid = false;
+                }
+                _ => {
+                    if !prev_solid {
+                        let mut j = i;
+                        while j > 0 && b[j - 1] >= 2 {
+                            j -= 1;
+                        }
+                        bottom = j;
+                    }
+                    prev_solid = true;
+                    above += 1;
+                    let s = SCtx { x, y, z, run_depth, secondary, stone_above: above, stone_below: (i - bottom + 1) as i32, fluid_h, min_surface, steep };
+                    if let Some(id) = self.apply(&self.rule, &s) {
+                        b[i] = id;
+                    }
+                }
+            }
+        }
+        b
+    }
+}
+
+/// Điều kiện `steep`: so độ cao mặt đất của ô kề trong cùng chunk.
+pub fn steep_at(top: &dyn Fn(i32, i32) -> i32, lx: i32, lz: i32) -> bool {
+    let (k, l) = ((lz - 1).max(0), (lz + 1).min(15));
+    if top(lx, l) >= top(lx, k) + 4 {
+        return true;
+    }
+    let (o, p) = ((lx - 1).max(0), (lx + 1).min(15));
+    top(p, lz) >= top(o, lz) + 4
 }
