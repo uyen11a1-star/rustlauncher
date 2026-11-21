@@ -164,3 +164,23 @@ pub fn show_keyboard(vm: *mut c_void, activity: *mut c_void) -> Result<(), Strin
         Ok(())
     }
 }
+
+/// Đổi hướng màn hình: ngang (SCREEN_ORIENTATION_SENSOR_LANDSCAPE = 6) hoặc dọc (SCREEN_ORIENTATION_PORTRAIT = 1).
+pub fn set_orientation(vm: *mut c_void, activity: *mut c_void, landscape: bool) -> Result<(), String> {
+    unsafe {
+        let env = env_of(vm).ok_or("không gắn được luồng vào JVM")?;
+        let j = Jni { env };
+        let get_class: extern "C" fn(Env, *mut c_void) -> *mut c_void = fnp(env, 31);
+        let cls = get_class(env, activity);
+        let m = j.method(cls, "setRequestedOrientation", "(I)V");
+        if m.is_null() {
+            return Err("không thấy setRequestedOrientation".into());
+        }
+        let call_void: extern "C" fn(Env, *mut c_void, *mut c_void, *const u64) = fnp(env, 63);
+        call_void(env, activity, m, [if landscape { 6u64 } else { 1u64 }].as_ptr());
+        if j.clear() {
+            return Err("setRequestedOrientation ném lỗi".into());
+        }
+        Ok(())
+    }
+}

@@ -51,3 +51,4 @@ label = "Rust Launcher"
 
 [package.metadata.android.application.activity]
 config_changes = "orientation|keyboardHidden|screenSize"
+orientation = "portrait"

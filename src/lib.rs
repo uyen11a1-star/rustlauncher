@@ -64,6 +64,7 @@ fn android_main(app: AndroidApp) {
     let mut quit = false;
     let mut mode = Mode::Menu;
     let mut soft_on = false;
+    let mut land = false;
 
     while !quit {
         let (mut init, mut term) = (false, false);
@@ -183,6 +184,13 @@ fn android_main(app: AndroidApp) {
                     Err(e) => launcher.log.lock().unwrap().push(format!("LỖI mở giao diện game: {e}")),
                 }
             }
+        }
+
+        // launcher = dọc; giao diện game và cảnh 3D = ngang
+        let want_land = !matches!(mode, Mode::Menu);
+        if want_land != land {
+            land = want_land;
+            let _ = perm::set_orientation(app.vm_as_ptr(), app.activity_as_ptr(), land);
         }
 
         if let (Some(e), Some(g)) = (egl.as_ref(), gfx.as_mut()) {
