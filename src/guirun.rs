@@ -113,6 +113,14 @@ impl GuiRun {
     /// Cần context GL hiện hành. Mở jar, vẽ được màn Mojang ngay, nạp phần còn lại ở luồng nền.
     pub fn new(jar_path: PathBuf, version: String, log: Arc<Mutex<Vec<String>>>, root: PathBuf) -> Result<GuiRun, String> {
         let jar = Arc::new(Jar::open(&jar_path)?);
+        {
+            let mut v: Vec<String> = jar.entries.values().filter(|e| e.name.contains("panorama") || e.name.contains("title/background")).map(|e| format!("jar: {} ({} byte)", e.name.trim_start_matches("assets/minecraft/"), e.size)).collect();
+            v.sort();
+            let mut l = log.lock().unwrap();
+            for s in v.into_iter().take(24) {
+                l.push(s);
+            }
+        }
         let assets = GuiAssets::mini(&*jar, &version);
         if assets.mojang.is_none() {
             return Err("client.jar không có logo Mojang".into());

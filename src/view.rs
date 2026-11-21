@@ -232,6 +232,9 @@ pub struct View {
     sent_sel: usize,
     key_names: Vec<String>,
     attack_held: bool,
+    /// số gói đào/đặt đã gửi và mô tả mục tiêu đang ngắm (hiện ở giữa màn hình để dò lỗi)
+    sent: i32,
+    aim_dbg: String,
     dig: Option<Dig>,
     place_req: bool,
     others: HashMap<i32, Other>,
@@ -648,6 +651,8 @@ impl View {
                 sent_sel: 0,
                 key_names: d.names.clone(),
                 attack_held: false,
+                sent: 0,
+                aim_dbg: String::new(),
                 dig: None,
                 place_req: false,
                 others: HashMap::new(),
@@ -889,7 +894,15 @@ impl View {
     fn net_actions(&mut self, now: Instant) {
         let Some(tx) = self.net.clone() else { return };
         let aim = self.aim();
+        self.aim_dbg = match &aim {
+            Some(a) => {
+                let id = self.col.as_ref().map_or(0, |c| c.world.get(a.pos[0], a.pos[1], a.pos[2]));
+                format!("{} {},{},{} mặt {}", self.state_name(id), a.pos[0], a.pos[1], a.pos[2], a.face)
+            }
+            None => "không trúng khối nào".to_string(),
+        };
         if self.place_req {
+            self.sent += 1;
             self.place_req = false;
             let _ = tx.send(crate::netplay::NetOut::Swing);
             match &aim {
@@ -923,6 +936,7 @@ impl View {
             let key = self.state_name(id);
             let (h, tool) = hardness(&key);
             let need = if h < 0.0 { 1e9 } else { h * if tool { 5.0 } else { 1.5 } + 0.05 };
+            self.sent += 1;
             let _ = tx.send(crate::netplay::NetOut::Swing);
             let _ = tx.send(crate::netplay::NetOut::Dig { status: 0, pos: a.pos, face: a.face });
             self.dig = Some(Dig { pos: a.pos, t0: now, need, finished: None });
@@ -939,10 +953,6 @@ impl View {
                 d.t0 = now;
                 d.finished = None;
             }
-        }
-        if (now.duration_since(d.t0).as_secs_f32() * 4.0) as i32 % 3 == 0 && d.finished.is_none() {
-            // vung tay đều khi đang đào
-            let _ = tx.send(crate::netplay::NetOut::Swing);
         }
     }
 
@@ -962,6 +972,11 @@ impl View {
         let lh = size * 1.25;
         g.begin();
         if !self.chat_open {
+            // dòng dò lỗi dưới chấm ngắm: khối đang ngắm, số lần gửi, số xác nhận của server
+            let ack = self.net_state.as_ref().map_or(0, |st| st.lock().unwrap().ack);
+            let dbg = format!("{} | gửi {} | server xác nhận {}", self.aim_dbg, self.sent, ack);
+            let tw = g.text_width(&dbg, 11.0 * s);
+            g.text(w / 2.0 - tw / 2.0, h / 2.0 + 14.0 * s, 11.0 * s, 0xffffffd0, &dbg);
             // chấm ngắm giữa màn hình
             let (cx, cy, t) = (w / 2.0, h / 2.0, 2.0 * s);
             g.rect(cx - 8.0 * s, cy - t / 2.0, 16.0 * s, t, 0xffffffc0);

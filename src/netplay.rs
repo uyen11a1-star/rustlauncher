@@ -93,6 +93,8 @@ pub struct NetState {
     /// server đổi ô thanh nhanh đang chọn
     pub held: Option<u8>,
     pub players: std::collections::HashMap<i32, Pl>,
+    /// số thứ tự hành động mới nhất server đã xác nhận (acknowledge_player_digging)
+    pub ack: i32,
 }
 
 /// Ô của cửa sổ 0 (túi người chơi) -> ô của ta.
@@ -823,6 +825,11 @@ fn reader(s: &mut TcpStream, comp: bool, wr: &Shared, tx: &Sender<NetIn>, cur: &
                         let (lx, lz, ly) = (((r >> 8) & 15) as i32, ((r >> 4) & 15) as i32, (r & 15) as i32);
                         let _ = tx.send(NetIn::Block(sx * 16 + lx, sy * 16 + ly, sz * 16 + lz, (r >> 12) as u32));
                     }
+                }
+            }
+            0x04 => {
+                if let Some(s) = rd_varint(&b, &mut i) {
+                    st.lock().unwrap().ack = s;
                 }
             }
             0x44 => parse_player_info(&b, st),
