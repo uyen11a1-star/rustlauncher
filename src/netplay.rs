@@ -40,7 +40,13 @@ pub enum NetOut {
     /// dùng vật phẩm cầm trên tay (không nhắm khối)
     Use { yaw: f32, pitch: f32 },
     Swing,
+    /// bấm ô `slot` của cửa sổ vật chứa `win` (click trái thường)
+    Click { win: i32, state: i32, slot: i16, button: i8, mode: i32 },
+    /// đóng cửa sổ vật chứa
+    CloseWin(i32),
 }
+
+pub use crate::winnet::{click_packet, NetWin};
 
 static SEQ: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
 
@@ -95,6 +101,10 @@ pub struct NetState {
     pub players: std::collections::HashMap<i32, Pl>,
     /// số thứ tự hành động mới nhất server đã xác nhận (acknowledge_player_digging)
     pub ack: i32,
+    /// cửa sổ vật chứa đang mở (None = không có)
+    pub win: Option<NetWin>,
+    /// luồng đọc đặt true khi `win` đổi (mở, đóng, nội dung); luồng vẽ đọc rồi xóa
+    pub win_dirty: bool,
 }
 
 /// Ô của cửa sổ 0 (túi người chơi) -> ô của ta.
@@ -631,6 +641,20 @@ pub fn start(conn: Conn) -> Result<Link, String> {
                         }
                         continue;
                     }
+                    NetOut::Click { win, state, slot, button, mode } => {
+                        if wsend(&wr, 0x11, &click_packet(win, state, slot, button, mode)).is_err() {
+                            break;
+                        }
+                        continue;
+                    }
+                    NetOut::CloseWin(id) => {
+                        let mut b = Vec::new();
+                        put_varint(&mut b, id as u32);
+                        if wsend(&wr, 0x12, &b).is_err() {
+                            break;
+                        }
+                        continue;
+                    }
                     NetOut::Held(h) => {
                         if wsend(&wr, 0x34, &(h as i16).to_be_bytes()).is_err() {
                             break;
@@ -836,6 +860,11 @@ fn reader(s: &mut TcpStream, comp: bool, wr: &Shared, tx: &Sender<NetIn>, cur: &
             0x01 | 0x4b | 0x33 | 0x34 | 0x36 | 0x7b | 0x23 | 0x51 => {
                 let _ = entity_packet(id, &b, st);
             }
+            0x39 | 0x11 => {
+                let mut g = st.lock().unwrap();
+                let g = &mut *g;
+                crate::winnet::apply(&mut g.win, &mut g.win_dirty, id, &b);
+            }
             0x12 => {
                 let win = rd_varint(&b, &mut i).unwrap_or(-1);
                 rd_varint(&b, &mut i);
@@ -861,6 +890,10 @@ fn reader(s: &mut TcpStream, comp: bool, wr: &Shared, tx: &Sender<NetIn>, cur: &
                         g.inv = inv;
                         g.inv_dirty = true;
                     }
+                } else {
+                    let mut g = st.lock().unwrap();
+                    let g = &mut *g;
+                    crate::winnet::apply(&mut g.win, &mut g.win_dirty, id, &b);
                 }
             }
             0x14 => {
@@ -871,6 +904,10 @@ fn reader(s: &mut TcpStream, comp: bool, wr: &Shared, tx: &Sender<NetIn>, cur: &
                     if let Some(v) = crate::slot::read_slot(&b, &mut i) {
                         set_inv(st, win0_slot(slot), v);
                     }
+                } else {
+                    let mut g = st.lock().unwrap();
+                    let g = &mut *g;
+                    crate::winnet::apply(&mut g.win, &mut g.win_dirty, id, &b);
                 }
             }
             0x6a => {
