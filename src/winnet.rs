@@ -61,6 +61,7 @@ pub fn parse_set_slot(b: &[u8]) -> Option<(i32, i32, i16, NSlot)> {
 pub fn apply(win: &mut Option<NetWin>, dirty: &mut bool, pid: i32, b: &[u8]) {
     match pid {
         0x39 => {
+            crate::netplay::trace(format!("WIN mở: {}", parse_open_window(b).map_or("LỖI PHÂN TÍCH".to_string(), |w| format!("id={} loại={} tiêu đề={}", w.id, w.kind, w.title))));
             if let Some(w) = parse_open_window(b) {
                 *win = Some(w);
                 *dirty = true;
@@ -75,7 +76,9 @@ pub fn apply(win: &mut Option<NetWin>, dirty: &mut bool, pid: i32, b: &[u8]) {
             }
         }
         0x12 => {
-            if let Some((wid, state, slots)) = parse_window_items(b) {
+            let r = parse_window_items(b);
+            crate::netplay::trace(format!("WIN items: {}", r.as_ref().map_or("LỖI PHÂN TÍCH (slot lạ?)".to_string(), |(w, st, v)| format!("id={w} state={st} ô={} cửa sổ đang mở={:?}", v.len(), win.as_ref().map(|x| x.id)))));
+            if let Some((wid, state, slots)) = r {
                 if let Some(w) = win.as_mut().filter(|w| w.id == wid) {
                     w.state_id = state;
                     w.slots = slots;

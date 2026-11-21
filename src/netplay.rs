@@ -673,6 +673,8 @@ pub fn start(conn: Conn) -> Result<Link, String> {
                         b.extend_from_slice(&pack_pos(pos));
                         b.push(face);
                         put_varint(&mut b, next_seq() as u32);
+                        trace(format!("DIG status={status} pos={pos:?} face={face}"));
+                        trace_flush();
                         if wsend_play(&wr, 0x28, &b).is_err() {
                             break;
                         }
@@ -689,6 +691,8 @@ pub fn start(conn: Conn) -> Result<Link, String> {
                         b.push(0);
                         b.push(0);
                         put_varint(&mut b, next_seq() as u32);
+                        trace(format!("DAT pos={pos:?} face={face} cursor={cur:?}"));
+                        trace_flush();
                         if wsend_play(&wr, 0x3f, &b).is_err() {
                             break;
                         }
@@ -700,6 +704,8 @@ pub fn start(conn: Conn) -> Result<Link, String> {
                         put_varint(&mut b, next_seq() as u32);
                         b.extend_from_slice(&yaw.to_be_bytes());
                         b.extend_from_slice(&pitch.to_be_bytes());
+                        trace("DUNG vật phẩm (không nhắm khối)".into());
+                        trace_flush();
                         if wsend_play(&wr, 0x40, &b).is_err() {
                             break;
                         }
@@ -885,6 +891,12 @@ fn reader(s: &mut TcpStream, comp: bool, wr: &Shared, tx: &Sender<NetIn>, cur: &
     loop {
         let (id, b) = recv(s, comp)?;
         let mut i = 0;
+        if matches!(id, 0x04 | 0x39 | 0x11 | 0x12 | 0x14 | 0x5e | 0x20) {
+            trace(format!("RX {id:#x} dài {}", b.len()));
+            if id != 0x14 {
+                trace_flush();
+            }
+        }
         match id {
             0x30 => {
                 EID.store(rd_i32(&b, &mut i).unwrap_or(0), std::sync::atomic::Ordering::Relaxed);

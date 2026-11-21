@@ -957,6 +957,9 @@ impl View {
     /// Đánh (giữ để đào) và Đặt gửi lên server.
     fn net_actions(&mut self, now: Instant) {
         let Some(tx) = self.net.clone() else { return };
+        if (self.place_req || self.attack_held) && self.swing.is_none() {
+            self.swing = Some(0.0);
+        }
         let aim = self.aim();
         self.aim_dbg = match &aim {
             Some(a) => {
