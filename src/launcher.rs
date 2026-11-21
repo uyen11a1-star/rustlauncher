@@ -114,6 +114,9 @@ impl Launcher {
                     shared.set_phase("Lỗi");
                 }
                 Ok(jar) => {
+                    for n in shared.notes.lock().unwrap().drain(..) {
+                        push(n);
+                    }
                     shared.set_phase("Sẵn sàng");
                     *out.lock().unwrap() = Some((jar, id2));
                 }
@@ -150,6 +153,9 @@ impl Launcher {
                     shared.set_phase("Lỗi");
                 }
                 Ok(jar) => {
+                    for n in shared.notes.lock().unwrap().drain(..) {
+                        push(n);
+                    }
                     shared.set_phase("Đang dựng texture và model...");
                     let built = if world {
                         match find_world(&root, &push) {
