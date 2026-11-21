@@ -1315,7 +1315,9 @@ impl View {
         }
         self.attack_held = attack;
         self.net_actions(now);
-        let inp = Input { fwd: (-sy) as f64, strafe: sx as f64, jump: self.jump_held, sneak: self.sneak_on, sprint: self.sprint_on };
+        // bàn phím Java chỉ có 0/±1 cho mỗi hướng; anticheat đối chiếu đúng các giá trị rời rạc đó nên cần lượng tử hóa cần analog
+        let q = |v: f32| if v > 0.25 { 1.0f64 } else if v < -0.25 { -1.0 } else { 0.0 };
+        let inp = Input { fwd: q(-sy), strafe: q(sx), jump: self.jump_held, sneak: self.sneak_on, sprint: self.sprint_on };
 
         // vật lý theo tick cố định 20/giây, camera nội suy giữa hai tick
         if self.col.as_ref().map_or(false, |c| c.loaded(self.player.pos[0].floor() as i32, self.player.pos[2].floor() as i32)) || self.col.is_none() {
