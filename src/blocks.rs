@@ -36,7 +36,7 @@ impl State {
 
 /// Khối không cản người (đuốc, nút, ray, biển, cỏ dây...). Hoa/cỏ đã được loại qua model "cross".
 fn no_collision(name: &str) -> bool {
-    const PARTS: [&str; 15] = ["torch", "button", "pressure_plate", "sign", "banner", "rail", "lever", "redstone_wire", "tripwire", "vine", "cobweb", "kelp", "seagrass", "coral_fan", "lichen"];
+    const PARTS: [&str; 22] = ["torch", "button", "pressure_plate", "sign", "banner", "rail", "lever", "redstone_wire", "tripwire", "vine", "cobweb", "kelp", "seagrass", "coral_fan", "lichen", "leaf_litter", "petals", "wildflowers", "resin_clump", "sculk_vein", "frogspawn", "cactus_flower"];
     name == "fire" || name == "soul_fire" || name == "end_gateway" || name.ends_with("_portal") || PARTS.iter().any(|p| name.contains(p))
 }
 
