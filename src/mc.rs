@@ -19,6 +19,7 @@ use tokio::{fs, io::AsyncWriteExt};
 pub type Res<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
 const MANIFEST_URL: &str = "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json";
+const OBJECTS_URL: &str = "https://resources.download.minecraft.net";
 const CONCURRENCY: usize = 48;
 
 // ---------- Dữ liệu dùng chung giữa luồng tải và UI ----------
@@ -33,6 +34,8 @@ pub struct Shared {
     pub bytes_total: AtomicU64,
     pub files_done: AtomicUsize,
     pub files_total: AtomicUsize,
+    /// ghi chú của luồng tải để luồng chính đẩy vào nhật ký (vd lỗi tải panorama)
+    pub notes: Mutex<Vec<String>>,
 }
 
 impl Shared {
@@ -68,6 +71,16 @@ pub struct VersionEntry {
 #[derive(Deserialize)]
 pub struct VersionMeta {
     pub downloads: Downloads,
+    #[serde(rename = "assetIndex", default)]
+    pub asset_index: Option<AssetIndexRef>,
+}
+
+#[derive(Deserialize, Clone)]
+pub struct AssetIndexRef {
+    pub id: String,
+    pub url: String,
+    pub sha1: String,
+    pub size: u64,
 }
 
 #[derive(Deserialize)]
@@ -211,5 +224,44 @@ pub async fn install_client(client: &Client, root: &Path, entry: &VersionEntry, 
         shared,
     )
     .await?;
+    // Ảnh panorama thật nằm ở asset index chứ không nhất thiết trong jar: tải thêm 6 file (best-effort).
+    if let Some(ai) = &meta.asset_index {
+        match fetch_panorama(client, root, &entry.id, ai, shared).await {
+            Ok(n) => shared.notes.lock().unwrap().push(format!("Đã có {n}/6 ảnh panorama từ asset index.")),
+            Err(e) => shared.notes.lock().unwrap().push(format!("Không tải được panorama từ asset index: {e}")),
+        }
+    } else {
+        shared.notes.lock().unwrap().push("version JSON không có assetIndex.".into());
+    }
     Ok(jar)
+}
+
+/// Thư mục chứa panorama_0..5.png tải từ asset index cho một phiên bản.
+pub fn pano_dir(root: &Path, version: &str) -> PathBuf {
+    root.join("assets").join("panorama").join(version)
+}
+
+/// Tải asset index rồi 6 ảnh panorama (kiểm SHA-1, bỏ qua file đã có) vào `pano_dir`.
+pub async fn fetch_panorama(client: &Client, root: &Path, version: &str, ai: &AssetIndexRef, shared: &Arc<Shared>) -> Res<usize> {
+    shared.set_phase("Đang tải panorama...");
+    shared.reset_progress();
+    let idx_path = root.join("assets").join("indexes").join(format!("{}.json", ai.id));
+    shared.bytes_total.store(ai.size, Relaxed);
+    shared.files_total.store(1, Relaxed);
+    download_one(client, &Task { url: ai.url.clone(), path: idx_path.clone(), sha1: Some(ai.sha1.clone()), size: ai.size }, shared).await?;
+    let objs = crate::mcgui::pano::parse_objects(&fs::read(&idx_path).await?);
+    if objs.is_empty() {
+        return Err("asset index không có panorama".into());
+    }
+    shared.reset_progress();
+    shared.bytes_total.store(objs.iter().map(|o| o.2).sum(), Relaxed);
+    shared.files_total.store(objs.len(), Relaxed);
+    let dir = pano_dir(root, version);
+    let mut n = 0;
+    for (i, hash, size) in objs {
+        let url = format!("{OBJECTS_URL}/{}/{}", &hash[..2], hash);
+        download_one(client, &Task { url, path: dir.join(format!("panorama_{i}.png")), sha1: Some(hash), size }, shared).await?;
+        n += 1;
+    }
+    Ok(n)
 }

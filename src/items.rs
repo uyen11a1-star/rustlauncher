@@ -64,6 +64,8 @@ pub struct Items {
     pub recipes: Vec<Recipe>,
     /// ảnh nền túi đồ (256x256, vùng 176x166)
     pub inv: Option<Tex>,
+    /// ảnh nền rương/menu server (generic_54.png)
+    pub chest: Option<Tex>,
     /// ảnh thanh nhanh + vùng nguồn [x,y,w,h] trong ảnh
     pub hot: Option<(Tex, [f32; 4])>,
     /// khung chọn thanh nhanh
@@ -525,6 +527,7 @@ fn build_any(jar: &Jar, atlas: &Atlas, log: &dyn Fn(String), net: bool) -> Items
     let (arm_v, arm_i) = arm_mesh(skin.w, skin.h);
     let (body_v, body_i) = body_mesh(skin.w, skin.h);
     let inv = load_tex(jar, &["assets/minecraft/textures/gui/container/inventory.png"]);
+    let chest = load_tex(jar, &["assets/minecraft/textures/gui/container/generic_54.png"]);
     // thanh nhanh: ảnh riêng (1.20.2+) hoặc widgets.png (cũ hơn)
     let hot = load_tex(jar, &["assets/minecraft/textures/gui/sprites/hud/hotbar.png"]).map(|t| (t, [0.0, 0.0, 182.0, 22.0])).or_else(|| load_tex(jar, &["assets/minecraft/textures/gui/widgets.png"]).map(|t| (t, [0.0, 0.0, 182.0, 22.0])));
     let sel = load_tex(jar, &["assets/minecraft/textures/gui/sprites/hud/hotbar_selection.png"]).map(|t| {
@@ -540,7 +543,7 @@ fn build_any(jar: &Jar, atlas: &Atlas, log: &dyn Fn(String), net: bool) -> Items
     log(format!("Công thức 2x2: {}, HUD: {}", recipes.len(), hud.is_some()));
     log(format!("GUI: túi đồ {}, thanh nhanh {}, khung chọn {}", inv.is_some(), hot.is_some(), sel.is_some()));
     log(format!("Vật phẩm: {} khối, skin {}x{}", list.len(), skin.w, skin.h));
-    Items { hud, hud_tex, head_n: 72, wear, recipes, inv, hot, sel, body_v, body_i, v: m.v, i: m.i, list, skin, arm_v, arm_i }
+    Items { hud, hud_tex, head_n: 72, wear, recipes, inv, chest, hot, sel, body_v, body_i, v: m.v, i: m.i, list, skin, arm_v, arm_i }
 }
 
 /// Thời gian một nhịp vung tay (6 tick = 0.3 giây như Minecraft).

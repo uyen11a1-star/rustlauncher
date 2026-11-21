@@ -31,6 +31,8 @@ pub struct GuiAssets {
     pub lang: HashMap<String, String>,
     pub splashes: Vec<String>,
     pub pano: Option<[usize; 6]>,
+    /// nguồn panorama đang dùng (để ghi nhật ký)
+    pub pano_note: &'static str,
     pub logo: Option<usize>,
     pub edition: Option<usize>,
     pub mojang: Option<usize>,
@@ -144,6 +146,7 @@ impl GuiAssets {
             lang: HashMap::new(),
             splashes: Vec::new(),
             pano: None,
+            pano_note: "",
             logo: None,
             edition: None,
             mojang: None,
@@ -217,28 +220,15 @@ impl GuiAssets {
             a.splashes = String::from_utf8_lossy(&b).lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty() && !l.starts_with('#')).collect();
         }
         tick(&mut done);
-        // panorama: 6 mặt 1024x1024, nạp song song
-        let paths: Vec<String> = (0..6).map(|i| format!("{base}title/background/panorama_{i}.png")).collect();
-        let decoded: Vec<Option<png::Image>> = std::thread::scope(|sc| {
-            let hs: Vec<_> = paths
-                .iter()
-                .map(|p| {
-                    sc.spawn(move || {
-                        let b = src.read(p)?;
-                        png::decode(&b).ok()
-                    })
-                })
-                .collect();
-            hs.into_iter().map(|h| h.join().ok().flatten()).collect()
-        });
-        if decoded.iter().all(|d| d.is_some()) {
-            let mut ids = [0usize; 6];
-            for (i, d) in decoded.into_iter().enumerate() {
-                a.imgs.push(d.unwrap());
-                ids[i] = a.imgs.len() - 1;
-            }
-            a.pano = Some(ids);
+        // panorama: ưu tiên ảnh thật (asset index/jar), ảnh giữ chỗ 1x1 bị loại, cuối cùng dựng bầu trời tạm
+        let (faces, note) = crate::mcgui::pano::load(src);
+        let mut ids = [0usize; 6];
+        for (i, f) in faces.into_iter().enumerate().take(6) {
+            a.imgs.push(f);
+            ids[i] = a.imgs.len() - 1;
         }
+        a.pano = Some(ids);
+        a.pano_note = note;
         for _ in 0..6 {
             tick(&mut done);
         }

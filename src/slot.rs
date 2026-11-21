@@ -234,6 +234,11 @@ fn container_fields(r: &mut R, fields: &Value, sc: &mut Scope, depth: u32) -> Op
 }
 
 fn read_slot_r(r: &mut R) -> Option<Option<(u32, u8)>> {
+    Some(read_slot_n(r)?.map(|(id, n, _)| (id, n)))
+}
+
+/// Như `read_slot_r` nhưng giữ thêm tên hiển thị (component custom_name, không có thì item_name) dạng chuỗi có mã §.
+fn read_slot_n(r: &mut R) -> Option<Option<(u32, u8, Option<String>)>> {
     let count = r.varint()?;
     if count <= 0 {
         return Some(None);
@@ -242,17 +247,40 @@ fn read_slot_r(r: &mut R) -> Option<Option<(u32, u8)>> {
     let added = r.varint()?;
     let removed = r.varint()?;
     let s = schema();
+    let (mut custom, mut base): (Option<String>, Option<String>) = (None, None);
     for _ in 0..added.max(0) {
         let t = r.varint()?.max(0) as usize;
         let name = s.ids.get(t)?;
         let ty = s.comp.get(name)?;
         let mut sc: Scope = vec![HashMap::new()];
+        let start = r.i;
         read_ty(r, ty, &mut sc, 0)?;
+        if name == "custom_name" || name == "item_name" {
+            let mut j = start;
+            if let Some(tag) = chat::read_nbt(r.b, &mut j) {
+                let txt = chat::to_legacy(&tag);
+                if !txt.is_empty() {
+                    if name == "custom_name" {
+                        custom = Some(txt);
+                    } else {
+                        base = Some(txt);
+                    }
+                }
+            }
+        }
     }
     for _ in 0..removed.max(0) {
         r.varint()?;
     }
-    Some(Some((item as u32, count.min(255) as u8)))
+    Some(Some((item as u32, count.min(255) as u8, custom.or(base))))
+}
+
+/// Đọc một Slot kèm tên hiển thị tuỳ chỉnh (nếu có).
+pub fn read_slot_named(b: &[u8], i: &mut usize) -> Option<Option<(u32, u8, Option<String>)>> {
+    let mut r = R { b, i: *i };
+    let v = read_slot_n(&mut r)?;
+    *i = r.i;
+    Some(v)
 }
 
 /// Đọc một Slot tại `i`: None = lỗi/lệch dữ liệu; Some(None) = ô trống; Some(Some((id mạng, số lượng))).

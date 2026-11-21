@@ -40,7 +40,13 @@ pub enum NetOut {
     /// dùng vật phẩm cầm trên tay (không nhắm khối)
     Use { yaw: f32, pitch: f32 },
     Swing,
+    /// bấm ô `slot` của cửa sổ vật chứa `win` (click trái thường)
+    Click { win: i32, state: i32, slot: i16, button: i8, mode: i32 },
+    /// đóng cửa sổ vật chứa
+    CloseWin(i32),
 }
+
+pub use crate::winnet::{click_packet, NetWin};
 
 static SEQ: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
 
@@ -95,6 +101,10 @@ pub struct NetState {
     pub players: std::collections::HashMap<i32, Pl>,
     /// số thứ tự hành động mới nhất server đã xác nhận (acknowledge_player_digging)
     pub ack: i32,
+    /// cửa sổ vật chứa đang mở (None = không có)
+    pub win: Option<NetWin>,
+    /// luồng đọc đặt true khi `win` đổi (mở, đóng, nội dung); luồng vẽ đọc rồi xóa
+    pub win_dirty: bool,
 }
 
 /// Ô của cửa sổ 0 (túi người chơi) -> ô của ta.
@@ -249,9 +259,21 @@ impl Drop for Link {
 struct Wr {
     s: TcpStream,
     comp: bool,
+    /// false trong lúc cấu hình lại (server chuyển máy chủ): không được gửi gói của pha chơi
+    play: bool,
 }
 
 type Shared = Arc<Mutex<Wr>>;
+
+/// Gửi gói của pha chơi; bị bỏ qua (không lỗi) khi đang ở pha cấu hình lại.
+fn wsend_play(w: &Shared, id: i32, body: &[u8]) -> Result<(), String> {
+    let mut g = w.lock().unwrap();
+    if !g.play {
+        return Ok(());
+    }
+    let c = g.comp;
+    send(&mut g.s, id, body, c)
+}
 
 fn wsend(w: &Shared, id: i32, body: &[u8]) -> Result<(), String> {
     let mut g = w.lock().unwrap();
@@ -569,7 +591,7 @@ fn parse_chunk(ctx: &mut Ctx, b: &[u8]) -> Option<RawChunk> {
 pub fn start(conn: Conn) -> Result<Link, String> {
     let rs = conn.s.try_clone().map_err(|e| e.to_string())?;
     let guard = conn.s.try_clone().map_err(|e| e.to_string())?;
-    let wr: Shared = Arc::new(Mutex::new(Wr { s: conn.s, comp: conn.comp }));
+    let wr: Shared = Arc::new(Mutex::new(Wr { s: conn.s, comp: conn.comp, play: true }));
     let (tx_in, rx_in) = mpsc::channel::<NetIn>();
     let (tx_out, rx_out) = mpsc::channel::<NetOut>();
     let cur: Arc<Mutex<[f64; 5]>> = Arc::new(Mutex::new([0.0; 5]));
@@ -593,7 +615,7 @@ pub fn start(conn: Conn) -> Result<Link, String> {
                         b.extend_from_slice(&pack_pos(pos));
                         b.push(face);
                         put_varint(&mut b, next_seq() as u32);
-                        if wsend(&wr, 0x28, &b).is_err() {
+                        if wsend_play(&wr, 0x28, &b).is_err() {
                             break;
                         }
                         continue;
@@ -609,7 +631,7 @@ pub fn start(conn: Conn) -> Result<Link, String> {
                         b.push(0);
                         b.push(0);
                         put_varint(&mut b, next_seq() as u32);
-                        if wsend(&wr, 0x3f, &b).is_err() {
+                        if wsend_play(&wr, 0x3f, &b).is_err() {
                             break;
                         }
                         continue;
@@ -620,19 +642,33 @@ pub fn start(conn: Conn) -> Result<Link, String> {
                         put_varint(&mut b, next_seq() as u32);
                         b.extend_from_slice(&yaw.to_be_bytes());
                         b.extend_from_slice(&pitch.to_be_bytes());
-                        if wsend(&wr, 0x40, &b).is_err() {
+                        if wsend_play(&wr, 0x40, &b).is_err() {
                             break;
                         }
                         continue;
                     }
                     NetOut::Swing => {
-                        if wsend(&wr, 0x3c, &[0]).is_err() {
+                        if wsend_play(&wr, 0x3c, &[0]).is_err() {
+                            break;
+                        }
+                        continue;
+                    }
+                    NetOut::Click { win, state, slot, button, mode } => {
+                        if wsend_play(&wr, 0x11, &click_packet(win, state, slot, button, mode)).is_err() {
+                            break;
+                        }
+                        continue;
+                    }
+                    NetOut::CloseWin(id) => {
+                        let mut b = Vec::new();
+                        put_varint(&mut b, id as u32);
+                        if wsend_play(&wr, 0x12, &b).is_err() {
                             break;
                         }
                         continue;
                     }
                     NetOut::Held(h) => {
-                        if wsend(&wr, 0x34, &(h as i16).to_be_bytes()).is_err() {
+                        if wsend_play(&wr, 0x34, &(h as i16).to_be_bytes()).is_err() {
                             break;
                         }
                         continue;
@@ -641,7 +677,7 @@ pub fn start(conn: Conn) -> Result<Link, String> {
                         let mut b = Vec::new();
                         if let Some(c) = t.strip_prefix('/') {
                             put_str(&mut b, c);
-                            if wsend(&wr, 0x06, &b).is_err() {
+                            if wsend_play(&wr, 0x06, &b).is_err() {
                                 break;
                             }
                         } else {
@@ -653,7 +689,7 @@ pub fn start(conn: Conn) -> Result<Link, String> {
                             put_varint(&mut b, 0);
                             b.extend_from_slice(&[0, 0, 0]);
                             b.push(0);
-                            if wsend(&wr, 0x08, &b).is_err() {
+                            if wsend_play(&wr, 0x08, &b).is_err() {
                                 break;
                             }
                         }
@@ -668,7 +704,7 @@ pub fn start(conn: Conn) -> Result<Link, String> {
                 b.extend_from_slice(&yaw.to_be_bytes());
                 b.extend_from_slice(&pitch.to_be_bytes());
                 b.push(ground as u8);
-                if wsend(&wr, 0x1e, &b).is_err() {
+                if wsend_play(&wr, 0x1e, &b).is_err() {
                     break;
                 }
             }
@@ -690,6 +726,10 @@ pub fn start(conn: Conn) -> Result<Link, String> {
 
 fn reader(s: &mut TcpStream, comp: bool, wr: &Shared, tx: &Sender<NetIn>, cur: &Arc<Mutex<[f64; 5]>>, st: &SharedState) -> Result<(), String> {
     let mut ctx = Ctx { min_y: -64, height: 384, dims: Vec::new(), biome_bits: 6, keys: Default::default() };
+    let mut loaded: std::collections::HashSet<(i32, i32)> = Default::default();
+    let mut cur_dim = String::new();
+    // một phiên = cấu hình + chơi; server (proxy) chuyển máy chủ thì quay lại đầu vòng
+    'session: loop {
     // ---- giai đoạn cấu hình ----
     wsend(wr, 0x00, &client_info())?;
     loop {
@@ -755,18 +795,62 @@ fn reader(s: &mut TcpStream, comp: bool, wr: &Shared, tx: &Sender<NetIn>, cur: &
                 rd_varint(&b, &mut i);
                 i += 3;
                 let dim = rd_varint(&b, &mut i).unwrap_or(0) as usize;
+                cur_dim = rd_str(&b, &mut i).unwrap_or_default();
                 if let Some(&(mn, h)) = ctx.dims.get(dim) {
                     ctx.min_y = mn;
                     ctx.height = h;
                 }
+                wr.lock().unwrap().play = true;
                 wsend(wr, 0x0d, &client_info())?;
                 let _ = tx.send(NetIn::Joined);
+            }
+            0x74 => {
+                // server (proxy BungeeCord/Velocity) chuyển sang máy chủ khác: xác nhận rồi vào lại pha cấu hình.
+                // Cờ play tắt và gói xác nhận gửi trong cùng một lần khóa để luồng ghi không chen gói chơi vào.
+                {
+                    let mut g = wr.lock().unwrap();
+                    g.play = false;
+                    let c = g.comp;
+                    send(&mut g.s, 0x0f, &[], c)?;
+                }
+                for (x, z) in loaded.drain() {
+                    let _ = tx.send(NetIn::Unload(x, z));
+                }
+                {
+                    let mut g = st.lock().unwrap();
+                    g.players.clear();
+                    g.win = None;
+                    g.win_dirty = true;
+                }
+                continue 'session;
+            }
+            0x50 => {
+                // respawn: sang thế giới khác thì bỏ chunk cũ và đổi chiều cao thế giới
+                let dim = rd_varint(&b, &mut i).unwrap_or(0) as usize;
+                let name = rd_str(&b, &mut i).unwrap_or_default();
+                if name != cur_dim {
+                    cur_dim = name;
+                    if let Some(&(mn, h)) = ctx.dims.get(dim) {
+                        ctx.min_y = mn;
+                        ctx.height = h;
+                    }
+                    for (x, z) in loaded.drain() {
+                        let _ = tx.send(NetIn::Unload(x, z));
+                    }
+                    st.lock().unwrap().players.clear();
+                }
+            }
+            0x7f => {
+                let host = rd_str(&b, &mut i).unwrap_or_default();
+                let port = rd_varint(&b, &mut i).unwrap_or(0);
+                return Err(format!("Disconnected: server yêu cầu chuyển sang {host}:{port} (chưa hỗ trợ transfer)"));
             }
             0x2b => wsend(wr, 0x1b, &b)?,
             0x3b => wsend(wr, 0x2c, &b)?,
             0x20 => return Err(format!("Disconnected: {}", nbt_text(&b))),
             0x2c => match parse_chunk(&mut ctx, &b) {
                 Some(rc) => {
+                    loaded.insert((rc.cx, rc.cz));
                     let _ = tx.send(NetIn::Chunk(rc));
                 }
                 None => {}
@@ -774,6 +858,7 @@ fn reader(s: &mut TcpStream, comp: bool, wr: &Shared, tx: &Sender<NetIn>, cur: &
             0x25 => {
                 let z = rd_i32(&b, &mut i).unwrap_or(0);
                 let x = rd_i32(&b, &mut i).unwrap_or(0);
+                loaded.remove(&(x, z));
                 let _ = tx.send(NetIn::Unload(x, z));
             }
             0x0b => {
@@ -836,6 +921,11 @@ fn reader(s: &mut TcpStream, comp: bool, wr: &Shared, tx: &Sender<NetIn>, cur: &
             0x01 | 0x4b | 0x33 | 0x34 | 0x36 | 0x7b | 0x23 | 0x51 => {
                 let _ = entity_packet(id, &b, st);
             }
+            0x39 | 0x11 => {
+                let mut g = st.lock().unwrap();
+                let g = &mut *g;
+                crate::winnet::apply(&mut g.win, &mut g.win_dirty, id, &b);
+            }
             0x12 => {
                 let win = rd_varint(&b, &mut i).unwrap_or(-1);
                 rd_varint(&b, &mut i);
@@ -861,6 +951,10 @@ fn reader(s: &mut TcpStream, comp: bool, wr: &Shared, tx: &Sender<NetIn>, cur: &
                         g.inv = inv;
                         g.inv_dirty = true;
                     }
+                } else {
+                    let mut g = st.lock().unwrap();
+                    let g = &mut *g;
+                    crate::winnet::apply(&mut g.win, &mut g.win_dirty, id, &b);
                 }
             }
             0x14 => {
@@ -871,6 +965,10 @@ fn reader(s: &mut TcpStream, comp: bool, wr: &Shared, tx: &Sender<NetIn>, cur: &
                     if let Some(v) = crate::slot::read_slot(&b, &mut i) {
                         set_inv(st, win0_slot(slot), v);
                     }
+                } else {
+                    let mut g = st.lock().unwrap();
+                    let g = &mut *g;
+                    crate::winnet::apply(&mut g.win, &mut g.win_dirty, id, &b);
                 }
             }
             0x6a => {
@@ -919,6 +1017,7 @@ fn reader(s: &mut TcpStream, comp: bool, wr: &Shared, tx: &Sender<NetIn>, cur: &
             }
             _ => {}
         }
+    }
     }
 }
 
