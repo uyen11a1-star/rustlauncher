@@ -131,3 +131,36 @@ pub fn request_all_files(vm: *mut c_void, activity: *mut c_void, package: &str) 
         Ok(())
     }
 }
+
+/// Bật bàn phím hệ thống: InputMethodManager.toggleSoftInput(SHOW_FORCED, 0).
+/// NativeActivity không có ô nhập nên showSoftInput thường không hiện gì; toggleSoftInput thì luôn hiện.
+/// Phím gõ sau đó tới app dưới dạng KeyEvent.
+pub fn show_keyboard(vm: *mut c_void, activity: *mut c_void) -> Result<(), String> {
+    unsafe {
+        let env = env_of(vm).ok_or("không gắn được luồng vào JVM")?;
+        let j = Jni { env };
+        let get_class: extern "C" fn(Env, *mut c_void) -> *mut c_void = fnp(env, 31);
+        let act_cls = get_class(env, activity);
+        let gss = j.method(act_cls, "getSystemService", "(Ljava/lang/String;)Ljava/lang/Object;");
+        if gss.is_null() {
+            return Err("không thấy getSystemService".into());
+        }
+        let name = j.string("input_method");
+        let call_obj: extern "C" fn(Env, *mut c_void, *mut c_void, *const u64) -> *mut c_void = fnp(env, 36);
+        let imm = call_obj(env, activity, gss, [name as u64].as_ptr());
+        if j.clear() || imm.is_null() {
+            return Err("không lấy được InputMethodManager".into());
+        }
+        let imm_cls = get_class(env, imm);
+        let toggle = j.method(imm_cls, "toggleSoftInput", "(II)V");
+        if toggle.is_null() {
+            return Err("không thấy toggleSoftInput".into());
+        }
+        let call_void: extern "C" fn(Env, *mut c_void, *mut c_void, *const u64) = fnp(env, 63);
+        call_void(env, imm, toggle, [2u64, 0u64].as_ptr());
+        if j.clear() {
+            return Err("toggleSoftInput ném lỗi".into());
+        }
+        Ok(())
+    }
+}

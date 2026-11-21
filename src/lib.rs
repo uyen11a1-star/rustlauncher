@@ -222,7 +222,9 @@ fn android_main(app: AndroidApp) {
                         if want != soft_on {
                             soft_on = want;
                             if want {
-                                app.show_soft_input(true);
+                                if perm::show_keyboard(app.vm_as_ptr(), app.activity_as_ptr()).is_err() {
+                                    app.show_soft_input(true);
+                                }
                             } else {
                                 app.hide_soft_input(false);
                             }
