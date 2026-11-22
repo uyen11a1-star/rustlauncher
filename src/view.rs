@@ -1608,6 +1608,19 @@ impl View {
         }
         g.end(None);
 
+        // dò lỗi cửa sổ vật chứa: ghi một dòng mỗi khi cửa sổ đổi
+        if let Some(wn) = &self.win {
+            static LAST_WIN: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(-1);
+            let filled = wn.slots.iter().filter(|x| x.is_some()).count();
+            let key = ((wn.id as i64) << 32) | ((wn.slots.len() as i64) << 12) | filled as i64;
+            if LAST_WIN.swap(key, std::sync::atomic::Ordering::Relaxed) != key {
+                let missing: Vec<u32> = wn.slots.iter().flatten().filter(|(id, _, _)| self.items.get(*id as usize).is_none()).map(|(id, _, _)| *id).take(6).collect();
+                let lay = self.win_layout(g).map(|l| format!("{:.0},{:.0} {:.0}x{:.0} k={}", l.panel[0], l.panel[1], l.panel[2], l.panel[3], l.k));
+                crate::netplay::trace(format!("WINDRAW id={} loại={} ô={} có vật={} vật không có icon={:?} chest_tex={:?} khung={:?} màn={}x{}", wn.id, wn.kind, wn.slots.len(), filled, missing, self.chest_tex.map(|t| (t.1, t.2)), lay, g.w, g.h));
+                crate::netplay::trace_flush();
+            }
+        }
+
         // lượt 2 (3D/ảnh): nền túi đồ & thanh nhanh bằng ảnh thật, Steve trong khung nhân vật, icon khối
         unsafe {
             glDisable(GL_SCISSOR_TEST);
