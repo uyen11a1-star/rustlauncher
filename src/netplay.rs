@@ -137,6 +137,9 @@ pub struct NetState {
     pub win: Option<NetWin>,
     /// luồng đọc đặt true khi `win` đổi (mở, đóng, nội dung); luồng vẽ đọc rồi xóa
     pub win_dirty: bool,
+    /// bản đồ (map) mới nhất: 128x128 byte màu, cờ đổi
+    pub map: Vec<u8>,
+    pub map_dirty: bool,
 }
 
 /// Ô của cửa sổ 0 (túi người chơi) -> ô của ta.
@@ -1088,6 +1091,57 @@ fn reader(s: &mut TcpStream, comp: bool, wr: &Shared, tx: &Sender<NetIn>, cur: &
                     let mut g = st.lock().unwrap();
                     let g = &mut *g;
                     crate::winnet::apply(&mut g.win, &mut g.win_dirty, id, &b);
+                }
+            }
+            0x31 => {
+                let mut j = 0usize;
+                let _id = rd_varint(&b, &mut j);
+                j += 2; // scale, locked
+                let mut ok = true;
+                if b.get(j).copied().unwrap_or(0) != 0 {
+                    j += 1;
+                    let n = rd_varint(&b, &mut j).unwrap_or(0);
+                    for _ in 0..n {
+                        rd_varint(&b, &mut j);
+                        j += 3;
+                        if b.get(j).copied().unwrap_or(0) != 0 {
+                            j += 1;
+                            if crate::chat::read_nbt(&b, &mut j).is_none() {
+                                ok = false;
+                                break;
+                            }
+                        } else {
+                            j += 1;
+                        }
+                    }
+                } else {
+                    j += 1;
+                }
+                if ok {
+                    let cols = b.get(j).copied().unwrap_or(0) as usize;
+                    if cols > 0 && j + 4 <= b.len() {
+                        let rows = b[j + 1] as usize;
+                        let (x0, y0) = (b[j + 2] as usize, b[j + 3] as usize);
+                        j += 4;
+                        let n = rd_varint(&b, &mut j).unwrap_or(0) as usize;
+                        if let Some(d) = b.get(j..j + n) {
+                            let mut g = st.lock().unwrap();
+                            if g.map.len() != 16384 {
+                                g.map = vec![0; 16384];
+                            }
+                            for r in 0..rows {
+                                for c in 0..cols {
+                                    let (x, y) = (x0 + c, y0 + r);
+                                    if x < 128 && y < 128 {
+                                        if let Some(&v) = d.get(r * cols + c) {
+                                            g.map[y * 128 + x] = v;
+                                        }
+                                    }
+                                }
+                            }
+                            g.map_dirty = true;
+                        }
+                    }
                 }
             }
             0x14 => {

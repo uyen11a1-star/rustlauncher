@@ -65,6 +65,17 @@ unsafe fn make_tex(rgba: &[u8], w: i32, h: i32) -> u32 {
     tex
 }
 
+const MAP_COLORS: [[u8; 3]; 62] = [
+    [0, 0, 0], [127, 178, 56], [247, 233, 163], [199, 199, 199], [255, 0, 0], [160, 160, 255], [167, 167, 167], [0, 124, 0],
+    [255, 255, 255], [164, 168, 184], [151, 109, 77], [112, 112, 112], [64, 64, 255], [143, 119, 72], [255, 252, 245], [216, 127, 51],
+    [178, 76, 216], [102, 153, 216], [229, 229, 51], [127, 204, 25], [242, 127, 165], [76, 76, 76], [153, 153, 153], [76, 127, 153],
+    [127, 63, 178], [51, 76, 178], [102, 76, 51], [102, 127, 51], [153, 51, 51], [25, 25, 25], [250, 238, 77], [92, 219, 213],
+    [74, 128, 255], [0, 217, 58], [129, 86, 49], [112, 2, 0], [209, 177, 161], [159, 82, 36], [149, 87, 108], [112, 108, 138],
+    [186, 133, 36], [103, 117, 53], [160, 77, 78], [57, 41, 35], [135, 107, 98], [87, 92, 92], [122, 73, 88], [76, 62, 92],
+    [76, 50, 35], [76, 82, 42], [142, 60, 46], [37, 22, 16], [189, 48, 49], [148, 63, 97], [92, 25, 29], [22, 126, 134],
+    [58, 142, 140], [86, 44, 62], [20, 180, 133], [100, 100, 100], [216, 175, 147], [127, 167, 150],
+];
+
 unsafe fn free(g: &Gpu) {
     glDeleteBuffers(1, &g.vbo);
     glDeleteBuffers(1, &g.ebo);
@@ -180,6 +191,10 @@ pub struct View {
     items: Vec<Item>,
     items_gpu: Gpu,
     arm_gpu: Gpu,
+    map_gpu: Gpu,
+    map_tex: u32,
+    map_idx: i32,
+    map_has: bool,
     skin_tex: u32,
     inv: Inv,
     inv_open: bool,
@@ -580,6 +595,18 @@ impl View {
             glGenBuffers(1, &mut quad_vbo);
             let items_gpu = upload_raw(&d.items.v, &d.items.i);
             let arm_gpu = upload_raw(&d.items.arm_v, &d.items.arm_i);
+            let map_gpu = {
+                let c = [255u8; 4];
+                let v = [
+                    V { p: [-0.5, -0.5, 0.0], uv: [0.0, 1.0], c },
+                    V { p: [0.5, -0.5, 0.0], uv: [1.0, 1.0], c },
+                    V { p: [0.5, 0.5, 0.0], uv: [1.0, 0.0], c },
+                    V { p: [-0.5, 0.5, 0.0], uv: [0.0, 0.0], c },
+                ];
+                upload_raw(&v, &[0, 1, 2, 0, 2, 3])
+            };
+            let map_tex = make_tex(&[214u8, 186, 140, 255].repeat(128 * 128), 128, 128);
+            let map_idx = include_str!("netitems.txt").lines().position(|n| n == "filled_map").map_or(-1, |p| p as i32);
             let skin_tex = make_tex(&d.items.skin.rgba, d.items.skin.w, d.items.skin.h);
             glBindTexture(GL_TEXTURE_2D, tex);
             let n_items = d.items.list.len();
@@ -603,6 +630,10 @@ impl View {
                 items: d.items.list,
                 items_gpu,
                 arm_gpu,
+                map_gpu,
+                map_tex,
+                map_idx,
+                map_has: false,
                 skin_tex,
                 inv: Inv::new(n_items, d.items.wear, d.items.recipes),
                 inv_open: false,
@@ -1526,6 +1557,46 @@ impl View {
                 glUniform3f(self.u_tint, hb, hb, hb);
                 let proj = math::perspective(1.2, aspect, 0.05, 20.0);
                 let sw = self.swing.map_or(0.0, |t| (t / SWING_T).min(1.0));
+                if self.shown.map_or(false, |i| i as i32 == self.map_idx) {
+                    if let Some(st) = &self.net_state {
+                        let mut g = st.lock().unwrap();
+                        if g.map_dirty && g.map.len() == 16384 {
+                            g.map_dirty = false;
+                            let mut px = Vec::with_capacity(16384 * 4);
+                            for &b in &g.map {
+                                let base = (b >> 2) as usize;
+                                if base == 0 || base > 61 {
+                                    px.extend_from_slice(&[214, 186, 140, 255]);
+                                } else {
+                                    let m = [180u32, 220, 255, 135][(b & 3) as usize];
+                                    let c = MAP_COLORS[base];
+                                    px.extend_from_slice(&[(c[0] as u32 * m / 255) as u8, (c[1] as u32 * m / 255) as u8, (c[2] as u32 * m / 255) as u8, 255]);
+                                }
+                            }
+                            glBindTexture(GL_TEXTURE_2D, self.map_tex);
+                            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 128, 128, GL_RGBA, GL_UNSIGNED_BYTE, px.as_ptr() as *const _);
+                            glBindTexture(GL_TEXTURE_2D, self.tex);
+                        }
+                    }
+                    let pd = -self.pitch.to_degrees();
+                    let f = (1.0 - pd / 45.0).clamp(0.0, 1.0);
+                    let tilt = -(f * std::f32::consts::PI).cos() * 0.5 + 0.5;
+                    let sq = sw.sqrt();
+                    let m = math::mul(
+                        &proj,
+                        &math::chain(&[
+                            math::translate(0.0, 0.04 - self.lower * 1.2 - 0.2 * (sq * std::f32::consts::PI).sin() * 0.0, -0.72),
+                            math::rot_x((tilt * -85.0f32).to_radians()),
+                            math::rot_x((sw * std::f32::consts::PI).sin() * 20.0f32.to_radians()),
+                            math::scale(0.76, 0.76, 0.76),
+                        ]),
+                    );
+                    glUniformMatrix4fv(self.u_mvp, 1, 0, m.as_ptr());
+                    glBindTexture(GL_TEXTURE_2D, self.map_tex);
+                    bind(&self.map_gpu);
+                    glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0 as *const _);
+                    glBindTexture(GL_TEXTURE_2D, self.tex);
+                } else {
                 match self.shown.and_then(|i| self.items.get(i as usize)) {
                     Some(it) => {
                         let m = math::mul(&proj, &if it.flat { items::hand_flat_matrix(self.lower, sw) } else { items::hand_matrix(self.lower, sw) });
@@ -1541,6 +1612,7 @@ impl View {
                         glDrawElements(GL_TRIANGLES, self.arm_gpu.count, GL_UNSIGNED_INT, 0 as *const _);
                         glBindTexture(GL_TEXTURE_2D, self.tex);
                     }
+                }
                 }
                 glUniform3f(self.u_tint, 1.0, 1.0, 1.0);
             }
