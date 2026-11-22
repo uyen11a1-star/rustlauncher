@@ -49,6 +49,8 @@ pub fn compare(jar: &Jar, seed: i64, dir: &Path, w: &World, keys: &[String], chu
     };
     log(format!("So sánh địa hình: dựng bộ máy xong ({} ms)", t0.elapsed().as_millis()));
     let cls: Vec<u8> = keys.iter().map(|k| class(k)).collect();
+    let sea = router.sea_level();
+    let mut water_top: std::collections::BTreeMap<i32, u64> = std::collections::BTreeMap::new();
     let (mut tot, mut ok, mut extra, mut missing) = (0u64, 0u64, 0u64, 0u64);
     let (mut cols, mut col_ok, mut col_diff, mut col_both) = (0u64, 0u64, 0i64, 0u64);
     let (mut s_tot, mut s_ok, mut s_feat) = (0u64, 0u64, 0u64);
@@ -67,7 +69,7 @@ pub fn compare(jar: &Jar, seed: i64, dir: &Path, w: &World, keys: &[String], chu
                 let mut t = MIN_Y;
                 for i in (0..H).rev() {
                     let y = MIN_Y + i as i32;
-                    if col[i] || y <= 63 {
+                    if col[i] || y < sea {
                         t = y + 1;
                         break;
                     }
@@ -81,6 +83,12 @@ pub fn compare(jar: &Jar, seed: i64, dir: &Path, w: &World, keys: &[String], chu
                 let (x, z) = (x0 + lx as i32, z0 + lz as i32);
                 let col = &solid[lz * 16 + lx];
                 let (mut rtop, mut ptop) = (i32::MIN, i32::MIN);
+                if let Some(wy) = (MIN_Y..=250).rev().find(|&y| {
+                    let id = w.get(x, y, z);
+                    id != UNKNOWN && short(&keys[id as usize]) == "water"
+                }) {
+                    *water_top.entry(wy).or_insert(0) += 1;
+                }
                 for y in (MIN_Y..=250).rev() {
                     let id = w.get(x, y, z);
                     if id == UNKNOWN {
@@ -168,6 +176,10 @@ pub fn compare(jar: &Jar, seed: i64, dir: &Path, w: &World, keys: &[String], chu
         if col_both == 0 { 0.0 } else { col_diff as f64 / col_both as f64 }
     ));
     log(format!("So sánh lớp bề mặt: khớp tên khối {:.1}% trên {} khối (bỏ qua {} khối do quặng/đặc điểm)", pct(s_ok, s_tot), s_tot, s_feat));
+    let mut wt: Vec<_> = water_top.into_iter().collect();
+    wt.sort_by(|a, b| b.1.cmp(&a.1));
+    let wt: Vec<String> = wt.iter().take(3).map(|(y, n)| format!("y={y}: {n} cột")).collect();
+    log(format!("Mực nước thật (khối nước cao nhất): {}; bộ máy dùng nước y < {}", wt.join(", "), sea));
     let mut v: Vec<_> = s_conf.into_iter().collect();
     v.sort_by(|a, b| b.1.cmp(&a.1));
     for ((p, r), n) in v.iter().take(8) {

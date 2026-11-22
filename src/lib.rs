@@ -43,6 +43,7 @@ mod ui;
 mod vbiome;
 mod vcompare;
 mod vdens;
+mod vgen;
 mod vnoise;
 mod vrng;
 

@@ -392,6 +392,15 @@ impl Worker {
     fn run(mut self, jar: Jar, atlas: Atlas, r: i32, pos: Arc<AtomicI64>, stop: Arc<AtomicBool>, tx: mpsc::Sender<Msg>) {
         let mut res = Resolver::new(&jar, &atlas);
         let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(2).min(4);
+        // sinh chunk bằng bộ máy worldgen ở chỗ thế giới chưa tạo (chỉ chế độ đọc đĩa)
+        let seed = match &self.src {
+            Src::Disk(d) => crate::vrng::read_seed(d),
+            _ => None,
+        };
+        let mut gen_router: Option<crate::vdens::Router> = None;
+        let mut gen_off = seed.is_none();
+        let mut gen_tried: HashSet<(i32, i32)> = HashSet::new();
+        let mut gen_count = 0usize;
         while !stop.load(Relaxed) {
             let (pcx, pcz) = unpack(pos.load(Relaxed));
             let far = |x: i32, z: i32| (x - pcx).abs() > r + 3 || (z - pcz).abs() > r + 3;
@@ -475,6 +484,43 @@ impl Worker {
                         }
                     }
                     busy = n > 0;
+                }
+            }
+            if let Some(sd) = seed {
+                if !gen_off {
+                    gen_tried.retain(|&(x, z)| !far(x, z));
+                    let mut miss: Vec<(i32, i32)> = Vec::new();
+                    for dz in -(r + 1)..=(r + 1) {
+                        for dx in -(r + 1)..=(r + 1) {
+                            let c = (pcx + dx, pcz + dz);
+                            if self.tried.contains(&c) && !self.w.chunks.contains_key(&c) && !gen_tried.contains(&c) {
+                                miss.push(c);
+                            }
+                        }
+                    }
+                    miss.sort_by_key(|c| dist(c));
+                    miss.truncate(2);
+                    if !miss.is_empty() && gen_router.is_none() {
+                        match crate::vdens::Router::build(&jar, sd) {
+                            Ok(rt) => gen_router = Some(rt),
+                            Err(_) => gen_off = true,
+                        }
+                    }
+                    if let Some(rt) = &gen_router {
+                        for c in miss {
+                            gen_tried.insert(c);
+                            raws.push(crate::vgen::generate(rt, c.0, c.1));
+                            want.push(c);
+                            for d in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
+                                self.meshed.remove(&(c.0 + d.0, c.1 + d.1));
+                            }
+                            gen_count += 1;
+                            if gen_count % 64 == 0 {
+                                rt.clear_caches();
+                            }
+                            busy = true;
+                        }
+                    }
                 }
             }
             if !edits.is_empty() {

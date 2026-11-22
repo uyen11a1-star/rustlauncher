@@ -829,6 +829,17 @@ impl<'a> Comp<'a> {
 }
 
 impl Router {
+    /// Mực nước biển: nước lấp các khối có y nhỏ hơn giá trị này.
+    pub fn sea_level(&self) -> i32 {
+        self.sea
+    }
+
+    /// Xả bộ nhớ đệm quần xã/độ cao sơ bộ khi sinh nhiều chunk (tránh phình RAM).
+    pub fn clear_caches(&self) {
+        self.biome_memo.borrow_mut().clear();
+        self.prelim_memo.borrow_mut().clear();
+    }
+
     /// Tên khối theo mã trong kết quả của `surface_column`.
     pub fn block_name(&self, id: u16) -> &str {
         &self.names[id as usize]
@@ -978,7 +989,7 @@ impl Router {
     pub fn surface_column(&self, x: i32, z: i32, solid: &[bool], steep: bool) -> Vec<u16> {
         let h = solid.len();
         let min = self.min_y;
-        let mut b: Vec<u16> = (0..h).map(|i| if solid[i] { 2 } else if min + i as i32 <= self.sea { 1 } else { 0 }).collect();
+        let mut b: Vec<u16> = (0..h).map(|i| if solid[i] { 2 } else if (min + i as i32) < self.sea { 1 } else { 0 }).collect();
         let mut top = 0usize;
         for i in (0..h).rev() {
             if b[i] != 0 {
