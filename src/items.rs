@@ -591,6 +591,30 @@ pub fn hand_matrix(lower: f32, sw: f32) -> Mat4 {
     ])
 }
 
+/// Vật phẩm phẳng (công cụ, xô, bản đồ...) cầm trên tay góc nhìn thứ nhất: transform "firstperson_righthand" của model item/generated
+/// (xoay 0,-90,25, dời 1.13,3.2,1.13 / 16, co 0.68) sau cùng chuỗi vung tay như khối.
+pub fn hand_flat_matrix(lower: f32, sw: f32) -> Mat4 {
+    let sq = sw.sqrt();
+    let f5 = -0.4 * (sq * PI).sin();
+    let f6 = 0.2 * (sq * 2.0 * PI).sin();
+    let f10 = -0.2 * (sw * PI).sin();
+    let f = (sw * sw * PI).sin();
+    let f1 = (sq * PI).sin();
+    math::chain(&[
+        math::translate(f5, f6, f10),
+        math::translate(0.56, -0.52 - lower * 0.6, -0.71999997),
+        math::rot_y((45.0 - f * 20.0).to_radians()),
+        math::rot_z((f1 * -20.0).to_radians()),
+        math::rot_x((f1 * -80.0).to_radians()),
+        math::rot_y((-45f32).to_radians()),
+        math::translate(1.13 / 16.0, 3.2 / 16.0, 1.13 / 16.0),
+        math::rot_y((-90f32).to_radians()),
+        math::rot_z(25f32.to_radians()),
+        math::scale(0.68, 0.68, 0.68),
+        math::translate(-0.5, -0.5, -0.5),
+    ])
+}
+
 /// Icon khối trong GUI (transform "gui" của model khối: xoay X 30°, Y 225°, co 0.625) đặt tại (cx, cy) pixel, `sz` pixel / khối.
 pub fn gui_matrix(w: f32, h: f32, cx: f32, cy: f32, sz: f32, zoff: f32) -> Mat4 {
     let ortho: Mat4 = [2.0 / w, 0.0, 0.0, 0.0, 0.0, -2.0 / h, 0.0, 0.0, 0.0, 0.0, -1.0 / 4000.0, 0.0, -1.0, 1.0, 0.0, 1.0];

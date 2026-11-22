@@ -1528,7 +1528,7 @@ impl View {
                 let sw = self.swing.map_or(0.0, |t| (t / SWING_T).min(1.0));
                 match self.shown.and_then(|i| self.items.get(i as usize)) {
                     Some(it) => {
-                        let m = math::mul(&proj, &items::hand_matrix(self.lower, sw));
+                        let m = math::mul(&proj, &if it.flat { items::hand_flat_matrix(self.lower, sw) } else { items::hand_matrix(self.lower, sw) });
                         glUniformMatrix4fv(self.u_mvp, 1, 0, m.as_ptr());
                         bind(&self.items_gpu);
                         glDrawElements(GL_TRIANGLES, it.hand.1, GL_UNSIGNED_INT, (it.hand.0 as usize * 4) as *const _);
