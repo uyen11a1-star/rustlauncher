@@ -833,6 +833,13 @@ fn reader(s: &mut TcpStream, comp: bool, wr: &Shared, tx: &Sender<NetIn>, cur: &
     // một phiên = cấu hình + chơi; server (proxy) chuyển máy chủ thì quay lại đầu vòng
     'session: loop {
     // ---- giai đoạn cấu hình ----
+    // như client gốc: báo tên client (minecraft:brand = "vanilla") rồi mới gửi cài đặt; hệ thống chống bot kiểm tra gói này
+    {
+        let mut b = Vec::new();
+        put_str(&mut b, "minecraft:brand");
+        put_str(&mut b, "vanilla");
+        wsend(wr, 0x02, &b)?;
+    }
     trace(format!("CAUHINH gửi settings: {:02x?}", client_info()));
     wsend(wr, 0x00, &client_info())?;
     loop {
