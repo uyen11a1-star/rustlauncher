@@ -738,6 +738,8 @@ pub fn start(conn: Conn) -> Result<Link, String> {
                         continue;
                     }
                     NetOut::Chat(t) => {
+                        trace(format!("CHAT gửi: {t}"));
+                        trace_flush();
                         let mut b = Vec::new();
                         if let Some(c) = t.strip_prefix('/') {
                             put_str(&mut b, c);
@@ -831,6 +833,7 @@ fn reader(s: &mut TcpStream, comp: bool, wr: &Shared, tx: &Sender<NetIn>, cur: &
     // một phiên = cấu hình + chơi; server (proxy) chuyển máy chủ thì quay lại đầu vòng
     'session: loop {
     // ---- giai đoạn cấu hình ----
+    trace(format!("CAUHINH gửi settings: {:02x?}", client_info()));
     wsend(wr, 0x00, &client_info())?;
     loop {
         let (id, body) = recv(s, comp)?;
@@ -994,6 +997,8 @@ fn reader(s: &mut TcpStream, comp: bool, wr: &Shared, tx: &Sender<NetIn>, cur: &
                 if let Some(t) = crate::chat::read_nbt(&b, &mut j) {
                     let action_bar = b.get(j).copied().unwrap_or(0) != 0;
                     if !action_bar {
+                        trace(format!("CHAT nhận: {}", crate::chat::to_legacy(&t)));
+                        trace_flush();
                         st.lock().unwrap().chat.push(crate::chat::to_legacy(&t));
                     }
                 }
