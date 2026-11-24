@@ -873,6 +873,8 @@ impl View {
                                 self.touches.clear();
                                 self.ui_down = None;
                                 self.ui_pt = (g.w as f32 / 2.0, g.h as f32 / 2.0);
+                            } else if let Some(tx) = &self.net {
+                                let _ = tx.send(crate::netplay::NetOut::CloseWin(0));
                             } else {
                                 self.inv.stash();
                             }
@@ -889,6 +891,25 @@ impl View {
                         Role::Ui => {
                             let up = (0..SLOTS).find(|&i| inside(inv_slot_rect(g, i), x, y));
                             // nhiều người chơi: túi chỉ để xem (server giữ dữ liệu thật)
+                            if self.net.is_some() {
+                                let down = self.ui_down.take().map(|(d, _)| d);
+                                let mut cl: Vec<i16> = Vec::new();
+                                match (down, up) {
+                                    (Some(d), Some(u)) if d != u => {
+                                        cl.push(crate::netplay::win0_proto(d));
+                                        cl.push(crate::netplay::win0_proto(u));
+                                    }
+                                    (_, Some(u)) => cl.push(crate::netplay::win0_proto(u)),
+                                    (_, None) if self.inv.cursor.is_some() && !inside(inv_panel(g), x, y) => cl.push(-999),
+                                    _ => {}
+                                }
+                                if let (Some(tx), Some(st)) = (&self.net, &self.net_state) {
+                                    let state = st.lock().unwrap().inv_state;
+                                    for s in cl {
+                                        let _ = tx.send(crate::netplay::NetOut::Click { win: 0, state, slot: s, button: 0, mode: 0 });
+                                    }
+                                }
+                            }
                             let up = if self.net.is_some() { None } else { up };
                             match (self.ui_down.take(), up) {
                                 // đang cầm vật: thả vào ô dưới ngón tay
@@ -1219,6 +1240,10 @@ impl View {
                     for i in 0..SLOTS {
                         self.inv.slots[i] = g.inv.get(i).copied().flatten().map(|(id, n)| crate::inv::Stack { item: id as u16, n });
                     }
+                }
+                if g.cursor_dirty {
+                    g.cursor_dirty = false;
+                    self.inv.cursor = g.cursor.map(|(id, n)| crate::inv::Stack { item: id as u16, n });
                 }
                 if g.win_dirty {
                     g.win_dirty = false;

@@ -140,6 +140,11 @@ pub struct NetState {
     /// bản đồ (map) mới nhất: 128x128 byte màu, cờ đổi
     pub map: Vec<u8>,
     pub map_dirty: bool,
+    /// số trạng thái túi (cửa sổ 0) mới nhất của server, dùng khi gửi click
+    pub inv_state: i32,
+    /// vật đang cầm trên con trỏ do server báo
+    pub cursor: Option<(u32, u8)>,
+    pub cursor_dirty: bool,
 }
 
 /// Ô của cửa sổ 0 (túi người chơi) -> ô của ta.
@@ -165,6 +170,19 @@ fn inv_slot(s: i32) -> Option<usize> {
         39 => Some(36),
         40 => Some(40),
         _ => None,
+    }
+}
+
+/// Ô của ta -> ô cửa sổ 0 của giao thức.
+pub fn win0_proto(i: usize) -> i16 {
+    match i {
+        0..=8 => 36 + i as i16,
+        9..=35 => i as i16,
+        36..=39 => 5 + (i - 36) as i16,
+        40 => 45,
+        41..=44 => 1 + (i - 41) as i16,
+        45 => 0,
+        _ => -1,
     }
 }
 
@@ -1062,9 +1080,16 @@ fn reader(s: &mut TcpStream, comp: bool, wr: &Shared, tx: &Sender<NetIn>, cur: &
                 let g = &mut *g;
                 crate::winnet::apply(&mut g.win, &mut g.win_dirty, id, &b);
             }
+            0x5e => {
+                if let Some(v) = crate::slot::read_slot(&b, &mut i) {
+                    let mut g = st.lock().unwrap();
+                    g.cursor = v;
+                    g.cursor_dirty = true;
+                }
+            }
             0x12 => {
                 let win = rd_varint(&b, &mut i).unwrap_or(-1);
-                rd_varint(&b, &mut i);
+                let state = rd_varint(&b, &mut i).unwrap_or(0);
                 if win == 0 {
                     let n = rd_varint(&b, &mut i).unwrap_or(0);
                     let mut inv: Vec<Option<(u32, u8)>> = vec![None; 46];
@@ -1082,7 +1107,13 @@ fn reader(s: &mut TcpStream, comp: bool, wr: &Shared, tx: &Sender<NetIn>, cur: &
                             }
                         }
                     }
+                    let carried = if ok { crate::slot::read_slot(&b, &mut i) } else { None };
                     let mut g = st.lock().unwrap();
+                    g.inv_state = state;
+                    if let Some(c) = carried {
+                        g.cursor = c;
+                        g.cursor_dirty = true;
+                    }
                     if ok || g.inv.len() < 46 {
                         g.inv = inv;
                         g.inv_dirty = true;
@@ -1146,7 +1177,10 @@ fn reader(s: &mut TcpStream, comp: bool, wr: &Shared, tx: &Sender<NetIn>, cur: &
             }
             0x14 => {
                 let win = rd_varint(&b, &mut i).unwrap_or(-1);
-                rd_varint(&b, &mut i);
+                let state = rd_varint(&b, &mut i).unwrap_or(0);
+                if win == 0 {
+                    st.lock().unwrap().inv_state = state;
+                }
                 let slot = rd_i16(&b, &mut i).unwrap_or(-1) as i32;
                 if win == 0 {
                     if let Some(v) = crate::slot::read_slot(&b, &mut i) {
