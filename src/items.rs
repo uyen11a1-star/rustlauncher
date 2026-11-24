@@ -77,6 +77,8 @@ pub struct Items {
     pub i: Vec<u32>,
     pub list: Vec<Item>,
     pub skin: Skin,
+    /// 10 giai đoạn vết nứt khi phá khối
+    pub crack: Vec<Tex>,
     pub arm_v: Vec<V>,
     pub arm_i: Vec<u32>,
 }
@@ -523,6 +525,7 @@ fn build_any(jar: &Jar, atlas: &Atlas, log: &dyn Fn(String), net: bool) -> Items
         list.push(Item { name, gui: (a, b - a), hand: (b, c - b), flat: false });
         keys.push(key.to_string());
     }
+    let crack: Vec<Tex> = (0..10).filter_map(|k| load_tex(jar, &[&format!("assets/minecraft/textures/block/destroy_stage_{k}.png")])).collect();
     let skin = load_skin(jar);
     let (arm_v, arm_i) = arm_mesh(skin.w, skin.h);
     let (body_v, body_i) = body_mesh(skin.w, skin.h);
@@ -543,7 +546,7 @@ fn build_any(jar: &Jar, atlas: &Atlas, log: &dyn Fn(String), net: bool) -> Items
     log(format!("Công thức 2x2: {}, HUD: {}", recipes.len(), hud.is_some()));
     log(format!("GUI: túi đồ {}, thanh nhanh {}, khung chọn {}", inv.is_some(), hot.is_some(), sel.is_some()));
     log(format!("Vật phẩm: {} khối, skin {}x{}", list.len(), skin.w, skin.h));
-    Items { hud, hud_tex, head_n: 72, wear, recipes, inv, chest, hot, sel, body_v, body_i, v: m.v, i: m.i, list, skin, arm_v, arm_i }
+    Items { hud, hud_tex, head_n: 72, wear, recipes, inv, chest, hot, sel, body_v, body_i, v: m.v, i: m.i, list, skin, arm_v, arm_i, crack }
 }
 
 /// Thời gian một nhịp vung tay (6 tick = 0.3 giây như Minecraft).

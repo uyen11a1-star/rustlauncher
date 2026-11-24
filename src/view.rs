@@ -191,6 +191,8 @@ pub struct View {
     items: Vec<Item>,
     items_gpu: Gpu,
     arm_gpu: Gpu,
+    crack_gpu: Gpu,
+    crack_tex: Vec<u32>,
     map_gpu: Gpu,
     map_tex: u32,
     map_idx: i32,
@@ -598,6 +600,28 @@ impl View {
             glGenBuffers(1, &mut quad_vbo);
             let items_gpu = upload_raw(&d.items.v, &d.items.i);
             let arm_gpu = upload_raw(&d.items.arm_v, &d.items.arm_i);
+            let crack_tex: Vec<u32> = d.items.crack.iter().map(|t| make_tex(&t.rgba, t.w, t.h)).collect();
+            let crack_gpu = {
+                let (mut v, mut ix) = (Vec::new(), Vec::new());
+                let (lo, hi) = (-0.002f32, 1.002f32);
+                // 6 mặt: (góc, trục u, trục v)
+                let faces: [([f32; 3], [f32; 3], [f32; 3]); 6] = [
+                    ([lo, lo, lo], [hi - lo, 0.0, 0.0], [0.0, hi - lo, 0.0]),
+                    ([lo, lo, hi], [hi - lo, 0.0, 0.0], [0.0, hi - lo, 0.0]),
+                    ([lo, lo, lo], [0.0, 0.0, hi - lo], [0.0, hi - lo, 0.0]),
+                    ([hi, lo, lo], [0.0, 0.0, hi - lo], [0.0, hi - lo, 0.0]),
+                    ([lo, lo, lo], [hi - lo, 0.0, 0.0], [0.0, 0.0, hi - lo]),
+                    ([lo, hi, lo], [hi - lo, 0.0, 0.0], [0.0, 0.0, hi - lo]),
+                ];
+                for (a, du, dv) in faces {
+                    let base = v.len() as u32;
+                    for (s, t) in [(0.0f32, 0.0f32), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)] {
+                        v.push(V { p: [a[0] + du[0] * s + dv[0] * t, a[1] + du[1] * s + dv[1] * t, a[2] + du[2] * s + dv[2] * t], uv: [s, 1.0 - t], c: [255; 4] });
+                    }
+                    ix.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+                }
+                upload_raw(&v, &ix)
+            };
             let map_gpu = {
                 let c = [255u8; 4];
                 let v = [
@@ -633,6 +657,8 @@ impl View {
                 items: d.items.list,
                 items_gpu,
                 arm_gpu,
+                crack_gpu,
+                crack_tex,
                 map_gpu,
                 map_tex,
                 map_idx,
@@ -1064,6 +1090,10 @@ impl View {
             let _ = tx.send(crate::netplay::NetOut::Dig { status: 0, pos: a.pos, face: a.face });
             self.dig = Some(Dig { pos: a.pos, t0: now, need, finished: None });
             return;
+        }
+        if self.swing.is_none() {
+            self.swing = Some(0.0);
+            let _ = tx.send(crate::netplay::NetOut::Swing);
         }
         let d = self.dig.as_mut().unwrap();
         if d.finished.is_none() && now.duration_since(d.t0).as_secs_f32() >= d.need {
@@ -1551,6 +1581,27 @@ impl View {
             }
             self.drawn_chunks = vis.len();
             self.drawn_verts = vis.iter().map(|c| c.nverts).sum();
+            // vết nứt khi đang phá khối
+            if let Some(d) = &self.dig {
+                if d.finished.is_none() && d.need < 1.0e8 && !self.crack_tex.is_empty() {
+                    let prog = (d.t0.elapsed().as_secs_f32() / d.need).clamp(0.0, 0.999);
+                    let st = ((prog * 10.0) as usize).min(self.crack_tex.len() - 1);
+                    let m = math::mul(&mvp, &math::translate(d.pos[0] as f32, d.pos[1] as f32, d.pos[2] as f32));
+                    glUniformMatrix4fv(self.u_mvp, 1, 0, m.as_ptr());
+                    glEnable(GL_BLEND);
+                    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+                    glDepthMask(0);
+                    glDisable(GL_CULL_FACE);
+                    glBindTexture(GL_TEXTURE_2D, self.crack_tex[st]);
+                    bind(&self.crack_gpu);
+                    glDrawElements(GL_TRIANGLES, 36, GL_UNSIGNED_INT, 0 as *const _);
+                    glDepthMask(1);
+                    glDisable(GL_BLEND);
+                    glEnable(GL_CULL_FACE);
+                    glBindTexture(GL_TEXTURE_2D, self.tex);
+                    glUniformMatrix4fv(self.u_mvp, 1, 0, mvp.as_ptr());
+                }
+            }
             // người chơi khác: thân Steve đứng yên, đầu quay theo hướng nhìn
             self.tags.clear();
             if !self.others.is_empty() {
