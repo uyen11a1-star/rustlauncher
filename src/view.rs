@@ -271,6 +271,8 @@ struct Other {
     pitch: f32,
     head: f32,
     name: String,
+    wp: f32,
+    ws: f32,
 }
 
 fn lerp_ang(a: f32, b: f32, t: f32) -> f32 {
@@ -1275,10 +1277,18 @@ impl View {
             let k = (dt * 10.0).min(1.0);
             self.others.retain(|e, _| raw.iter().any(|r| r.0 == *e));
             for (e, p, name) in raw {
-                let o = self.others.entry(e).or_insert_with(|| Other { pos: [p.pos[0] as f32, p.pos[1] as f32, p.pos[2] as f32], tgt: p.pos, yaw: p.yaw, pitch: p.pitch, head: p.head, name: String::new() });
+                let o = self.others.entry(e).or_insert_with(|| Other { pos: [p.pos[0] as f32, p.pos[1] as f32, p.pos[2] as f32], tgt: p.pos, yaw: p.yaw, pitch: p.pitch, head: p.head, name: String::new(), wp: 0.0, ws: 0.0 });
                 o.tgt = p.pos;
+                let old = [o.pos[0], o.pos[2]];
                 for j in 0..3 {
                     o.pos[j] += (p.pos[j] as f32 - o.pos[j]) * k;
+                }
+                if dt > 0.0 {
+                    let d = ((o.pos[0] - old[0]).powi(2) + (o.pos[2] - old[1]).powi(2)).sqrt();
+                    let tick = dt * 20.0;
+                    let sp = (d / tick * 4.0).min(1.0);
+                    o.ws += (sp - o.ws) * (0.4 * tick).min(1.0);
+                    o.wp += o.ws * tick;
                 }
                 o.yaw = lerp_ang(o.yaw, p.yaw, k);
                 o.head = lerp_ang(o.head, p.head, k);
@@ -1561,7 +1571,30 @@ impl View {
                     glUniformMatrix4fv(self.u_mvp, 1, 0, mh.as_ptr());
                     glDrawElements(GL_TRIANGLES, hn, GL_UNSIGNED_INT, 0 as *const _);
                     glUniformMatrix4fv(self.u_mvp, 1, 0, mb.as_ptr());
-                    glDrawElements(GL_TRIANGLES, self.body_gpu.count - hn, GL_UNSIGNED_INT, (hn as usize * 4) as *const _);
+                    let total = self.body_gpu.count;
+                    let draw = |a: i32, b: i32| glDrawElements(GL_TRIANGLES, b - a, GL_UNSIGNED_INT, (a as usize * 4) as *const _);
+                    // thân (+ áo ngoài)
+                    draw(hn, hn + 36);
+                    if total > 252 {
+                        draw(252, 288);
+                    }
+                    // tay chân đung đưa quanh khớp (vai y=2, hông y=12)
+                    let (ph, sp) = (o.wp * 0.6662, o.ws);
+                    let swing = [
+                        (3, [-5.0, 2.0, 0.0], (ph + std::f32::consts::PI).cos() * sp),
+                        (4, [5.0, 2.0, 0.0], ph.cos() * sp),
+                        (5, [-1.9, 12.0, 0.0], ph.cos() * 1.4 * sp),
+                        (6, [1.9, 12.0, 0.0], (ph + std::f32::consts::PI).cos() * 1.4 * sp),
+                    ];
+                    for (bx, pv, ang) in swing {
+                        let ml = math::chain(&[mvp, base, math::translate(pv[0], pv[1], pv[2]), math::rot_x(ang), math::translate(-pv[0], -pv[1], -pv[2])]);
+                        glUniformMatrix4fv(self.u_mvp, 1, 0, ml.as_ptr());
+                        draw(bx * 36, bx * 36 + 36);
+                        if total > 252 {
+                            let e = 252 + (bx - 2) * 36;
+                            draw(e, e + 36);
+                        }
+                    }
                     if !o.name.is_empty() {
                         let (x, y, z) = (o.pos[0], o.pos[1] + 2.1, o.pos[2]);
                         let cw = mvp[3] * x + mvp[7] * y + mvp[11] * z + mvp[15];
