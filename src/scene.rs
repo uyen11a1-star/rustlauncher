@@ -159,24 +159,9 @@ pub fn bright(l: u8) -> f32 {
     0.03 + 0.97 * x / (4.0 - 3.0 * x)
 }
 
-/// Độ sáng 0..1 của một mức sáng 0..15.
-fn bright_n(n: u8) -> f32 {
-    let x = n as f32 / 15.0;
-    0.03 + 0.97 * x / (4.0 - 3.0 * x)
-}
-
-/// Tỉ lệ sáng-trời: sky / (sky + block).
-fn sky_share(sk: f32, bl: f32) -> f32 {
-    if sk + bl <= 0.0 {
-        0.5
-    } else {
-        sk / (sk + bl)
-    }
-}
-
 /// Smooth lighting: mỗi đỉnh lấy trung bình ánh sáng của 4 ô quanh nó (lớp ô phía trước mặt) nhân với AO
 /// (ô đặc làm tối như Minecraft). Trả về độ sáng 0..1 cho 4 đỉnh của mặt.
-fn smooth(world: &World, states: &[State], p: [i32; 3], f: &crate::assets::BFace) -> ([f32; 4], [f32; 4]) {
+fn smooth(world: &World, states: &[State], p: [i32; 3], f: &crate::assets::BFace) -> ([f32; 4], [f32; 4], [f32; 4]) {
     let d = f.cull as usize;
     let a = [1usize, 1, 2, 2, 0, 0][d] ;
     let (t1, t2) = ((a + 1) % 3, (a + 2) % 3);
@@ -185,7 +170,7 @@ fn smooth(world: &World, states: &[State], p: [i32; 3], f: &crate::assets::BFace
     let mut opaque = [[false; 3]; 3];
     let mut light = [[(0.0f32, 0.0f32); 3]; 3];
     let lc = world.light(n[0], n[1], n[2]);
-    let center = (bright_n(lc >> 4), bright_n(lc & 15));
+    let center = ((lc >> 4) as f32, (lc & 15) as f32);
     for i in 0..3 {
         for j in 0..3 {
             let mut q = n;
@@ -198,12 +183,12 @@ fn smooth(world: &World, states: &[State], p: [i32; 3], f: &crate::assets::BFace
                 center
             } else {
                 let lq = world.light(q[0], q[1], q[2]);
-                (bright_n(lq >> 4), bright_n(lq & 15))
+                ((lq >> 4) as f32, (lq & 15) as f32)
             };
         }
     }
     let mut out = [0.0f32; 4];
-    let mut share = [0.5f32; 4];
+    let (mut sky, mut blk) = ([0.0f32; 4], [0.0f32; 4]);
     for k in 0..4 {
         let s1 = if f.q[k][t1] > 0.5 { 2 } else { 0 };
         let s2 = if f.q[k][t2] > 0.5 { 2 } else { 0 };
@@ -212,13 +197,13 @@ fn smooth(world: &World, states: &[State], p: [i32; 3], f: &crate::assets::BFace
         let (ok, lk) = if oa && ob { (true, center) } else { (opaque[s1][s2], light[s1][s2]) };
         let sk = (center.0 + light[s1][1].0 + light[1][s2].0 + lk.0) / 4.0;
         let bl = (center.1 + light[s1][1].1 + light[1][s2].1 + lk.1) / 4.0;
-        let l = sk.max(bl);
-        share[k] = sky_share(sk, bl);
+        sky[k] = sk;
+        blk[k] = bl;
         let sh = |o: bool| if o { 0.2f32 } else { 1.0 };
         let ao = (1.0 + sh(oa) + sh(ob) + sh(ok)) / 4.0;
-        out[k] = l * ao;
+        out[k] = ao;
     }
-    (out, share)
+    (out, sky, blk)
 }
 
 fn mesh_chunk(world: &World, states: &[State], cx: i32, cz: i32) -> Mesh {
@@ -278,14 +263,14 @@ fn mesh_chunk(world: &World, states: &[State], cx: i32, cz: i32) -> Mesh {
                             } else {
                                 world.light(x, y, z)
                             };
-                            mesh.push_water(f, at, col, bright(lv));
+                            mesh.push_water_l(f, at, col, (lv >> 4) as f32, (lv & 15) as f32);
                         } else if f.cull != NOCULL {
-                            let (br, t) = smooth(world, states, [x, y, z], f);
-                            mesh.push_face_vt(f, at, col, br, t);
+                            let (ao, sk, bl) = smooth(world, states, [x, y, z], f);
+                            mesh.push_face_vl(f, at, col, ao, sk, bl);
                         } else {
                             let lv = world.light(x, y, z);
-                            let (sk, bl) = (bright_n(lv >> 4), bright_n(lv & 15));
-                            mesh.push_face_bt(f, at, col, sk.max(bl), sky_share(sk, bl));
+                            let (sk, bl) = ((lv >> 4) as f32, (lv & 15) as f32);
+                            mesh.push_face_vl(f, at, col, [1.0; 4], [sk; 4], [bl; 4]);
                         }
                     }
                 }

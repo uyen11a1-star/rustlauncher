@@ -19,6 +19,8 @@ pub struct V {
     pub p: [f32; 3],
     pub uv: [f32; 2],
     pub c: [u8; 4],
+    /// mức sáng trời, sáng khối (0..1 = mức/15) để tra bảng lightmap; 0 với vật không thuộc thế giới
+    pub l: [u8; 4],
 }
 
 pub struct Jar {
@@ -438,29 +440,9 @@ impl Mesh {
         let s = f.shade * br;
         let c = [(col[0] as f32 * s) as u8, (col[1] as f32 * s) as u8, (col[2] as f32 * s) as u8, 255];
         for k in 0..4 {
-            self.v.push(V { p: [f.q[k][0] + at[0], f.q[k][1] + at[1], f.q[k][2] + at[2]], uv: f.uv[k], c });
+            self.v.push(V { p: [f.q[k][0] + at[0], f.q[k][1] + at[1], f.q[k][2] + at[2]], uv: f.uv[k], c, l: [0; 4] });
         }
         self.i.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
-    }
-
-    /// Như `push_face_b` nhưng alpha mang tỉ lệ sáng-trời `t` (0..1) để shader đổi theo giờ trong ngày.
-    pub fn push_face_bt(&mut self, f: &BFace, at: [f32; 3], col: [u8; 3], br: f32, t: f32) {
-        self.push_face_vt(f, at, col, [br; 4], [t; 4]);
-    }
-
-    /// Như `push_face_v` nhưng mỗi đỉnh kèm tỉ lệ sáng-trời `t`: sky/(sky+block) của ánh sáng đỉnh.
-    pub fn push_face_vt(&mut self, f: &BFace, at: [f32; 3], col: [u8; 3], br: [f32; 4], t: [f32; 4]) {
-        let base = self.v.len() as u32;
-        for k in 0..4 {
-            let s = f.shade * br[k];
-            let c = [(col[0] as f32 * s) as u8, (col[1] as f32 * s) as u8, (col[2] as f32 * s) as u8, (t[k].clamp(0.0, 1.0) * 255.0 + 0.5) as u8];
-            self.v.push(V { p: [f.q[k][0] + at[0], f.q[k][1] + at[1], f.q[k][2] + at[2]], uv: f.uv[k], c });
-        }
-        if br[0] + br[2] >= br[1] + br[3] {
-            self.i.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
-        } else {
-            self.i.extend_from_slice(&[base + 1, base + 2, base + 3, base + 1, base + 3, base]);
-        }
     }
 
     /// Như `push_face_b` nhưng mỗi đỉnh một độ sáng (smooth lighting). Đường chéo chia tam giác chọn theo độ sáng để không lộ vệt.
@@ -469,7 +451,7 @@ impl Mesh {
         for k in 0..4 {
             let s = f.shade * br[k];
             let c = [(col[0] as f32 * s) as u8, (col[1] as f32 * s) as u8, (col[2] as f32 * s) as u8, 255];
-            self.v.push(V { p: [f.q[k][0] + at[0], f.q[k][1] + at[1], f.q[k][2] + at[2]], uv: f.uv[k], c });
+            self.v.push(V { p: [f.q[k][0] + at[0], f.q[k][1] + at[1], f.q[k][2] + at[2]], uv: f.uv[k], c, l: [0; 4] });
         }
         if br[0] + br[2] >= br[1] + br[3] {
             self.i.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
@@ -478,13 +460,41 @@ impl Mesh {
         }
     }
 
+    /// Mặt thế giới có ánh sáng: màu đỉnh = màu * bóng mặt * AO; mức sáng trời / khối (0..15) từng đỉnh để shader tra lightmap như vanilla.
+    pub fn push_face_vl(&mut self, f: &BFace, at: [f32; 3], col: [u8; 3], ao: [f32; 4], sk: [f32; 4], bl: [f32; 4]) {
+        let base = self.v.len() as u32;
+        for k in 0..4 {
+            let s = f.shade * ao[k];
+            let c = [(col[0] as f32 * s) as u8, (col[1] as f32 * s) as u8, (col[2] as f32 * s) as u8, 255];
+            let l = [(sk[k] / 15.0 * 255.0 + 0.5) as u8, (bl[k] / 15.0 * 255.0 + 0.5) as u8, 0, 0];
+            self.v.push(V { p: [f.q[k][0] + at[0], f.q[k][1] + at[1], f.q[k][2] + at[2]], uv: f.uv[k], c, l });
+        }
+        let br = |k: usize| sk[k].max(bl[k]) * ao[k];
+        if br(0) + br(2) >= br(1) + br(3) {
+            self.i.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+        } else {
+            self.i.extend_from_slice(&[base + 1, base + 2, base + 3, base + 1, base + 3, base]);
+        }
+    }
+
+    /// Mặt nước có ánh sáng (alpha 200, chỉ số vào `iw`).
+    pub fn push_water_l(&mut self, f: &BFace, at: [f32; 3], col: [u8; 3], sk: f32, bl: f32) {
+        let base = self.v.len() as u32;
+        let c = [(col[0] as f32 * f.shade) as u8, (col[1] as f32 * f.shade) as u8, (col[2] as f32 * f.shade) as u8, 200];
+        let l = [(sk / 15.0 * 255.0 + 0.5) as u8, (bl / 15.0 * 255.0 + 0.5) as u8, 0, 0];
+        for k in 0..4 {
+            self.v.push(V { p: [f.q[k][0] + at[0], f.q[k][1] + at[1], f.q[k][2] + at[2]], uv: f.uv[k], c, l });
+        }
+        self.iw.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+    }
+
     /// Như `push_face` nhưng cho mặt nước: alpha 200, chỉ số vào danh sách `iw`.
     pub fn push_water(&mut self, f: &BFace, at: [f32; 3], col: [u8; 3], br: f32) {
         let base = self.v.len() as u32;
         let s = f.shade * br;
         let c = [(col[0] as f32 * s) as u8, (col[1] as f32 * s) as u8, (col[2] as f32 * s) as u8, 200];
         for k in 0..4 {
-            self.v.push(V { p: [f.q[k][0] + at[0], f.q[k][1] + at[1], f.q[k][2] + at[2]], uv: f.uv[k], c });
+            self.v.push(V { p: [f.q[k][0] + at[0], f.q[k][1] + at[1], f.q[k][2] + at[2]], uv: f.uv[k], c, l: [0; 4] });
         }
         self.iw.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
     }

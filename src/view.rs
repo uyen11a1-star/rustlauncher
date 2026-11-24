@@ -14,7 +14,7 @@ use crate::{
     items::{self, Hud, Item, Spr, SWING_T},
     math,
     phys::{Collider, Input, Player, TICK},
-    scene::{bright, pack, ChunkMesh, Msg, SceneData, Streamer},
+    scene::{pack, ChunkMesh, Msg, SceneData, Streamer},
     world::World,
 };
 
@@ -82,31 +82,63 @@ unsafe fn free(g: &Gpu) {
 }
 
 const VS: &str = "#version 300 es
-in vec3 a_pos; in vec2 a_uv; in vec4 a_col;
+in vec3 a_pos; in vec2 a_uv; in vec4 a_col; in vec4 a_l;
 uniform mat4 u_mvp;
-out vec2 v_uv; out vec4 v_col; out float v_d;
-void main(){ v_uv=a_uv; v_col=a_col; vec4 p=u_mvp*vec4(a_pos,1.0); v_d=p.w; gl_Position=p; }";
+uniform vec2 u_sky;
+uniform sampler2D u_lm;
+out vec2 v_uv; out vec4 v_col; out float v_d; out vec3 v_lm;
+void main(){
+  v_uv=a_uv; v_col=a_col;
+  v_lm=vec3(1.0);
+  if(u_sky.x>0.5){ v_lm=texture(u_lm,(a_l.yx*15.0+0.5)/16.0).rgb; }
+  vec4 p=u_mvp*vec4(a_pos,1.0); v_d=p.w; gl_Position=p;
+}";
 
 const FS: &str = "#version 300 es
 precision highp float;
-in vec2 v_uv; in vec4 v_col; in float v_d;
+in vec2 v_uv; in vec4 v_col; in float v_d; in vec3 v_lm;
 uniform sampler2D u_tex;
 uniform vec2 u_fog;
 uniform vec3 u_fogc;
 uniform vec3 u_tint;
-uniform vec2 u_sky;
 out vec4 o;
 void main(){
   vec4 t=texture(u_tex,v_uv); if(t.a<0.1) discard;
   float f=clamp((u_fog.y-v_d)/(u_fog.y-u_fog.x),0.0,1.0);
-  vec3 l=v_col.rgb; float al=t.a*v_col.a;
-  if(u_sky.x>0.5){
-    float s=v_col.a; float r=s>=0.5?1.0:s/(1.0-s); float rb=s>=0.5?(1.0-s)/s:1.0;
-    l*=max(r*u_sky.y,rb); al=t.a;
-  }
-  vec3 c=mix(u_fogc, t.rgb*l*u_tint, f);
-  o=vec4(c, al);
+  vec3 c=mix(u_fogc, t.rgb*v_col.rgb*v_lm*u_tint, f);
+  o=vec4(c, t.a*v_col.a);
 }";
+
+/// Bảng lightmap 16x16 của vanilla (lightmap.fsh, Overworld): hàng = mức sáng trời, cột = mức sáng khối.
+/// `g` là độ tối trời (getSkyDarken), `gamma` là tùy chọn độ sáng (mặc định 0.5).
+fn build_lightmap(g: f32, gamma: f32) -> Vec<[f32; 3]> {
+    let sky_factor = g * 0.95 + 0.05;
+    let block_factor = 1.5f32;
+    let lerp = |a: f32, b: f32, t: f32| a + (b - a) * t;
+    let sc = [lerp(g, 1.0, 0.35), lerp(g, 1.0, 0.35), 1.0];
+    let br = |lv: f32| {
+        let x = lv / 15.0;
+        x / (4.0 - 3.0 * x)
+    };
+    let mut out = Vec::with_capacity(256);
+    for sky in 0..16 {
+        for blk in 0..16 {
+            let b = br(blk as f32) * block_factor;
+            let s = br(sky as f32) * sky_factor;
+            let mut c = [b, b * ((b * 0.6 + 0.4) * 0.6 + 0.4), b * (b * b * 0.6 + 0.4)];
+            for k in 0..3 {
+                c[k] += sc[k] * s;
+                c[k] = lerp(c[k], 0.75, 0.04);
+                c[k] = c[k].clamp(0.0, 1.0);
+                let n = 1.0 - c[k];
+                c[k] = lerp(c[k], 1.0 - n * n * n * n, gamma);
+                c[k] = lerp(c[k], 0.75, 0.04).clamp(0.0, 1.0);
+            }
+            out.push(c);
+        }
+    }
+    out
+}
 
 const VS_SKY: &str = "#version 300 es
 out vec2 v_ndc;
@@ -191,6 +223,10 @@ pub struct View {
     sky_glow: i32,
     sky_f: i32,
     u_skyl: i32,
+    u_lm: i32,
+    lm_tex: u32,
+    lm: Vec<[f32; 3]>,
+    hand_c: [f32; 3],
     day_time: f64,
     day_tick: bool,
     rain: f32,
@@ -233,7 +269,6 @@ pub struct View {
     swing: Option<f32>,
     lower: f32,
     shown: Option<u16>,
-    hand_b: f32,
     name_t: f32,
     last_held: (usize, Option<u16>),
     gpu: HashMap<(i32, i32), Gpu>,
@@ -576,7 +611,7 @@ fn inside(r: [f32; 4], x: f32, y: f32) -> bool {
 impl View {
     /// Cần context GL đang hiện hành.
     pub fn new(d: SceneData) -> Result<View, String> {
-        let prog = build_program(VS, FS, &["a_pos", "a_uv", "a_col"])?;
+        let prog = build_program(VS, FS, &["a_pos", "a_uv", "a_col", "a_l"])?;
         let sky = build_program(VS_SKY, FS_SKY, &[])?;
         unsafe {
             let c = |s: &str| CString::new(s).unwrap();
@@ -586,6 +621,17 @@ impl View {
             let sky_glow = glGetUniformLocation(sky, c("u_glow").as_ptr());
             let sky_f = glGetUniformLocation(sky, c("u_f").as_ptr());
             let u_skyl = glGetUniformLocation(prog, c("u_sky").as_ptr());
+            let u_lm = glGetUniformLocation(prog, c("u_lm").as_ptr());
+            let lm0 = build_lightmap(1.0, 0.5);
+            glActiveTexture(GL_TEXTURE1);
+            let lm_tex = {
+                let px: Vec<u8> = lm0.iter().flat_map(|c| [(c[0] * 255.0 + 0.5) as u8, (c[1] * 255.0 + 0.5) as u8, (c[2] * 255.0 + 0.5) as u8, 255]).collect();
+                let t = make_tex(&px, 16, 16);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+                t
+            };
+            glActiveTexture(GL_TEXTURE0);
             let u_fog = glGetUniformLocation(prog, c("u_fog").as_ptr());
             let u_fogc = glGetUniformLocation(prog, c("u_fogc").as_ptr());
             let u_mvp = glGetUniformLocation(prog, c("u_mvp").as_ptr());
@@ -647,7 +693,7 @@ impl View {
                 for (a, du, dv) in faces {
                     let base = v.len() as u32;
                     for (s, t) in [(0.0f32, 0.0f32), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)] {
-                        v.push(V { p: [a[0] + du[0] * s + dv[0] * t, a[1] + du[1] * s + dv[1] * t, a[2] + du[2] * s + dv[2] * t], uv: [s, 1.0 - t], c: [255; 4] });
+                        v.push(V { p: [a[0] + du[0] * s + dv[0] * t, a[1] + du[1] * s + dv[1] * t, a[2] + du[2] * s + dv[2] * t], uv: [s, 1.0 - t], c: [255; 4], l: [0; 4] });
                     }
                     ix.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
                 }
@@ -656,10 +702,10 @@ impl View {
             let map_gpu = {
                 let c = [255u8; 4];
                 let v = [
-                    V { p: [-0.5, -0.5, 0.0], uv: [0.0, 1.0], c },
-                    V { p: [0.5, -0.5, 0.0], uv: [1.0, 1.0], c },
-                    V { p: [0.5, 0.5, 0.0], uv: [1.0, 0.0], c },
-                    V { p: [-0.5, 0.5, 0.0], uv: [0.0, 0.0], c },
+                    V { p: [-0.5, -0.5, 0.0], uv: [0.0, 1.0], c, l: [0; 4] },
+                    V { p: [0.5, -0.5, 0.0], uv: [1.0, 1.0], c, l: [0; 4] },
+                    V { p: [0.5, 0.5, 0.0], uv: [1.0, 0.0], c, l: [0; 4] },
+                    V { p: [-0.5, 0.5, 0.0], uv: [0.0, 0.0], c, l: [0; 4] },
                 ];
                 upload_raw(&v, &[0, 1, 2, 0, 2, 3])
             };
@@ -702,7 +748,6 @@ impl View {
                 swing: None,
                 lower: 1.0,
                 shown: None,
-                hand_b: 1.0,
                 name_t: 0.0,
                 last_held: (0, None),
                 prog,
@@ -713,6 +758,10 @@ impl View {
                 sky_glow,
                 sky_f,
                 u_skyl,
+                u_lm,
+                lm_tex,
+                lm: lm0,
+                hand_c: [1.0; 3],
                 day_time: 6000.0,
                 day_tick: false,
                 rain: 0.0,
@@ -776,7 +825,7 @@ impl View {
         let (u0, v0, u1, v1) = (src[0] / tw, src[1] / th, (src[0] + src[2]) / tw, (src[1] + src[3]) / th);
         let (x0, y0, x1, y1) = (dst[0], dst[1], dst[0] + dst[2], dst[1] + dst[3]);
         let c = [255u8; 4];
-        let v = |x: f32, y: f32, u: f32, vv: f32| V { p: [x, y, 0.0], uv: [u, vv], c };
+        let v = |x: f32, y: f32, u: f32, vv: f32| V { p: [x, y, 0.0], uv: [u, vv], c, l: [0; 4] };
         let q = [v(x0, y0, u0, v0), v(x1, y0, u1, v0), v(x1, y1, u1, v1), v(x0, y0, u0, v0), v(x1, y1, u1, v1), v(x0, y1, u0, v1)];
         glBindBuffer(GL_ARRAY_BUFFER, self.quad_vbo);
         glBufferData(GL_ARRAY_BUFFER, (q.len() * std::mem::size_of::<V>()) as isize, q.as_ptr() as *const _, GL_STREAM_DRAW);
@@ -787,6 +836,8 @@ impl View {
         glVertexAttribPointer(1, 2, GL_FLOAT, 0, stride, 12 as *const _);
         glEnableVertexAttribArray(2);
         glVertexAttribPointer(2, 4, GL_UNSIGNED_BYTE, 1, stride, 20 as *const _);
+                glEnableVertexAttribArray(3);
+                glVertexAttribPointer(3, 4, GL_UNSIGNED_BYTE, 1, stride, 24 as *const _);
         glDrawArrays(GL_TRIANGLES, 0, 6);
     }
 
@@ -833,6 +884,16 @@ impl View {
                 }
             }
         }
+    }
+
+    /// Byte sáng (trời << 4 | khối) tại ô; chunk chưa nạp coi như trời sáng hoàn toàn.
+    fn light_at(&self, x: i32, y: i32, z: i32) -> u8 {
+        self.col.as_ref().map_or(0xF0, |c| c.world.light(x, y, z))
+    }
+
+    /// Màu lightmap cho một byte sáng.
+    fn lm_color(&self, l: u8) -> [f32; 3] {
+        self.lm.get(((l >> 4) as usize) * 16 + (l & 15) as usize).copied().unwrap_or([1.0; 3])
     }
 
     pub fn take_kick(&mut self) -> Option<String> {
@@ -1548,9 +1609,12 @@ impl View {
         let eye = self.prev_eye + (self.player.eye_height() - self.prev_eye) * a;
         self.pos = [cam(0) as f32, (cam(1) + eye) as f32, cam(2) as f32];
 
-        // độ sáng của tay theo ánh sáng thế giới tại mắt (làm mượt)
-        let target_b = self.col.as_ref().map_or(1.0, |c| bright(c.world.light(self.pos[0].floor() as i32, self.pos[1].floor() as i32, self.pos[2].floor() as i32)));
-        self.hand_b += (target_b - self.hand_b) * (dt * 8.0).min(1.0);
+        // màu sáng của tay theo lightmap tại mắt (làm mượt)
+        let eye_l = self.light_at(self.pos[0].floor() as i32, self.pos[1].floor() as i32, self.pos[2].floor() as i32);
+        let target_c = self.lm_color(eye_l);
+        for k in 0..3 {
+            self.hand_c[k] += (target_c[k] - self.hand_c[k]) * (dt * 8.0).min(1.0);
+        }
 
         // mắt đang ở trong nước / dung nham: sương mù dày màu xanh / cam, không thấy trời
         let medium = self.col.as_ref().map_or(0, |c| c.fluid_at(self.pos[0].floor() as i32, self.pos[1].floor() as i32, self.pos[2].floor() as i32));
@@ -1567,6 +1631,14 @@ impl View {
         let skyf = ((ca * 2.0 + 0.5).clamp(0.0, 1.0)) * (1.0 - self.rain * 0.3);
         let dm = ((ca * 2.0 + 0.2).clamp(0.0, 1.0) * wet) * 0.8 + 0.2;
         let fk = skyf * 0.94 + 0.06;
+        self.lm = build_lightmap(dm, 0.5);
+        unsafe {
+            let px: Vec<u8> = self.lm.iter().flat_map(|c| [(c[0] * 255.0 + 0.5) as u8, (c[1] * 255.0 + 0.5) as u8, (c[2] * 255.0 + 0.5) as u8, 255]).collect();
+            glActiveTexture(GL_TEXTURE1);
+            glBindTexture(GL_TEXTURE_2D, self.lm_tex);
+            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 16, 16, GL_RGBA, GL_UNSIGNED_BYTE, px.as_ptr() as *const _);
+            glActiveTexture(GL_TEXTURE0);
+        }
         let (fog_c, fog_s, fog_e) = match medium {
             1 => ([0.10f32 * fk, 0.22 * fk, 0.50 * fk], 0.0f32, 22.0f32),
             2 => ([0.55, 0.10, 0.02], 0.0, 3.0),
@@ -1583,7 +1655,7 @@ impl View {
             glDisable(GL_DEPTH_TEST);
             glDisable(GL_CULL_FACE);
             glDisable(GL_BLEND);
-            for i in 0..3 {
+            for i in 0..4 {
                 glDisableVertexAttribArray(i);
             }
             if medium == 0 {
@@ -1616,6 +1688,7 @@ impl View {
             glActiveTexture(GL_TEXTURE0);
             glBindTexture(GL_TEXTURE_2D, self.tex);
             glUniform1i(self.u_tex, 0);
+            glUniform1i(self.u_lm, 1);
             let stride = std::mem::size_of::<V>() as i32;
             let fr = math::frustum(&mvp);
             let vis: Vec<&Gpu> = self.gpu.values().filter(|c| math::aabb_visible(&fr, &c.bb)).collect();
@@ -1627,21 +1700,21 @@ impl View {
                 glVertexAttribPointer(1, 2, GL_FLOAT, 0, stride, 12 as *const _);
                 glEnableVertexAttribArray(2);
                 glVertexAttribPointer(2, 4, GL_UNSIGNED_BYTE, 1, stride, 20 as *const _);
+                glEnableVertexAttribArray(3);
+                glVertexAttribPointer(3, 4, GL_UNSIGNED_BYTE, 1, stride, 24 as *const _);
                 glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, c.ebo);
             };
             // lượt 1: khối đặc (độ sáng trời đổi theo giờ)
-            glUniform2f(self.u_skyl, 1.0, dm);
+            glUniform2f(self.u_skyl, 1.0, 0.0);
             for c in &vis {
                 bind(c);
                 glDrawElements(GL_TRIANGLES, c.count, GL_UNSIGNED_INT, 0 as *const _);
             }
-            glUniform2f(self.u_skyl, 0.0, 1.0);
             // lượt 2: nước nửa trong suốt (không ghi độ sâu)
             if vis.iter().any(|c| c.cw > 0) {
                 glEnable(GL_BLEND);
                 glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
                 glDepthMask(0);
-                glUniform3f(self.u_tint, dm, dm, dm);
                 for c in &vis {
                     if c.cw > 0 {
                         bind(c);
@@ -1650,8 +1723,8 @@ impl View {
                 }
                 glDepthMask(1);
                 glDisable(GL_BLEND);
-                glUniform3f(self.u_tint, 1.0, 1.0, 1.0);
             }
+            glUniform2f(self.u_skyl, 0.0, 0.0);
             self.drawn_chunks = vis.len();
             self.drawn_verts = vis.iter().map(|c| c.nverts).sum();
             // vết nứt khi đang phá khối
@@ -1684,6 +1757,8 @@ impl View {
                 let hn = self.head_n;
                 let sc = 0.9375 / 16.0;
                 for o in self.others.values() {
+                    let tc = self.lm_color(self.light_at(o.pos[0].floor() as i32, (o.pos[1] + 1.0).floor() as i32, o.pos[2].floor() as i32));
+                    glUniform3f(self.u_tint, tc[0], tc[1], tc[2]);
                     let base = math::chain(&[
                         math::translate(o.pos[0], o.pos[1], o.pos[2]),
                         math::rot_y((180.0 - o.yaw).to_radians()),
@@ -1733,6 +1808,7 @@ impl View {
                 }
                 glBindTexture(GL_TEXTURE_2D, self.tex);
                 glEnable(GL_CULL_FACE);
+                glUniform3f(self.u_tint, 1.0, 1.0, 1.0);
                 glUniformMatrix4fv(self.u_mvp, 1, 0, mvp.as_ptr());
             }
 
@@ -1743,6 +1819,8 @@ impl View {
                 let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0.0, |d| (d.as_millis() % 100000) as f32 / 1000.0);
                 for (p, id) in &self.drop_list {
                     let Some(it) = self.items.get(*id as usize) else { continue };
+                    let tc = self.lm_color(self.light_at(p[0].floor() as i32, (p[1] + 0.25).floor() as i32, p[2].floor() as i32));
+                    glUniform3f(self.u_tint, tc[0], tc[1], tc[2]);
                     let sc = if it.flat { 0.45 } else { 0.3 };
                     let m = math::chain(&[
                         mvp,
@@ -1755,6 +1833,7 @@ impl View {
                     glDrawElements(GL_TRIANGLES, it.hand.1, GL_UNSIGNED_INT, (it.hand.0 as usize * 4) as *const _);
                 }
                 glEnable(GL_CULL_FACE);
+                glUniform3f(self.u_tint, 1.0, 1.0, 1.0);
                 glUniformMatrix4fv(self.u_mvp, 1, 0, mvp.as_ptr());
             }
 
@@ -1763,8 +1842,8 @@ impl View {
                 glClear(GL_DEPTH_BUFFER_BIT);
                 glDisable(GL_CULL_FACE);
                 glUniform2f(self.u_fog, 1.0e6, 2.0e6);
-                let hb = self.hand_b;
-                glUniform3f(self.u_tint, hb, hb, hb);
+                let hc = self.hand_c;
+                glUniform3f(self.u_tint, hc[0], hc[1], hc[2]);
                 let proj = math::perspective(1.2, aspect, 0.05, 20.0);
                 let sw = self.swing.map_or(0.0, |t| (t / SWING_T).min(1.0));
                 if self.shown.map_or(false, |i| i as i32 == self.map_idx) {
@@ -1977,6 +2056,8 @@ impl View {
                 glVertexAttribPointer(1, 2, GL_FLOAT, 0, stride, 12 as *const _);
                 glEnableVertexAttribArray(2);
                 glVertexAttribPointer(2, 4, GL_UNSIGNED_BYTE, 1, stride, 20 as *const _);
+                glEnableVertexAttribArray(3);
+                glVertexAttribPointer(3, 4, GL_UNSIGNED_BYTE, 1, stride, 24 as *const _);
                 glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ebo);
             };
             // Steve trong khung nhân vật (vị trí 26..75 x 8..75, chân ở (51, 75)), thân và đầu quay theo ngón tay như vanilla

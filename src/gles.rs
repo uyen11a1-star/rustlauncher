@@ -108,6 +108,7 @@ pub const GL_R8: i32 = 0x8229;
 pub const GL_RED: u32 = 0x1903;
 pub const GL_UNPACK_ALIGNMENT: u32 = 0x0CF5;
 pub const GL_TEXTURE0: u32 = 0x84C0;
+pub const GL_TEXTURE1: u32 = 0x84C1;
 pub const GL_DEPTH_TEST: u32 = 0x0B71;
 pub const GL_CULL_FACE: u32 = 0x0B44;
 pub const GL_LEQUAL: u32 = 0x0203;

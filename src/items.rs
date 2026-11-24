@@ -134,7 +134,7 @@ fn add_box(v: &mut Vec<V>, idx: &mut Vec<u32>, tw: f32, th: f32, mn: [f32; 3], m
         let uvs = [(px[0] + e, px[1] + e), (px[2] - e, px[1] + e), (px[2] - e, px[3] - e), (px[0] + e, px[3] - e)];
         for (k, (s, t)) in [(0.0f32, 0.0f32), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)].iter().enumerate() {
             let p = [(a[0] + du[0] * s + dv[0] * t + off[0]) / div, (a[1] + du[1] * s + dv[1] * t + off[1]) / div, (a[2] + du[2] * s + dv[2] * t + off[2]) / div];
-            v.push(V { p, uv: [uvs[k].0 / tw, uvs[k].1 / th], c: [255; 4] });
+            v.push(V { p, uv: [uvs[k].0 / tw, uvs[k].1 / th], c: [255; 4], l: [0; 4] });
         }
         idx.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
     }
@@ -466,7 +466,7 @@ fn build_net_list(jar: &Jar, atlas: &Atlas, m: &mut Mesh, lang: &Option<Value>) 
                 let z = 0.5 + li as f32 * 0.002;
                 let base = m.v.len() as u32;
                 for (p, uv) in [([0.0, 0.0], [u0, v1]), ([1.0, 0.0], [u1, v1]), ([1.0, 1.0], [u1, v0]), ([0.0, 1.0], [u0, v0])] {
-                    m.v.push(V { p: [p[0], p[1], z], uv, c: [255; 4] });
+                    m.v.push(V { p: [p[0], p[1], z], uv, c: [255; 4], l: [0; 4] });
                 }
                 m.i.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
             }
