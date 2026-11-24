@@ -94,12 +94,18 @@ uniform sampler2D u_tex;
 uniform vec2 u_fog;
 uniform vec3 u_fogc;
 uniform vec3 u_tint;
+uniform vec2 u_sky;
 out vec4 o;
 void main(){
   vec4 t=texture(u_tex,v_uv); if(t.a<0.1) discard;
   float f=clamp((u_fog.y-v_d)/(u_fog.y-u_fog.x),0.0,1.0);
-  vec3 c=mix(u_fogc, t.rgb*v_col.rgb*u_tint, f);
-  o=vec4(c, t.a*v_col.a);
+  vec3 l=v_col.rgb; float al=t.a*v_col.a;
+  if(u_sky.x>0.5){
+    float s=v_col.a; float r=s>=0.5?1.0:s/(1.0-s); float rb=s>=0.5?(1.0-s)/s:1.0;
+    l*=max(r*u_sky.y,rb); al=t.a;
+  }
+  vec3 c=mix(u_fogc, t.rgb*l*u_tint, f);
+  o=vec4(c, al);
 }";
 
 const VS_SKY: &str = "#version 300 es
@@ -111,14 +117,27 @@ precision highp float;
 in vec2 v_ndc;
 uniform mat4 u_view;
 uniform vec2 u_tf;
+uniform vec3 u_sun;
+uniform vec4 u_glow;
+uniform float u_f;
 out vec4 o;
+float hash(vec3 p){ p=fract(p*0.3183099+0.1); p*=17.0; return fract(p.x*p.y*p.z*(p.x+p.y+p.z)); }
 void main(){
   vec3 d=normalize(vec3(v_ndc.x*u_tf.x, v_ndc.y*u_tf.y, -1.0))*mat3(u_view);
   float h=clamp(d.y,0.0,1.0);
-  vec3 c=mix(vec3(0.53,0.81,0.92), vec3(0.25,0.50,0.88), pow(h,0.6));
-  float k=dot(d, normalize(vec3(0.5,0.7,0.4)));
-  c+=vec3(1.0,0.95,0.7)*smoothstep(0.9985,0.9995,k);
-  c+=vec3(1.0,0.9,0.6)*0.25*pow(max(k,0.0),64.0);
+  vec3 c=mix(vec3(0.53,0.81,0.92), vec3(0.25,0.50,0.88), pow(h,0.6))*u_f;
+  float n=1.0-u_f;
+  if(n>0.05 && d.y>-0.05){ c+=vec3(1.0)*step(0.9985,hash(floor(d*160.0)))*n; }
+  vec2 sh=normalize(u_sun.xz+vec2(0.0001,0.0));
+  float dirw=pow(max(dot(normalize(d.xz+vec2(0.0001,0.0)),sh),0.0),2.0);
+  float w=u_glow.a*dirw*clamp(1.0-abs(d.y)*2.5,0.0,1.0);
+  c=mix(c,u_glow.rgb,w);
+  vec3 e1=vec3(u_sun.y,-u_sun.x,0.0);
+  vec3 e2=vec3(0.0,0.0,1.0);
+  float k=dot(d,u_sun);
+  if(k>0.3){ vec2 q=vec2(dot(d,e1),dot(d,e2))/k; if(max(abs(q.x),abs(q.y))<0.15) c=vec3(1.0,1.0,0.78); }
+  float km=-k;
+  if(km>0.3){ vec2 q=vec2(dot(d,e1),dot(d,e2))/km; if(max(abs(q.x),abs(q.y))<0.1) c=vec3(0.86,0.9,1.0); }
   o=vec4(c,1.0);
 }";
 
@@ -168,6 +187,14 @@ pub struct View {
     sky: u32,
     sky_view: i32,
     sky_tf: i32,
+    sky_sun: i32,
+    sky_glow: i32,
+    sky_f: i32,
+    u_skyl: i32,
+    day_time: f64,
+    day_tick: bool,
+    rain: f32,
+    thunder: f32,
     u_fog: i32,
     u_fogc: i32,
     u_tint: i32,
@@ -555,6 +582,10 @@ impl View {
             let c = |s: &str| CString::new(s).unwrap();
             let sky_view = glGetUniformLocation(sky, c("u_view").as_ptr());
             let sky_tf = glGetUniformLocation(sky, c("u_tf").as_ptr());
+            let sky_sun = glGetUniformLocation(sky, c("u_sun").as_ptr());
+            let sky_glow = glGetUniformLocation(sky, c("u_glow").as_ptr());
+            let sky_f = glGetUniformLocation(sky, c("u_f").as_ptr());
+            let u_skyl = glGetUniformLocation(prog, c("u_sky").as_ptr());
             let u_fog = glGetUniformLocation(prog, c("u_fog").as_ptr());
             let u_fogc = glGetUniformLocation(prog, c("u_fogc").as_ptr());
             let u_mvp = glGetUniformLocation(prog, c("u_mvp").as_ptr());
@@ -678,6 +709,14 @@ impl View {
                 sky,
                 sky_view,
                 sky_tf,
+                sky_sun,
+                sky_glow,
+                sky_f,
+                u_skyl,
+                day_time: 6000.0,
+                day_tick: false,
+                rain: 0.0,
+                thunder: 0.0,
                 u_fog,
                 u_fogc,
                 gpu,
@@ -1275,6 +1314,13 @@ impl View {
                         self.inv.slots[i] = g.inv.get(i).copied().flatten().map(|(id, n)| crate::inv::Stack { item: id as u16, n });
                     }
                 }
+                if g.time_dirty {
+                    g.time_dirty = false;
+                    self.day_time = g.day_time.abs() as f64;
+                    self.day_tick = g.day_tick;
+                }
+                self.rain = g.rain;
+                self.thunder = g.thunder;
                 if g.cursor_dirty {
                     g.cursor_dirty = false;
                     self.inv.cursor = g.cursor.map(|(id, n)| crate::inv::Stack { item: id as u16, n });
@@ -1508,10 +1554,23 @@ impl View {
 
         // mắt đang ở trong nước / dung nham: sương mù dày màu xanh / cam, không thấy trời
         let medium = self.col.as_ref().map_or(0, |c| c.fluid_at(self.pos[0].floor() as i32, self.pos[1].floor() as i32, self.pos[2].floor() as i32));
+        // giờ trong ngày như vanilla: góc thiên thể, độ sáng trời, mặt trời / mặt trăng
+        if self.day_tick {
+            self.day_time += dt as f64 * 20.0;
+        }
+        let pi = std::f32::consts::PI;
+        let tod = (self.day_time.rem_euclid(24000.0) / 24000.0) as f32;
+        let dd = (tod - 0.25).rem_euclid(1.0);
+        let ang = (dd * 2.0 + (0.5 - (dd * pi).cos() / 2.0)) / 3.0;
+        let (sa, ca) = (ang * 2.0 * pi).sin_cos();
+        let wet = (1.0 - self.rain * 5.0 / 16.0) * (1.0 - self.thunder * 5.0 / 16.0);
+        let skyf = ((ca * 2.0 + 0.5).clamp(0.0, 1.0)) * (1.0 - self.rain * 0.3);
+        let dm = ((ca * 2.0 + 0.2).clamp(0.0, 1.0) * wet) * 0.8 + 0.2;
+        let fk = skyf * 0.94 + 0.06;
         let (fog_c, fog_s, fog_e) = match medium {
-            1 => ([0.10f32, 0.22, 0.50], 0.0f32, 22.0f32),
+            1 => ([0.10f32 * fk, 0.22 * fk, 0.50 * fk], 0.0f32, 22.0f32),
             2 => ([0.55, 0.10, 0.02], 0.0, 3.0),
-            _ => ([0.53, 0.81, 0.92], FOG_START, FOG_END),
+            _ => ([0.53 * fk, 0.81 * fk, 0.92 * fk], FOG_START, FOG_END),
         };
         let aspect = g.w as f32 / g.h as f32;
         let mvp = math::mul(&math::perspective(self.fov_deg.to_radians(), aspect, 0.05, 300.0), &math::view(self.pos, self.yaw, self.pitch));
@@ -1533,6 +1592,16 @@ impl View {
                 glUniformMatrix4fv(self.sky_view, 1, 0, vm.as_ptr());
                 let tf = (1.2f32 / 2.0).tan();
                 glUniform2f(self.sky_tf, tf * aspect, tf);
+                glUniform3f(self.sky_sun, -sa, ca, 0.0);
+                glUniform1f(self.sky_f, skyf);
+                let glow = if ca.abs() < 0.4 {
+                    let x = ca / 0.4 * 0.5 + 0.5;
+                    let a = 1.0 - (1.0 - (x * pi).sin()) * 0.99;
+                    [x * 0.3 + 0.7, x * x * 0.7 + 0.2, 0.2, a * a]
+                } else {
+                    [0.0; 4]
+                };
+                glUniform4f(self.sky_glow, glow[0], glow[1], glow[2], glow[3]);
                 glDrawArrays(GL_TRIANGLES, 0, 3);
             }
             glEnable(GL_DEPTH_TEST);
@@ -1560,16 +1629,19 @@ impl View {
                 glVertexAttribPointer(2, 4, GL_UNSIGNED_BYTE, 1, stride, 20 as *const _);
                 glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, c.ebo);
             };
-            // lượt 1: khối đặc
+            // lượt 1: khối đặc (độ sáng trời đổi theo giờ)
+            glUniform2f(self.u_skyl, 1.0, dm);
             for c in &vis {
                 bind(c);
                 glDrawElements(GL_TRIANGLES, c.count, GL_UNSIGNED_INT, 0 as *const _);
             }
+            glUniform2f(self.u_skyl, 0.0, 1.0);
             // lượt 2: nước nửa trong suốt (không ghi độ sâu)
             if vis.iter().any(|c| c.cw > 0) {
                 glEnable(GL_BLEND);
                 glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
                 glDepthMask(0);
+                glUniform3f(self.u_tint, dm, dm, dm);
                 for c in &vis {
                     if c.cw > 0 {
                         bind(c);
@@ -1578,6 +1650,7 @@ impl View {
                 }
                 glDepthMask(1);
                 glDisable(GL_BLEND);
+                glUniform3f(self.u_tint, 1.0, 1.0, 1.0);
             }
             self.drawn_chunks = vis.len();
             self.drawn_verts = vis.iter().map(|c| c.nverts).sum();

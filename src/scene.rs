@@ -159,17 +159,33 @@ pub fn bright(l: u8) -> f32 {
     0.03 + 0.97 * x / (4.0 - 3.0 * x)
 }
 
+/// Độ sáng 0..1 của một mức sáng 0..15.
+fn bright_n(n: u8) -> f32 {
+    let x = n as f32 / 15.0;
+    0.03 + 0.97 * x / (4.0 - 3.0 * x)
+}
+
+/// Tỉ lệ sáng-trời: sky / (sky + block).
+fn sky_share(sk: f32, bl: f32) -> f32 {
+    if sk + bl <= 0.0 {
+        0.5
+    } else {
+        sk / (sk + bl)
+    }
+}
+
 /// Smooth lighting: mỗi đỉnh lấy trung bình ánh sáng của 4 ô quanh nó (lớp ô phía trước mặt) nhân với AO
 /// (ô đặc làm tối như Minecraft). Trả về độ sáng 0..1 cho 4 đỉnh của mặt.
-fn smooth(world: &World, states: &[State], p: [i32; 3], f: &crate::assets::BFace) -> [f32; 4] {
+fn smooth(world: &World, states: &[State], p: [i32; 3], f: &crate::assets::BFace) -> ([f32; 4], [f32; 4]) {
     let d = f.cull as usize;
     let a = [1usize, 1, 2, 2, 0, 0][d] ;
     let (t1, t2) = ((a + 1) % 3, (a + 2) % 3);
     let n = [p[0] + DV[d][0], p[1] + DV[d][1], p[2] + DV[d][2]];
     // lưới 3x3 các ô trong lớp phía trước: chỉ số (i+1, j+1) với i theo t1, j theo t2
     let mut opaque = [[false; 3]; 3];
-    let mut light = [[0.0f32; 3]; 3];
-    let center = bright(world.light(n[0], n[1], n[2]));
+    let mut light = [[(0.0f32, 0.0f32); 3]; 3];
+    let lc = world.light(n[0], n[1], n[2]);
+    let center = (bright_n(lc >> 4), bright_n(lc & 15));
     for i in 0..3 {
         for j in 0..3 {
             let mut q = n;
@@ -178,22 +194,31 @@ fn smooth(world: &World, states: &[State], p: [i32; 3], f: &crate::assets::BFace
             let id = world.get(q[0], q[1], q[2]);
             let op = id != UNKNOWN && id != 0 && states[id as usize].occl == 0x3f;
             opaque[i][j] = op;
-            light[i][j] = if op { center } else { bright(world.light(q[0], q[1], q[2])) };
+            light[i][j] = if op {
+                center
+            } else {
+                let lq = world.light(q[0], q[1], q[2]);
+                (bright_n(lq >> 4), bright_n(lq & 15))
+            };
         }
     }
     let mut out = [0.0f32; 4];
+    let mut share = [0.5f32; 4];
     for k in 0..4 {
         let s1 = if f.q[k][t1] > 0.5 { 2 } else { 0 };
         let s2 = if f.q[k][t2] > 0.5 { 2 } else { 0 };
         let (oa, ob) = (opaque[s1][1], opaque[1][s2]);
         // ô góc: nếu cả hai ô bên cạnh đặc thì coi góc đặc luôn (ánh sáng không lọt qua khe chéo)
         let (ok, lk) = if oa && ob { (true, center) } else { (opaque[s1][s2], light[s1][s2]) };
-        let l = (center + light[s1][1] + light[1][s2] + lk) / 4.0;
+        let sk = (center.0 + light[s1][1].0 + light[1][s2].0 + lk.0) / 4.0;
+        let bl = (center.1 + light[s1][1].1 + light[1][s2].1 + lk.1) / 4.0;
+        let l = sk.max(bl);
+        share[k] = sky_share(sk, bl);
         let sh = |o: bool| if o { 0.2f32 } else { 1.0 };
         let ao = (1.0 + sh(oa) + sh(ob) + sh(ok)) / 4.0;
         out[k] = l * ao;
     }
-    out
+    (out, share)
 }
 
 fn mesh_chunk(world: &World, states: &[State], cx: i32, cz: i32) -> Mesh {
@@ -255,11 +280,12 @@ fn mesh_chunk(world: &World, states: &[State], cx: i32, cz: i32) -> Mesh {
                             };
                             mesh.push_water(f, at, col, bright(lv));
                         } else if f.cull != NOCULL {
-                            let br = smooth(world, states, [x, y, z], f);
-                            mesh.push_face_v(f, at, col, br);
+                            let (br, t) = smooth(world, states, [x, y, z], f);
+                            mesh.push_face_vt(f, at, col, br, t);
                         } else {
-                            let br = bright(world.light(x, y, z));
-                            mesh.push_face_b(f, at, col, br);
+                            let lv = world.light(x, y, z);
+                            let (sk, bl) = (bright_n(lv >> 4), bright_n(lv & 15));
+                            mesh.push_face_bt(f, at, col, sk.max(bl), sky_share(sk, bl));
                         }
                     }
                 }
@@ -392,15 +418,6 @@ impl Worker {
     fn run(mut self, jar: Jar, atlas: Atlas, r: i32, pos: Arc<AtomicI64>, stop: Arc<AtomicBool>, tx: mpsc::Sender<Msg>) {
         let mut res = Resolver::new(&jar, &atlas);
         let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(2).min(4);
-        // sinh chunk bằng bộ máy worldgen ở chỗ thế giới chưa tạo (chỉ chế độ đọc đĩa)
-        let seed = match &self.src {
-            Src::Disk(d) => crate::vrng::read_seed(d),
-            _ => None,
-        };
-        let mut gen_router: Option<crate::vdens::Router> = None;
-        let mut gen_off = seed.is_none();
-        let mut gen_tried: HashSet<(i32, i32)> = HashSet::new();
-        let mut gen_count = 0usize;
         while !stop.load(Relaxed) {
             let (pcx, pcz) = unpack(pos.load(Relaxed));
             let far = |x: i32, z: i32| (x - pcx).abs() > r + 3 || (z - pcz).abs() > r + 3;
@@ -484,43 +501,6 @@ impl Worker {
                         }
                     }
                     busy = n > 0;
-                }
-            }
-            if let Some(sd) = seed {
-                if !gen_off {
-                    gen_tried.retain(|&(x, z)| !far(x, z));
-                    let mut miss: Vec<(i32, i32)> = Vec::new();
-                    for dz in -(r + 1)..=(r + 1) {
-                        for dx in -(r + 1)..=(r + 1) {
-                            let c = (pcx + dx, pcz + dz);
-                            if self.tried.contains(&c) && !self.w.chunks.contains_key(&c) && !gen_tried.contains(&c) {
-                                miss.push(c);
-                            }
-                        }
-                    }
-                    miss.sort_by_key(|c| dist(c));
-                    miss.truncate(2);
-                    if !miss.is_empty() && gen_router.is_none() {
-                        match crate::vdens::Router::build(&jar, sd) {
-                            Ok(rt) => gen_router = Some(rt),
-                            Err(_) => gen_off = true,
-                        }
-                    }
-                    if let Some(rt) = &gen_router {
-                        for c in miss {
-                            gen_tried.insert(c);
-                            raws.push(crate::vgen::generate(rt, c.0, c.1));
-                            want.push(c);
-                            for d in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
-                                self.meshed.remove(&(c.0 + d.0, c.1 + d.1));
-                            }
-                            gen_count += 1;
-                            if gen_count % 64 == 0 {
-                                rt.clear_caches();
-                            }
-                            busy = true;
-                        }
-                    }
                 }
             }
             if !edits.is_empty() {

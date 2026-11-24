@@ -153,6 +153,13 @@ pub struct NetState {
     /// vật đang cầm trên con trỏ do server báo
     pub cursor: Option<(u32, u8)>,
     pub cursor_dirty: bool,
+    /// giờ trong ngày (tick) do server báo, có tự chạy không, và cờ đổi
+    pub day_time: i64,
+    pub day_tick: bool,
+    pub time_dirty: bool,
+    /// mưa / sấm (0..1)
+    pub rain: f32,
+    pub thunder: f32,
 }
 
 /// Ô của cửa sổ 0 (túi người chơi) -> ô của ta.
@@ -1147,6 +1154,30 @@ fn reader(s: &mut TcpStream, comp: bool, wr: &Shared, tx: &Sender<NetIn>, cur: &
                 let mut g = st.lock().unwrap();
                 let g = &mut *g;
                 crate::winnet::apply(&mut g.win, &mut g.win_dirty, id, &b);
+            }
+            0x6f => {
+                let _age = rd_i64(&b, &mut i);
+                let t = rd_i64(&b, &mut i).unwrap_or(6000);
+                let tick = b.get(i).copied().unwrap_or(1) != 0;
+                let mut g = st.lock().unwrap();
+                g.day_time = t;
+                g.day_tick = tick;
+                g.time_dirty = true;
+            }
+            0x26 => {
+                let reason = b.first().copied().unwrap_or(255);
+                let val = rd_f32(&b, &mut 1usize).unwrap_or(0.0);
+                let mut g = st.lock().unwrap();
+                match reason {
+                    1 => g.rain = 1.0,
+                    2 => {
+                        g.rain = 0.0;
+                        g.thunder = 0.0;
+                    }
+                    7 => g.rain = val.clamp(0.0, 1.0),
+                    8 => g.thunder = val.clamp(0.0, 1.0),
+                    _ => {}
+                }
             }
             0x5e => {
                 if let Some(v) = crate::slot::read_slot(&b, &mut i) {
