@@ -115,6 +115,13 @@ pub struct Pl {
     pub head: f32,
 }
 
+/// Vật phẩm rơi dưới đất.
+#[derive(Clone)]
+pub struct Dropped {
+    pub pos: [f64; 3],
+    pub item: Option<u32>,
+}
+
 /// Trạng thái nhận từ server, luồng đọc ghi vào, luồng vẽ lấy ra.
 #[derive(Default)]
 pub struct NetState {
@@ -128,6 +135,7 @@ pub struct NetState {
     /// server đổi ô thanh nhanh đang chọn
     pub held: Option<u8>,
     pub players: std::collections::HashMap<i32, Pl>,
+    pub drops: std::collections::HashMap<i32, Dropped>,
     /// số thứ tự hành động mới nhất server đã xác nhận (acknowledge_player_digging)
     pub ack: i32,
     /// số lần server dịch chuyển ta và độ lệch gần nhất so với vị trí ta đã báo (để dò lỗi)
@@ -230,6 +238,11 @@ fn entity_packet(id: i32, b: &[u8], st: &SharedState) -> Option<()> {
             let eid = rd_varint(b, &mut i)?;
             let uuid = uuid_at(b, &mut i)?;
             let ty = rd_varint(b, &mut i)?;
+            if ty == 70 {
+                let (x, y, z) = (rd_f64(b, &mut i)?, rd_f64(b, &mut i)?, rd_f64(b, &mut i)?);
+                st.lock().unwrap().drops.insert(eid, Dropped { pos: [x, y, z], item: None });
+                return Some(());
+            }
             if ty != 151 {
                 return Some(());
             }
@@ -246,6 +259,53 @@ fn entity_packet(id: i32, b: &[u8], st: &SharedState) -> Option<()> {
             for _ in 0..n {
                 let e = rd_varint(b, &mut i)?;
                 g.players.remove(&e);
+                g.drops.remove(&e);
+            }
+        }
+        0x7a => {
+            let e = rd_varint(b, &mut i)?;
+            st.lock().unwrap().drops.remove(&e);
+        }
+        0x61 => {
+            let eid = rd_varint(b, &mut i)?;
+            if !st.lock().unwrap().drops.contains_key(&eid) {
+                return Some(());
+            }
+            loop {
+                let key = *b.get(i)?;
+                i += 1;
+                if key == 0xff {
+                    break;
+                }
+                let ty = rd_varint(b, &mut i)?;
+                match ty {
+                    0 | 8 => i += 1,
+                    1 | 20 => {
+                        rd_varint(b, &mut i)?;
+                    }
+                    4 => {
+                        rd_str(b, &mut i)?;
+                    }
+                    5 => {
+                        crate::chat::read_nbt(b, &mut i)?;
+                    }
+                    6 => {
+                        let has = *b.get(i)? != 0;
+                        i += 1;
+                        if has {
+                            crate::chat::read_nbt(b, &mut i)?;
+                        }
+                    }
+                    7 => {
+                        let v = crate::slot::read_slot(b, &mut i)?;
+                        if key == 8 {
+                            if let Some(d) = st.lock().unwrap().drops.get_mut(&eid) {
+                                d.item = v.map(|x| x.0);
+                            }
+                        }
+                    }
+                    _ => break,
+                }
             }
         }
         0x33 | 0x34 | 0x36 => {
@@ -258,6 +318,11 @@ fn entity_packet(id: i32, b: &[u8], st: &SharedState) -> Option<()> {
             }
             let look = if id != 0x33 { Some((ang(b, &mut i), ang(b, &mut i))) } else { None };
             let mut g = st.lock().unwrap();
+            if let Some(dr) = g.drops.get_mut(&eid) {
+                for k in 0..3 {
+                    dr.pos[k] += d[k];
+                }
+            }
             if let Some(p) = g.players.get_mut(&eid) {
                 for k in 0..3 {
                     p.pos[k] += d[k];
@@ -275,6 +340,9 @@ fn entity_packet(id: i32, b: &[u8], st: &SharedState) -> Option<()> {
             let (yaw, pitch) = (rd_f32(b, &mut i)?, rd_f32(b, &mut i)?);
             let flags = if id == 0x7b { rd_i32(b, &mut i)? as u32 } else { 0 };
             let mut g = st.lock().unwrap();
+            if let Some(dr) = g.drops.get_mut(&eid) {
+                dr.pos = [x, y, z];
+            }
             if let Some(p) = g.players.get_mut(&eid) {
                 let r = |bit: u32, new: f64, old: f64| if flags & (1 << bit) != 0 { old + new } else { new };
                 p.pos = [r(0, x, p.pos[0]), r(1, y, p.pos[1]), r(2, z, p.pos[2])];
@@ -1072,7 +1140,7 @@ fn reader(s: &mut TcpStream, comp: bool, wr: &Shared, tx: &Sender<NetIn>, cur: &
                 }
             }
             0x44 => parse_player_info(&b, st),
-            0x01 | 0x4b | 0x33 | 0x34 | 0x36 | 0x7b | 0x23 | 0x51 => {
+            0x01 | 0x4b | 0x33 | 0x34 | 0x36 | 0x7b | 0x23 | 0x51 | 0x61 | 0x7a => {
                 let _ = entity_packet(id, &b, st);
             }
             0x39 | 0x11 => {

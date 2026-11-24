@@ -258,6 +258,7 @@ pub struct View {
     dig: Option<Dig>,
     place_req: bool,
     others: HashMap<i32, Other>,
+    drop_list: Vec<([f32; 3], u32)>,
     /// tên người chơi trên màn hình: (x, y, tên)
     tags: Vec<(f32, f32, String)>,
 }
@@ -696,6 +697,7 @@ impl View {
                 dig: None,
                 place_req: false,
                 others: HashMap::new(),
+                drop_list: Vec::new(),
                 tags: Vec::new(),
             })
         }
@@ -1266,6 +1268,10 @@ impl View {
                 let raw: Vec<(i32, crate::netplay::Pl, String)> = g.players.iter().map(|(e, p)| (*e, p.clone(), g.names.get(&p.uuid).cloned().unwrap_or_default())).collect();
                 (std::mem::take(&mut g.chat), raw)
             };
+            {
+                let g = st.lock().unwrap();
+                self.drop_list = g.drops.values().filter_map(|d| d.item.map(|it| ([d.pos[0] as f32, d.pos[1] as f32, d.pos[2] as f32], it))).collect();
+            }
             let k = (dt * 10.0).min(1.0);
             self.others.retain(|e, _| raw.iter().any(|r| r.0 == *e));
             for (e, p, name) in raw {
@@ -1569,6 +1575,28 @@ impl View {
                     }
                 }
                 glBindTexture(GL_TEXTURE_2D, self.tex);
+                glEnable(GL_CULL_FACE);
+                glUniformMatrix4fv(self.u_mvp, 1, 0, mvp.as_ptr());
+            }
+
+            // vật phẩm rơi: xoay và nhấp nhô
+            if !self.drop_list.is_empty() {
+                glDisable(GL_CULL_FACE);
+                bind(&self.items_gpu);
+                let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0.0, |d| (d.as_millis() % 100000) as f32 / 1000.0);
+                for (p, id) in &self.drop_list {
+                    let Some(it) = self.items.get(*id as usize) else { continue };
+                    let sc = if it.flat { 0.45 } else { 0.3 };
+                    let m = math::chain(&[
+                        mvp,
+                        math::translate(p[0], p[1] + 0.25 + (t * 2.0).sin() * 0.05, p[2]),
+                        math::rot_y(t * 1.5),
+                        math::scale(sc, sc, sc),
+                        math::translate(-0.5, -0.5, -0.5),
+                    ]);
+                    glUniformMatrix4fv(self.u_mvp, 1, 0, m.as_ptr());
+                    glDrawElements(GL_TRIANGLES, it.hand.1, GL_UNSIGNED_INT, (it.hand.0 as usize * 4) as *const _);
+                }
                 glEnable(GL_CULL_FACE);
                 glUniformMatrix4fv(self.u_mvp, 1, 0, mvp.as_ptr());
             }
